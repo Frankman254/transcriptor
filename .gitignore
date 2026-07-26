@@ -1,0 +1,26 @@
+# --- Media / audio / video (no van al repo) ---
+*.mp3
+*.mp4
+*.m4a
+*.webm
+*.opus
+*.wav
+*.flac
+
+# --- Salidas de transcripción personales en la raíz del proyecto ---
+/*.srt
+/*.vtt
+/*.tsv
+/*.json
+/*.txt
+
+# --- Salidas y caché de la app ---
+webapp/output/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Sistema / editores ---
+.DS_Store
+.venv/
+venv/

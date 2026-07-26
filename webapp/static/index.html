@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcriptor local</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --border: #2a2f3a;
+    --text: #e6e8ec; --muted: #9aa3b2; --accent: #5b8cff; --accent2: #38d39f;
+    --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 14px; padding: 20px; margin-bottom: 20px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  select, input[type=text] {
+    width: 100%; padding: 10px 12px; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 9px; color: var(--text);
+    font-size: 14px;
+  }
+  input[type=file] { color: var(--muted); font-size: 13px; }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 160px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tab { padding: 8px 16px; border-radius: 9px; border: 1px solid var(--border);
+         background: var(--panel2); cursor: pointer; font-size: 14px; color: var(--muted); }
+  .tab.active { border-color: var(--accent); color: var(--text); background: #202634; }
+  button.go {
+    margin-top: 16px; width: 100%; padding: 12px; border: none; border-radius: 10px;
+    background: var(--accent); color: #fff; font-size: 15px; font-weight: 600;
+    cursor: pointer;
+  }
+  button.go:disabled { opacity: .5; cursor: not-allowed; }
+  .badges { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .badge { font-size: 12px; padding: 4px 10px; border-radius: 999px;
+           background: var(--panel2); border: 1px solid var(--border); color: var(--muted); }
+  .badge b { color: var(--text); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         background: var(--accent2); margin-right: 5px; }
+  .progress-outer { height: 10px; background: var(--panel2); border-radius: 999px;
+                    overflow: hidden; border: 1px solid var(--border); }
+  .progress-inner { height: 100%; width: 0%; background: linear-gradient(90deg,var(--accent),var(--accent2));
+                    transition: width .3s ease; }
+  .progress-label { display: flex; justify-content: space-between; font-size: 13px;
+                    color: var(--muted); margin: 8px 2px 0; }
+  .stage { font-size: 14px; color: var(--muted); margin-bottom: 12px; }
+  .stage .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .segments { max-height: 420px; overflow-y: auto; margin-top: 6px; }
+  .seg { display: flex; gap: 12px; padding: 7px 4px; border-bottom: 1px solid var(--border); }
+  .seg:last-child { border-bottom: none; }
+  .seg .t { color: var(--accent); font-variant-numeric: tabular-nums; font-size: 12px;
+            white-space: nowrap; padding-top: 1px; min-width: 118px; }
+  .seg .x { flex: 1; }
+  .downloads { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+  .downloads a { text-decoration: none; padding: 8px 14px; border-radius: 9px;
+                 background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+                 font-size: 13px; }
+  .downloads a:hover { border-color: var(--accent); }
+  .err { color: var(--danger); font-size: 14px; }
+  .hidden { display: none; }
+  cite { color: var(--muted); font-style: normal; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎙️ Transcriptor local</h1>
+  <p class="sub">Whisper corriendo en tu máquina · progreso en vivo · cada frase con su tiempo</p>
+
+  <div class="card">
+    <div class="tabs">
+      <div class="tab active" data-src="url" onclick="setSource('url')">🔗 YouTube</div>
+      <div class="tab" data-src="file" onclick="setSource('file')">📁 Archivo</div>
+    </div>
+
+    <div id="pane-url">
+      <label>Link de YouTube</label>
+      <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=...">
+    </div>
+    <div id="pane-file" class="hidden">
+      <label>Audio o video (mp3, m4a, wav, mp4…)</label>
+      <input type="file" id="file" accept="audio/*,video/*">
+    </div>
+
+    <div id="mode-pane" style="margin-top:16px">
+      <label>¿Qué quieres hacer?</label>
+      <div class="tabs">
+        <div class="tab active" data-mode="transcribe" onclick="setMode('transcribe')">🎧 Transcribir</div>
+        <div class="tab" data-mode="lyrics" onclick="setMode('lyrics')">🎤 Letra de canción</div>
+        <div class="tab" data-mode="audio_only" onclick="setMode('audio_only')">⬇️ Solo audio</div>
+      </div>
+      <p class="sub hidden" id="mode-hint" style="margin:8px 2px 0;font-size:12px"></p>
+    </div>
+
+    <div class="row" id="opts" style="margin-top:16px">
+      <div>
+        <label>Modelo</label>
+        <select id="model"></select>
+      </div>
+      <div>
+        <label>Idioma</label>
+        <select id="language"></select>
+      </div>
+    </div>
+
+    <button class="go" id="go" onclick="start()">Transcribir</button>
+  </div>
+
+  <div class="card hidden" id="live">
+    <div class="badges" id="badges"></div>
+    <div class="stage" id="stage"></div>
+    <div class="progress-outer"><div class="progress-inner" id="bar"></div></div>
+    <div class="progress-label"><span id="pct">0%</span><span id="clock"></span></div>
+    <div id="err" class="err"></div>
+    <div class="downloads hidden" id="downloads"></div>
+    <div class="segments" id="segments"></div>
+  </div>
+</div>
+
+<script>
+let SOURCE = "url";
+let MODE = "transcribe";
+let INFO = null;
+
+function setSource(s) {
+  SOURCE = s;
+  document.querySelectorAll(".tab[data-src]").forEach(t =>
+    t.classList.toggle("active", t.dataset.src === s));
+  document.getElementById("pane-url").classList.toggle("hidden", s !== "url");
+  document.getElementById("pane-file").classList.toggle("hidden", s !== "file");
+}
+
+function setMode(m) {
+  MODE = m;
+  document.querySelectorAll(".tab[data-mode]").forEach(t =>
+    t.classList.toggle("active", t.dataset.mode === m));
+  // En "solo audio" no hacen falta modelo ni idioma; en letra sí (usa Whisper).
+  document.getElementById("opts").classList.toggle("hidden", m === "audio_only");
+  document.getElementById("go").textContent =
+    m === "audio_only" ? "Descargar audio" :
+    m === "lyrics" ? "Sacar letra" : "Transcribir";
+  const hints = {
+    lyrics: "🎤 Aísla la voz con Demucs y luego la transcribe. Solo en CPU la " +
+            "separación tarda varios minutos por canción.",
+  };
+  const hint = document.getElementById("mode-hint");
+  hint.textContent = hints[m] || "";
+  hint.classList.toggle("hidden", !hints[m]);
+}
+
+function fmt(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const mm = String(m).padStart(2, "0"), ss = String(s).padStart(2, "0");
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+async function loadInfo() {
+  INFO = await (await fetch("/api/info")).json();
+  const ms = document.getElementById("model");
+  INFO.models.forEach(m => {
+    const o = document.createElement("option");
+    o.value = m.name;
+    o.textContent = m.name + (m.cached ? "  ✓ descargado" : "  ⬇ requiere descarga");
+    if (m.name === "medium") o.selected = true;
+    ms.appendChild(o);
+  });
+  const ls = document.getElementById("language");
+  INFO.languages.forEach(l => {
+    const o = document.createElement("option");
+    o.value = l.value; o.textContent = l.label;
+    ls.appendChild(o);
+  });
+}
+
+async function start() {
+  const model = document.getElementById("model").value;
+  const language = document.getElementById("language").value;
+  const fd = new FormData();
+  fd.append("source_type", SOURCE);
+  fd.append("model", model);
+  fd.append("language", language);
+  fd.append("mode", MODE);
+
+  if (MODE === "audio_only") {
+    // Solo audio funciona con un link de YouTube.
+    const url = document.getElementById("url").value.trim();
+    if (!url) return alert("Pega un link de YouTube para descargar el audio");
+    fd.append("url", url);
+  } else if (SOURCE === "url") {
+    const url = document.getElementById("url").value.trim();
+    if (!url) return alert("Pega un link de YouTube");
+    fd.append("url", url);
+  } else {
+    const f = document.getElementById("file").files[0];
+    if (!f) return alert("Elige un archivo");
+    fd.append("file", f);
+  }
+
+  document.getElementById("go").disabled = true;
+  const live = document.getElementById("live");
+  live.classList.remove("hidden");
+  document.getElementById("segments").innerHTML = "";
+  document.getElementById("downloads").classList.add("hidden");
+  document.getElementById("downloads").innerHTML = "";
+  document.getElementById("err").textContent = "";
+  setBadges({ model: MODE === "audio_only" ? null : model, device: INFO.device });
+  setStage("Iniciando…", true);
+  setProgress(0);
+
+  const res = await fetch("/api/jobs", { method: "POST", body: fd });
+  const { job_id } = await res.json();
+  listen(job_id);
+}
+
+function setBadges({ model, device, title, duration }) {
+  const b = document.getElementById("badges");
+  let html = model
+    ? `<span class="badge"><span class="dot"></span>Modelo <b>${model}</b></span>`
+    : "";
+  html += `<span class="badge">Dispositivo <b>${device}</b></span>`;
+  if (title) html += `<span class="badge" title="${title}">🎬 <b>${title.slice(0, 40)}</b></span>`;
+  if (duration) html += `<span class="badge">Duración <b>${fmt(duration)}</b></span>`;
+  b.innerHTML = html;
+}
+
+function setStage(text, spinning) {
+  document.getElementById("stage").innerHTML =
+    (spinning ? '<span class="spin">⏳</span> ' : "") + text;
+}
+function setProgress(p) {
+  const pct = p == null ? null : Math.round(p * 100);
+  document.getElementById("bar").style.width = (pct == null ? 3 : pct) + "%";
+  document.getElementById("pct").textContent = pct == null ? "…" : pct + "%";
+}
+
+function listen(jobId) {
+  const es = new EventSource(`/api/jobs/${jobId}/events`);
+  let duration = 0;
+
+  es.addEventListener("status", e => {
+    const d = JSON.parse(e.data);
+    setStage(d.message || d.stage, true);
+    if (d.model) setBadges({ model: d.model, device: d.device, duration: d.duration });
+  });
+  es.addEventListener("meta", e => {
+    const d = JSON.parse(e.data);
+    duration = d.duration;
+    setBadges({ model: d.model, device: d.device, title: d.title, duration: d.duration });
+  });
+  es.addEventListener("segment", e => {
+    const d = JSON.parse(e.data);
+    if (d.progress != null) setProgress(d.progress);
+    document.getElementById("clock").textContent =
+      `${fmt(d.end)}${duration ? " / " + fmt(duration) : ""}`;
+    const row = document.createElement("div");
+    row.className = "seg";
+    row.innerHTML = `<span class="t">${fmt(d.start)} → ${fmt(d.end)}</span>` +
+                    `<span class="x"></span>`;
+    row.querySelector(".x").textContent = d.text;
+    const box = document.getElementById("segments");
+    box.appendChild(row);
+    box.scrollTop = box.scrollHeight;
+  });
+  es.addEventListener("done", e => {
+    const d = JSON.parse(e.data);
+    setStage("✅ Listo — " + (d.title || ""), false);
+    setProgress(1);
+    const dl = document.getElementById("downloads");
+    dl.classList.remove("hidden");
+    dl.innerHTML = "<span class='badge'>Descargar:</span>";
+    for (const [ext, name] of Object.entries(d.files)) {
+      const a = document.createElement("a");
+      a.href = `/download/${d.job_id}/${encodeURIComponent(name)}`;
+      a.textContent = ext === "audio" ? "⬇️ audio (" + name + ")" : "." + ext;
+      dl.appendChild(a);
+    }
+    document.getElementById("go").disabled = false;
+    es.close();
+  });
+  es.addEventListener("error", e => {
+    let msg = "Se perdió la conexión con el servidor.";
+    try { msg = JSON.parse(e.data).message; } catch (_) {}
+    document.getElementById("err").textContent = "⚠️ " + msg;
+    setStage("Error", false);
+    document.getElementById("go").disabled = false;
+    es.close();
+  });
+}
+
+loadInfo();
+</script>
+</body>
+</html>

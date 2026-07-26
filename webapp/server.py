@@ -1,0 +1,368 @@
+"""
+Transcriptor local — backend FastAPI.
+
+Corre Whisper (openai-whisper) localmente sobre un link de YouTube o un archivo
+de audio/video, y transmite el progreso en vivo por SSE:
+  - modelo y dispositivo (CPU/GPU) que se está usando
+  - etapa actual (descargando / transcribiendo)
+  - cada segmento con su inicio --> fin apenas Whisper lo produce
+  - porcentaje de avance (segundos transcritos / duración total)
+
+No necesita internet para transcribir si el modelo ya está en la caché
+(~/.cache/whisper). Si eliges un modelo que no está descargado, el backend lo
+baja con `curl` (usa el llavero de macOS y evita el error SSL de proxys).
+"""
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import uuid
+from pathlib import Path
+
+import whisper  # solo para conocer las URLs de los modelos
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+OUTPUT_DIR = BASE_DIR / "output"
+CACHE_DIR = Path.home() / ".cache" / "whisper"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Modelos que ofrecemos en la interfaz (nombre -> etiqueta amigable).
+MODELS = ["tiny", "base", "small", "medium", "large-v3", "turbo"]
+
+# Idiomas comunes; "" = detección automática.
+LANGUAGES = [
+    ("", "Auto (detectar)"),
+    ("Spanish", "Español"),
+    ("English", "Inglés"),
+    ("Portuguese", "Portugués"),
+    ("French", "Francés"),
+    ("Italian", "Italiano"),
+    ("German", "Alemán"),
+]
+
+app = FastAPI(title="Transcriptor local")
+
+# job_id -> dict(queue, done, ...)
+JOBS: dict[str, dict] = {}
+
+
+# --------------------------------------------------------------------------- #
+# Utilidades
+# --------------------------------------------------------------------------- #
+def device_name() -> str:
+    # Whisper (openai-whisper) por CLI usa cuda si existe, si no cpu.
+    # No usa MPS por defecto, así que reportamos lo que realmente correrá.
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda (GPU)"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def model_cache_path(model: str) -> Path:
+    """Ruta donde Whisper guarda el .pt del modelo."""
+    url = whisper._MODELS[model]
+    return CACHE_DIR / os.path.basename(url)
+
+
+def model_is_cached(model: str) -> bool:
+    return model_cache_path(model).exists()
+
+
+def ensure_model(model: str, emit) -> None:
+    """Descarga el modelo con curl si no está en caché (evita el SSL de Python)."""
+    if model_is_cached(model):
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    url = whisper._MODELS[model]
+    target = model_cache_path(model)
+    emit("status", stage="downloading_model",
+         message=f"Descargando modelo '{model}' (~una vez)…")
+    proc = subprocess.run(
+        ["curl", "-L", "--fail", "-o", str(target), url],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        if target.exists():
+            target.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"No se pudo descargar el modelo '{model}': {proc.stderr[-300:]}"
+        )
+
+
+def ffprobe_duration(path: Path) -> float:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+_TS_RE = re.compile(
+    r"\[(\d+:\d+(?::\d+)?\.\d+)\s*-->\s*(\d+:\d+(?::\d+)?\.\d+)\]\s?(.*)"
+)
+
+
+def parse_ts(ts: str) -> float:
+    parts = ts.split(":")
+    parts = [float(p) for p in parts]
+    while len(parts) < 3:
+        parts.insert(0, 0.0)
+    h, m, s = parts
+    return h * 3600 + m * 60 + s
+
+
+def download_youtube(url: str, outdir: Path, emit) -> tuple[Path, str, float]:
+    """Descarga el audio como mp3. Devuelve (ruta, título, duración)."""
+    emit("status", stage="downloading", message="Descargando audio de YouTube…")
+    fmt = "after_move:%(id)s\t%(title)s\t%(duration)s\t%(filepath)s"
+    proc = subprocess.run(
+        ["yt-dlp", "-x", "--audio-format", "mp3", "--no-simulate",
+         "--print", fmt, "-o", str(outdir / "%(id)s.%(ext)s"), url],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"yt-dlp falló: {proc.stderr[-400:]}")
+    line = [l for l in proc.stdout.splitlines() if "\t" in l][-1]
+    _id, title, dur, filepath = line.split("\t")
+    duration = float(dur) if dur and dur != "NA" else 0.0
+    return Path(filepath), title, duration
+
+
+def download_best_audio(url: str, outdir: Path, emit) -> tuple[Path, str, float]:
+    """Descarga el mejor stream de audio SIN recodificar (m4a/opus, sin pérdida).
+
+    Devuelve (ruta, título, duración). Se usa en modo "solo audio".
+    """
+    emit("status", stage="downloading",
+         message="Descargando audio en la mejor calidad…")
+    fmt = "after_move:%(id)s\t%(title)s\t%(duration)s\t%(filepath)s"
+    proc = subprocess.run(
+        ["yt-dlp", "-f", "bestaudio/best", "--no-simulate",
+         "--print", fmt, "-o", str(outdir / "%(title)s.%(ext)s"), url],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"yt-dlp falló: {proc.stderr[-400:]}")
+    line = [l for l in proc.stdout.splitlines() if "\t" in l][-1]
+    _id, title, dur, filepath = line.split("\t")
+    duration = float(dur) if dur and dur != "NA" else 0.0
+    return Path(filepath), title, duration
+
+
+def demucs_available() -> bool:
+    """¿Está instalado Demucs (para el modo 'letra de canción')?"""
+    try:
+        import demucs  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def separate_vocals(audio: Path, outdir: Path, emit) -> Path:
+    """Aísla la voz de la música con Demucs y devuelve la ruta de vocals.wav.
+
+    La primera vez, Demucs descarga sus pesos (~una vez). Separar en CPU es
+    lento (varios minutos por canción); es normal.
+    """
+    emit("status", stage="separating",
+         message="Separando la voz de la música con Demucs (puede tardar)…")
+    sep_dir = outdir / "demucs"
+    proc = subprocess.run(
+        [sys.executable, "-m", "demucs", "--two-stems=vocals",
+         "-o", str(sep_dir), str(audio)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"Demucs falló: {proc.stderr[-400:]}")
+    matches = list(sep_dir.rglob("vocals.wav"))
+    if not matches:
+        raise RuntimeError("Demucs no produjo la pista de voz.")
+    return matches[0]
+
+
+def run_whisper(audio: Path, model: str, language: str, outdir: Path,
+                duration: float, emit) -> dict:
+    """Corre Whisper por CLI en modo verbose y transmite cada segmento."""
+    cmd = ["whisper", str(audio), "--model", model,
+           "--output_format", "all", "--output_dir", str(outdir),
+           "--verbose", "True", "--model_dir", str(CACHE_DIR)]
+    if language:
+        cmd += ["--language", language]
+
+    emit("status", stage="transcribing",
+         message=f"Transcribiendo con '{model}' en {device_name()}…",
+         model=model, device=device_name(), duration=duration)
+
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=env,
+    )
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        m = _TS_RE.search(line)
+        if m:
+            start = parse_ts(m.group(1))
+            end = parse_ts(m.group(2))
+            text = m.group(3).strip()
+            progress = min(end / duration, 1.0) if duration else None
+            emit("segment", start=start, end=end, text=text, progress=progress)
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError("Whisper terminó con error.")
+
+    stem = audio.stem
+    files = {}
+    for ext in ("txt", "srt", "vtt", "tsv", "json"):
+        f = outdir / f"{stem}.{ext}"
+        if f.exists():
+            files[ext] = f.name
+    return files
+
+
+def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
+             model: str, language: str, mode: str = "transcribe") -> None:
+    job = JOBS[job_id]
+
+    def emit(event: str, **data):
+        job["queue"].put({"event": event, "data": data})
+
+    outdir = OUTPUT_DIR / job_id
+    outdir.mkdir(parents=True, exist_ok=True)
+    try:
+        # Modo "solo audio": descargar el mejor audio y terminar, sin Whisper.
+        if mode == "audio_only":
+            audio, title, duration = download_best_audio(url, outdir, emit)
+            emit("meta", title=title, duration=duration, device=device_name())
+            emit("done", title=title, files={"audio": audio.name},
+                 job_id=job_id)
+            return
+
+        # Modo "letra de canción" necesita Demucs para aislar la voz.
+        if mode == "lyrics" and not demucs_available():
+            raise RuntimeError(
+                "Demucs no está instalado. Instálalo con: pip3 install demucs"
+            )
+
+        ensure_model(model, emit)
+
+        if source_type == "url":
+            # Para letra usamos el mejor audio (mejor separación de voz).
+            if mode == "lyrics":
+                audio, title, duration = download_best_audio(url, outdir, emit)
+            else:
+                audio, title, duration = download_youtube(url, outdir, emit)
+        else:
+            audio = upload_path
+            title = audio.name
+            duration = ffprobe_duration(audio)
+
+        emit("meta", title=title, duration=duration,
+             model=model, device=device_name())
+
+        if mode == "lyrics":
+            audio = separate_vocals(audio, outdir, emit)
+
+        files = run_whisper(audio, model, language, outdir, duration, emit)
+        emit("done", title=title, files=files, job_id=job_id)
+    except Exception as e:  # noqa: BLE001
+        emit("error", message=str(e))
+    finally:
+        job["queue"].put(None)  # centinela: fin del stream
+
+
+# --------------------------------------------------------------------------- #
+# Rutas
+# --------------------------------------------------------------------------- #
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+
+@app.get("/api/info")
+def info():
+    return JSONResponse({
+        "device": device_name(),
+        "models": [{"name": m, "cached": model_is_cached(m)} for m in MODELS],
+        "languages": [{"value": v, "label": l} for v, l in LANGUAGES],
+    })
+
+
+@app.post("/api/jobs")
+async def create_job(
+    source_type: str = Form(...),
+    model: str = Form("medium"),
+    language: str = Form(""),
+    url: str = Form(""),
+    mode: str = Form("transcribe"),
+    file: UploadFile | None = File(None),
+):
+    job_id = uuid.uuid4().hex[:12]
+    upload_path = None
+    if source_type == "file":
+        if file is None:
+            return JSONResponse({"error": "Falta el archivo"}, status_code=400)
+        outdir = OUTPUT_DIR / job_id
+        outdir.mkdir(parents=True, exist_ok=True)
+        upload_path = outdir / file.filename
+        with open(upload_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+    JOBS[job_id] = {"queue": queue.Queue()}
+    threading.Thread(
+        target=pipeline,
+        args=(job_id, source_type, url, upload_path, model, language, mode),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/jobs/{job_id}/events")
+def events(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"error": "job no existe"}, status_code=404)
+
+    def gen():
+        q: queue.Queue = job["queue"]
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            yield f"event: {item['event']}\ndata: {json.dumps(item['data'])}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/download/{job_id}/{name}")
+def download(job_id: str, name: str):
+    path = OUTPUT_DIR / job_id / name
+    if not path.exists():
+        return JSONResponse({"error": "no existe"}, status_code=404)
+    return FileResponse(path, filename=name)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)
