@@ -14,7 +14,6 @@ baja con `curl` (usa el llavero de macOS y evita el error SSL de proxys).
 """
 import json
 import os
-import queue
 import re
 import shutil
 import subprocess
@@ -24,7 +23,7 @@ import uuid
 from pathlib import Path
 
 import whisper  # solo para conocer las URLs de los modelos
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -72,6 +71,24 @@ def device_name() -> str:
     except Exception:
         pass
     return "cpu"
+
+
+def start_caffeinate() -> subprocess.Popen | None:
+    """Impide que la Mac se duerma / bloquee / apague la pantalla mientras dura
+    el trabajo. Devuelve el proceso (hay que terminarlo al acabar) o None si no
+    es macOS. Flags: -d display, -i idle, -m disco, -s sistema (con corriente),
+    -u actividad de usuario (mantiene la pantalla despierta).
+
+    Nota: no evita el "clamshell sleep" al cerrar la tapa; para eso hace falta
+    `sudo pmset -a disablesleep 1`. Pero el proceso sobrevive a ese sueño y
+    continúa al despertar.
+    """
+    if not shutil.which("caffeinate"):
+        return None
+    try:
+        return subprocess.Popen(["caffeinate", "-dimsu"])
+    except Exception:
+        return None
 
 
 def model_cache_path(model: str) -> Path:
@@ -245,7 +262,13 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
     job = JOBS[job_id]
 
     def emit(event: str, **data):
-        job["queue"].put({"event": event, "data": data})
+        # Guardamos cada evento en un buffer (permite reconexión) y avisamos.
+        with job["cond"]:
+            job["events"].append({"event": event, "data": data})
+            job["cond"].notify_all()
+
+    # Mantiene la Mac despierta durante todo el trabajo.
+    caffeinate = start_caffeinate()
 
     outdir = OUTPUT_DIR / job_id
     outdir.mkdir(parents=True, exist_ok=True)
@@ -288,7 +311,11 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
     except Exception as e:  # noqa: BLE001
         emit("error", message=str(e))
     finally:
-        job["queue"].put(None)  # centinela: fin del stream
+        if caffeinate is not None:
+            caffeinate.terminate()  # deja que la Mac vuelva a poder dormir
+        with job["cond"]:
+            job["done"] = True  # marca fin del stream (para todos los lectores)
+            job["cond"].notify_all()
 
 
 # --------------------------------------------------------------------------- #
@@ -328,7 +355,11 @@ async def create_job(
         with open(upload_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-    JOBS[job_id] = {"queue": queue.Queue()}
+    JOBS[job_id] = {
+        "events": [],                 # buffer de todos los eventos (para reconexión)
+        "cond": threading.Condition(),
+        "done": False,
+    }
     threading.Thread(
         target=pipeline,
         args=(job_id, source_type, url, upload_path, model, language, mode),
@@ -338,18 +369,40 @@ async def create_job(
 
 
 @app.get("/api/jobs/{job_id}/events")
-def events(job_id: str):
+def events(job_id: str, request: Request):
     job = JOBS.get(job_id)
     if not job:
         return JSONResponse({"error": "job no existe"}, status_code=404)
 
+    # Reconexión: el navegador reenvía el id del último evento recibido; retomamos
+    # desde el siguiente y así no se pierde ni se duplica nada tras un corte.
+    last = request.headers.get("last-event-id")
+    start = 0
+    if last is not None:
+        try:
+            start = int(last) + 1
+        except ValueError:
+            start = 0
+
     def gen():
-        q: queue.Queue = job["queue"]
+        cond: threading.Condition = job["cond"]
+        i = start
         while True:
-            item = q.get()
-            if item is None:
+            with cond:
+                if i >= len(job["events"]) and not job["done"]:
+                    cond.wait(timeout=15)  # espera evento nuevo o manda heartbeat
+                pending = job["events"][i:]
+                done = job["done"]
+            if pending:
+                for item in pending:
+                    yield (f"id: {i}\n"
+                           f"event: {item['event']}\n"
+                           f"data: {json.dumps(item['data'])}\n\n")
+                    i += 1
+            else:
+                yield ": keep-alive\n\n"  # mantiene viva la conexión TCP
+            if done and i >= len(job["events"]):
                 break
-            yield f"event: {item['event']}\ndata: {json.dumps(item['data'])}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

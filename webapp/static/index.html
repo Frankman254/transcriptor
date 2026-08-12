@@ -218,6 +218,7 @@ async function start() {
 
   const res = await fetch("/api/jobs", { method: "POST", body: fd });
   const { job_id } = await res.json();
+  localStorage.setItem("job_id", job_id);  // para retomar si se recarga la pestaña
   listen(job_id);
 }
 
@@ -242,9 +243,20 @@ function setProgress(p) {
   document.getElementById("pct").textContent = pct == null ? "…" : pct + "%";
 }
 
+function finishJob() {
+  // Trabajo terminado (bien o mal): dejamos de retomarlo al recargar.
+  localStorage.removeItem("job_id");
+  document.getElementById("go").disabled = false;
+}
+
 function listen(jobId) {
+  // EventSource se reconecta solo tras un corte (dormir la Mac, WiFi, etc.) y,
+  // gracias a los `id:` del servidor, retoma justo donde se quedó, sin duplicar.
   const es = new EventSource(`/api/jobs/${jobId}/events`);
   let duration = 0;
+  let tries = 0;
+
+  es.addEventListener("open", () => { tries = 0; });  // reconectó bien
 
   es.addEventListener("status", e => {
     const d = JSON.parse(e.data);
@@ -283,20 +295,51 @@ function listen(jobId) {
       a.textContent = ext === "audio" ? "⬇️ audio (" + name + ")" : "." + ext;
       dl.appendChild(a);
     }
-    document.getElementById("go").disabled = false;
     es.close();
+    finishJob();
   });
   es.addEventListener("error", e => {
-    let msg = "Se perdió la conexión con el servidor.";
-    try { msg = JSON.parse(e.data).message; } catch (_) {}
-    document.getElementById("err").textContent = "⚠️ " + msg;
-    setStage("Error", false);
-    document.getElementById("go").disabled = false;
-    es.close();
+    if (e.data) {
+      // Error real de la app (p. ej. yt-dlp/whisper falló).
+      let msg = "Ocurrió un error.";
+      try { msg = JSON.parse(e.data).message; } catch (_) {}
+      document.getElementById("err").textContent = "⚠️ " + msg;
+      setStage("Error", false);
+      es.close();
+      finishJob();
+      return;
+    }
+    // Sin datos = se cayó la conexión. EventSource reintenta solo.
+    tries++;
+    if (tries > 6) {
+      document.getElementById("err").textContent =
+        "⚠️ No se pudo reconectar. El trabajo pudo terminar o el servidor se cerró.";
+      setStage("Sin conexión", false);
+      es.close();
+      finishJob();
+      return;
+    }
+    setStage("🔌 Conexión perdida, reintentando… (la transcripción sigue en el servidor)", true);
   });
 }
 
+// Al cargar: si había un trabajo en curso (p. ej. la Mac se durmió y recargaste),
+// lo retomamos automáticamente mientras el servidor siga vivo.
+function resumeIfAny() {
+  const jobId = localStorage.getItem("job_id");
+  if (!jobId) return;
+  document.getElementById("live").classList.remove("hidden");
+  document.getElementById("segments").innerHTML = "";
+  document.getElementById("downloads").classList.add("hidden");
+  document.getElementById("err").textContent = "";
+  document.getElementById("go").disabled = true;
+  setStage("Retomando el trabajo en curso…", true);
+  setProgress(0);
+  listen(jobId);
+}
+
 loadInfo();
+resumeIfAny();
 </script>
 </body>
 </html>
