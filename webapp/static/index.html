@@ -58,7 +58,7 @@
   .seg { display: flex; gap: 12px; padding: 7px 4px; border-bottom: 1px solid var(--border); }
   .seg:last-child { border-bottom: none; }
   .seg .t { color: var(--accent); font-variant-numeric: tabular-nums; font-size: 12px;
-            white-space: nowrap; padding-top: 1px; min-width: 118px; }
+            white-space: nowrap; padding-top: 1px; min-width: 168px; }
   .seg .x { flex: 1; }
   .downloads { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
   .downloads a { text-decoration: none; padding: 8px 14px; border-radius: 9px;
@@ -161,6 +161,14 @@ function fmt(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
   const mm = String(m).padStart(2, "0"), ss = String(s).padStart(2, "0");
   return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+// Igual que fmt pero con milisegundos (importante para sincronizar letras).
+function fmtMs(sec) {
+  sec = Math.max(0, sec || 0);
+  const whole = Math.floor(sec);
+  const ms = Math.floor((sec - whole) * 1000);
+  return fmt(whole) + "." + String(ms).padStart(3, "0");
 }
 
 async function loadInfo() {
@@ -275,7 +283,7 @@ function listen(jobId) {
       `${fmt(d.end)}${duration ? " / " + fmt(duration) : ""}`;
     const row = document.createElement("div");
     row.className = "seg";
-    row.innerHTML = `<span class="t">${fmt(d.start)} → ${fmt(d.end)}</span>` +
+    row.innerHTML = `<span class="t">${fmtMs(d.start)} → ${fmtMs(d.end)}</span>` +
                     `<span class="x"></span>`;
     row.querySelector(".x").textContent = d.text;
     const box = document.getElementById("segments");
@@ -292,7 +300,9 @@ function listen(jobId) {
     for (const [ext, name] of Object.entries(d.files)) {
       const a = document.createElement("a");
       a.href = `/download/${d.job_id}/${encodeURIComponent(name)}`;
-      a.textContent = ext === "audio" ? "⬇️ audio (" + name + ")" : "." + ext;
+      a.textContent = ext === "audio" ? "⬇️ audio (" + name + ")"
+                    : ext === "lyrixa" ? "🎵 Lyrixa (.lyrixa.json)"
+                    : "." + ext;
       dl.appendChild(a);
     }
     es.close();

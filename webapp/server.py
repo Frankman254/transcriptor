@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import whisper  # solo para conocer las URLs de los modelos
@@ -222,7 +223,10 @@ def run_whisper(audio: Path, model: str, language: str, outdir: Path,
     """Corre Whisper por CLI en modo verbose y transmite cada segmento."""
     cmd = ["whisper", str(audio), "--model", model,
            "--output_format", "all", "--output_dir", str(outdir),
-           "--verbose", "True", "--model_dir", str(CACHE_DIR)]
+           "--verbose", "True", "--model_dir", str(CACHE_DIR),
+           # Tiempos por palabra: bordes de segmento más precisos (al ms) y
+           # habilita words[] en el JSON para el puente con Lyrixa.
+           "--word_timestamps", "True"]
     if language:
         cmd += ["--language", language]
 
@@ -255,6 +259,79 @@ def run_whisper(audio: Path, model: str, language: str, outdir: Path,
         if f.exists():
             files[ext] = f.name
     return files
+
+
+def build_lyrixa_bundle(outdir: Path, json_name: str | None,
+                        title: str, duration: float) -> str | None:
+    """Convierte el JSON de Whisper en un proyecto `.lyrixa.json` importable.
+
+    Cada segmento se vuelve un clip cronometrado (startTime/endTime en segundos
+    con decimales = precisión de ms) en la capa principal 'layer-main'. Lyrixa
+    lo carga como proyecto y ya tiene la letra y los tiempos exactos. Si Whisper
+    dio tiempos por palabra, se incluyen en `clip.words` (campo reservado que el
+    renderer ignora hoy pero contempla a futuro).
+    """
+    if not json_name:
+        return None
+    try:
+        data = json.loads((outdir / json_name).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    clips: list[dict] = []
+    lines: list[str] = []
+    for i, seg in enumerate(data.get("segments", [])):
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = round(float(seg.get("start", 0.0)), 3)
+        end = round(float(seg.get("end", start)), 3)
+        if end <= start:                 # respeta MIN_CLIP_DURATION de Lyrixa
+            end = round(start + 0.25, 3)
+        clip = {
+            "id": f"clip-{i}",
+            "text": text,
+            "startTime": start,
+            "endTime": end,
+            "layerId": "layer-main",     # MAIN_LAYER_ID de Lyrixa
+            "sourceIndex": len(lines),
+            "createdBy": "import",
+            "transitionIn": "fade",
+            "transitionOut": "fade",
+            "position": "center",
+        }
+        words = []
+        for w in seg.get("words") or []:
+            wt = (w.get("word") or w.get("text") or "").strip()
+            if not wt or "start" not in w or "end" not in w:
+                continue
+            words.append({"text": wt,
+                          "startTime": round(float(w["start"]), 3),
+                          "endTime": round(float(w["end"]), 3)})
+        if words:
+            clip["words"] = words
+        clips.append(clip)
+        lines.append(text)
+
+    envelope = {
+        "schemaVersion": 1,
+        "app": "Lyrixa",
+        "exportedAt": datetime.now(timezone.utc).isoformat(),
+        "project": {
+            "id": f"transcriptor-{Path(json_name).stem}",
+            "name": title or Path(json_name).stem,
+            "lyricMode": "single",
+            "rawLyricsText": "\n".join(lines),
+            "normalizedLyrics": lines,
+            "clips": clips,
+            "currentTime": 0,
+            "renderMode": "editor",
+        },
+    }
+    out = outdir / f"{Path(json_name).stem}.lyrixa.json"
+    out.write_text(json.dumps(envelope, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    return out.name
 
 
 def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
@@ -307,6 +384,10 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
             audio = separate_vocals(audio, outdir, emit)
 
         files = run_whisper(audio, model, language, outdir, duration, emit)
+        # Puente con Lyrixa: proyecto con clips ya cronometrados.
+        lyrixa = build_lyrixa_bundle(outdir, files.get("json"), title, duration)
+        if lyrixa:
+            files["lyrixa"] = lyrixa
         emit("done", title=title, files=files, job_id=job_id)
     except Exception as e:  # noqa: BLE001
         emit("error", message=str(e))
