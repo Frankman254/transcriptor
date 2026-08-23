@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 import uuid
-from datetime import datetime, timezone
+from collections import deque
 from pathlib import Path
 
 import whisper  # solo para conocer las URLs de los modelos
@@ -31,6 +31,7 @@ from fastapi.responses import (
     JSONResponse,
     StreamingResponse,
 )
+from lyrixa_bridge import build_lyrixa_envelope
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -40,6 +41,42 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Modelos que ofrecemos en la interfaz (nombre -> etiqueta amigable).
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "turbo"]
+
+# Formatos de audio ofrecidos al descargar.
+#   value      -> lo que se le pasa a `yt-dlp --audio-format` ("best" = no recodificar)
+#   lossless   -> no tiene bitrate que elegir
+#   cover      -> el contenedor admite carátula incrustada
+AUDIO_FORMATS = [
+    {"value": "best", "label": "Original (sin recodificar)",
+     "hint": "Tal cual viene de YouTube (opus/m4a). Máxima fidelidad y lo más rápido.",
+     "lossless": True, "cover": True},
+    {"value": "mp3", "label": "MP3",
+     "hint": "El más compatible: suena en cualquier reproductor.",
+     "lossless": False, "cover": True},
+    {"value": "m4a", "label": "M4A (AAC)",
+     "hint": "Mejor calidad que MP3 al mismo peso. Ideal para Apple Music/iPhone.",
+     "lossless": False, "cover": True},
+    {"value": "opus", "label": "Opus",
+     "hint": "El más eficiente: máxima calidad en el menor tamaño.",
+     "lossless": False, "cover": True},
+    {"value": "vorbis", "label": "OGG Vorbis",
+     "hint": "Libre y compatible con Android y reproductores abiertos.",
+     "lossless": False, "cover": True},
+    {"value": "flac", "label": "FLAC",
+     "hint": "Sin pérdida y comprimido. Para archivar o escuchar en alta fidelidad.",
+     "lossless": True, "cover": True},
+    {"value": "alac", "label": "ALAC",
+     "hint": "Sin pérdida de Apple. Para la biblioteca de Música de macOS/iOS.",
+     "lossless": True, "cover": True},
+    {"value": "wav", "label": "WAV",
+     "hint": "Sin comprimir, para editar. Pesa mucho y no admite carátula.",
+     "lossless": True, "cover": False},
+]
+
+# Bitrates para los formatos con pérdida (mp3/m4a/opus/vorbis).
+AUDIO_QUALITIES = ["320K", "256K", "192K", "128K", "96K"]
+
+_FORMATS_BY_VALUE = {f["value"]: f for f in AUDIO_FORMATS}
 
 # Idiomas comunes; "" = detección automática.
 LANGUAGES = [
@@ -135,6 +172,22 @@ def ffprobe_duration(path: Path) -> float:
         return 0.0
 
 
+# Caracteres que no pueden ir en un nombre de archivo (o que rompen la
+# cabecera Content-Disposition al descargar).
+_BAD_FS_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def safe_stem(name: str, fallback: str = "transcripcion") -> str:
+    """Convierte un título en un nombre de archivo usable, sin perder legibilidad.
+
+    Se usa para que el .txt/.srt/.json salgan como "Nombre del video.srt" en vez
+    de "u2xI9o6siyI.srt" (id de YouTube) o "vocals.srt" (salida de Demucs).
+    """
+    stem = _BAD_FS_CHARS.sub("_", (name or "").strip())
+    stem = re.sub(r"\s+", " ", stem).strip(" .")
+    return stem[:120].strip() or fallback
+
+
 _TS_RE = re.compile(
     r"\[(\d+:\d+(?::\d+)?\.\d+)\s*-->\s*(\d+:\d+(?::\d+)?\.\d+)\]\s?(.*)"
 )
@@ -149,41 +202,156 @@ def parse_ts(ts: str) -> float:
     return h * 3600 + m * 60 + s
 
 
-def download_youtube(url: str, outdir: Path, emit) -> tuple[Path, str, float]:
-    """Descarga el audio como mp3. Devuelve (ruta, título, duración)."""
-    emit("status", stage="downloading", message="Descargando audio de YouTube…")
-    fmt = "after_move:%(id)s\t%(title)s\t%(duration)s\t%(filepath)s"
-    proc = subprocess.run(
-        ["yt-dlp", "-x", "--audio-format", "mp3", "--no-simulate",
-         "--print", fmt, "-o", str(outdir / "%(id)s.%(ext)s"), url],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"yt-dlp falló: {proc.stderr[-400:]}")
-    line = [l for l in proc.stdout.splitlines() if "\t" in l][-1]
-    _id, title, dur, filepath = line.split("\t")
-    duration = float(dur) if dur and dur != "NA" else 0.0
-    return Path(filepath), title, duration
+# Progreso de yt-dlp: lo pedimos en un formato fijo y parseable en vez de
+# tener que leer la barra bonita que imprime por defecto.
+_YT_PROGRESS_TMPL = (
+    "download:@PROG@%(progress.downloaded_bytes)s|"
+    "%(progress.total_bytes,progress.total_bytes_estimate)s|"
+    "%(progress.fragment_index)s|%(progress.fragment_count)s"
+)
+_PROG_RE = re.compile(r"^@PROG@(\S*)\|(\S*)\|(\S*)\|(\S*)$")
+
+# Nombres internos de los postprocesadores de yt-dlp -> qué contarle al usuario.
+_PP_LABELS = {
+    "ExtractAudio": "Convirtiendo el audio…",
+    "ThumbnailsConvertor": "Preparando la carátula…",
+    "EmbedThumbnail": "Incrustando la carátula…",
+    "FFmpegMetadata": "Escribiendo los metadatos…",
+    "Metadata": "Escribiendo los metadatos…",
+}
 
 
-def download_best_audio(url: str, outdir: Path, emit) -> tuple[Path, str, float]:
-    """Descarga el mejor stream de audio SIN recodificar (m4a/opus, sin pérdida).
+def _pos_float(text: str) -> float | None:
+    """Convierte a float los campos de yt-dlp, que valen 'NA' cuando no se saben."""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
-    Devuelve (ruta, título, duración). Se usa en modo "solo audio".
+
+def _yt_dlp_error(tail: str) -> str:
+    """Traduce el error crudo de yt-dlp a algo accionable."""
+    if "403" in tail or "Forbidden" in tail:
+        return ("YouTube rechazó la descarga (HTTP 403). Casi siempre significa "
+                "que yt-dlp se quedó viejo: actualízalo con "
+                "`brew upgrade yt-dlp` (o `pip3 install -U yt-dlp`) y reintenta.")
+    if "Sign in to confirm" in tail or "bot" in tail.lower():
+        return ("YouTube pide verificar que no eres un bot. Prueba a exportar las "
+                "cookies del navegador: `yt-dlp --cookies-from-browser chrome …`")
+    if "Video unavailable" in tail or "Private video" in tail:
+        return "El video no está disponible (privado, borrado o con bloqueo regional)."
+    return f"yt-dlp falló: {tail[-400:]}"
+
+
+def audio_download_args(audio_format: str, quality: str) -> tuple[list[str], dict]:
+    """Argumentos de yt-dlp para el formato pedido + la ficha de ese formato.
+
+    "best" conserva el códec original (no recodifica); cualquier otro valor
+    convierte con ffmpeg. En ambos casos incrustamos metadatos y, si el
+    contenedor lo admite, la carátula del video como portada del álbum.
     """
+    spec = _FORMATS_BY_VALUE.get(audio_format) or _FORMATS_BY_VALUE["best"]
+
+    # Siempre extraemos el audio. Con "best", ffmpeg solo lo re-empaqueta (copia
+    # el códec tal cual, sin recodificar): el resultado es .opus o .m4a en vez
+    # del .webm crudo, que ni admite carátula ni lo abren muchos reproductores.
+    args: list[str] = ["-x", "--audio-format", spec["value"]]
+    if not spec["lossless"]:
+        args += ["--audio-quality", quality or "192K"]
+
+    args += [
+        "--embed-metadata",
+        # La descripción entera de YouTube dentro del tag ensucia cualquier
+        # reproductor (son miles de caracteres); la vaciamos.
+        "--parse-metadata", ":(?P<meta_description>)",
+        "--parse-metadata", ":(?P<meta_synopsis>)",
+        # Si el video no declara artista/álbum (o sea: no viene de YouTube
+        # Music), caemos al canal para no dejar los campos vacíos.
+        "--parse-metadata", "%(artist,creator,uploader)s:%(meta_artist)s",
+        "--parse-metadata", "%(album,playlist_title,uploader)s:%(meta_album)s",
+    ]
+    if spec["cover"]:
+        args += ["--embed-thumbnail", "--convert-thumbnails", "jpg"]
+    return args, spec
+
+
+def download_audio(url: str, outdir: Path, emit, audio_format: str = "best",
+                   quality: str = "192K",
+                   name_template: str = "%(title)s.%(ext)s",
+                   ) -> tuple[Path, str, float]:
+    """Descarga el audio de un link y emite el avance en vivo.
+
+    Devuelve (ruta, título, duración). El archivo sale con sus metadatos y su
+    carátula ya incrustados.
+    """
+    extra, spec = audio_download_args(audio_format, quality)
     emit("status", stage="downloading",
-         message="Descargando audio en la mejor calidad…")
-    fmt = "after_move:%(id)s\t%(title)s\t%(duration)s\t%(filepath)s"
-    proc = subprocess.run(
-        ["yt-dlp", "-f", "bestaudio/best", "--no-simulate",
-         "--print", fmt, "-o", str(outdir / "%(title)s.%(ext)s"), url],
-        capture_output=True, text=True,
+         message=f"Descargando audio ({spec['label']})…")
+    emit("progress", stage="downloading", progress=0.0)
+
+    cmd = [
+        "yt-dlp", "-f", "bestaudio/best", "--no-simulate", "--no-playlist",
+        # --print activa --quiet, que se lleva por delante el progreso;
+        # --progress lo vuelve a encender.
+        "--newline", "--progress",
+        # Descargas largas: reintenta en vez de morir a mitad de camino.
+        "--retries", "10", "--fragment-retries", "10",
+        "--concurrent-fragments", "4",
+        "--progress-template", _YT_PROGRESS_TMPL,
+        "--progress-template", "postprocess:@PP@%(progress.postprocessor)s",
+        "--print", "after_move:@DONE@%(id)s\t%(title)s\t%(duration)s\t%(filepath)s",
+        "-o", str(outdir / name_template),
+    ] + extra + [url]
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
+
+    tail: deque[str] = deque(maxlen=30)   # por si hay que explicar un fallo
+    done_line: str | None = None
+    last_pct = -1
+    last_pp = None
+
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if line.startswith("@DONE@"):
+            done_line = line[len("@DONE@"):]
+            continue
+        if line.startswith("@PP@"):
+            label = _PP_LABELS.get(line[len("@PP@"):].strip())
+            if label and label != last_pp:
+                last_pp = label
+                emit("status", stage="postprocessing", message=label)
+                emit("progress", stage="postprocessing", progress=None)
+            continue
+        m = _PROG_RE.match(line)
+        if m:
+            got, total, frag_i, frag_n = m.groups()
+            fraction = None
+            if _pos_float(total):
+                fraction = (_pos_float(got) or 0.0) / _pos_float(total)
+            elif _pos_float(frag_n):          # HLS: no hay bytes, pero sí fragmentos
+                fraction = (_pos_float(frag_i) or 0.0) / _pos_float(frag_n)
+            if fraction is not None:
+                pct = int(min(fraction, 1.0) * 100)
+                if pct != last_pct:           # 1 evento por punto porcentual
+                    last_pct = pct
+                    emit("progress", stage="downloading",
+                         progress=min(fraction, 1.0))
+            continue
+        tail.append(line)
+
+    proc.wait()
     if proc.returncode != 0:
-        raise RuntimeError(f"yt-dlp falló: {proc.stderr[-400:]}")
-    line = [l for l in proc.stdout.splitlines() if "\t" in l][-1]
-    _id, title, dur, filepath = line.split("\t")
+        raise RuntimeError(_yt_dlp_error("\n".join(tail)))
+
+    if not done_line:
+        raise RuntimeError("yt-dlp terminó pero no reportó el archivo descargado.")
+    _id, title, dur, filepath = done_line.split("\t")
     duration = float(dur) if dur and dur != "NA" else 0.0
+    emit("progress", stage="downloading", progress=1.0)
     return Path(filepath), title, duration
 
 
@@ -196,31 +364,86 @@ def demucs_available() -> bool:
         return False
 
 
+# Demucs escribe una barra tqdm en stderr:
+#   " 25%|█████▌      | 5.85/23.4 [00:01<00:03, 5.66seconds/s]"
+# Nos quedamos con la fracción exacta (procesado/total), no con el entero.
+_DEMUCS_RE = re.compile(r"(\d+)%\|.*?\|\s*([\d.]+)/([\d.]+)\s")
+_DEMUCS_BAG_RE = re.compile(r"bag of (\d+) models")
+
+
 def separate_vocals(audio: Path, outdir: Path, emit) -> Path:
     """Aísla la voz de la música con Demucs y devuelve la ruta de vocals.wav.
 
     La primera vez, Demucs descarga sus pesos (~una vez). Separar en CPU es
-    lento (varios minutos por canción); es normal.
+    lento (varios minutos por canción); por eso vamos emitiendo el avance.
+
+    Los modelos "bag of N" (como htdemucs_ft) pasan la pista por N modelos y
+    dibujan N barras seguidas, así que las encadenamos en un solo porcentaje
+    global: cada barra completa vale 1/N del total.
     """
     emit("status", stage="separating",
          message="Separando la voz de la música con Demucs (puede tardar)…")
+    emit("progress", stage="separating", progress=0.0)
+
     sep_dir = outdir / "demucs"
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, "-m", "demucs", "--two-stems=vocals",
          "-o", str(sep_dir), str(audio)],
-        capture_output=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
+
+    tail: deque[str] = deque(maxlen=30)
+    n_models = 1        # cuántas pasadas hará (bag of N)
+    finished = 0        # pasadas ya completadas
+    prev_fraction = 0.0
+    last_pct = -1
+
+    # text=True traduce los \r de la barra a \n, así que cada refresco de tqdm
+    # llega aquí como una línea suelta.
+    for line in proc.stdout:
+        line = line.rstrip("\n").strip()
+        if not line:
+            continue
+        bag = _DEMUCS_BAG_RE.search(line)
+        if bag:
+            n_models = max(1, int(bag.group(1)))
+            tail.append(line)
+            continue
+        m = _DEMUCS_RE.search(line)
+        if not m:
+            tail.append(line)
+            continue
+        done, total = float(m.group(2)), float(m.group(3))
+        fraction = min(done / total, 1.0) if total else 0.0
+        if fraction < prev_fraction - 0.01:   # la barra reinició = nuevo modelo
+            finished = min(finished + 1, n_models - 1)
+        prev_fraction = fraction
+        overall = (finished + fraction) / n_models
+        pct = int(overall * 100)
+        if pct != last_pct:
+            last_pct = pct
+            emit("progress", stage="separating", progress=min(overall, 1.0))
+
+    proc.wait()
     if proc.returncode != 0:
-        raise RuntimeError(f"Demucs falló: {proc.stderr[-400:]}")
+        raise RuntimeError(f"Demucs falló: {chr(10).join(tail)[-400:]}")
+
     matches = list(sep_dir.rglob("vocals.wav"))
     if not matches:
         raise RuntimeError("Demucs no produjo la pista de voz.")
+    emit("progress", stage="separating", progress=1.0)
     return matches[0]
 
 
 def run_whisper(audio: Path, model: str, language: str, outdir: Path,
-                duration: float, emit) -> dict:
-    """Corre Whisper por CLI en modo verbose y transmite cada segmento."""
+                duration: float, emit, out_stem: str | None = None) -> dict:
+    """Corre Whisper por CLI en modo verbose y transmite cada segmento.
+
+    `out_stem` es el nombre con el que queremos que salgan los archivos. Whisper
+    los nombra según el audio que le damos, que puede ser el id de YouTube o el
+    `vocals.wav` de Demucs; aquí los renombramos al título de verdad.
+    """
     cmd = ["whisper", str(audio), "--model", model,
            "--output_format", "all", "--output_dir", str(outdir),
            "--verbose", "True", "--model_dir", str(CACHE_DIR),
@@ -253,23 +476,30 @@ def run_whisper(audio: Path, model: str, language: str, outdir: Path,
         raise RuntimeError("Whisper terminó con error.")
 
     stem = audio.stem
+    target = safe_stem(out_stem or stem, fallback=stem)
     files = {}
     for ext in ("txt", "srt", "vtt", "tsv", "json"):
         f = outdir / f"{stem}.{ext}"
-        if f.exists():
-            files[ext] = f.name
+        if not f.exists():
+            continue
+        if target != stem:
+            renamed = outdir / f"{target}.{ext}"
+            f.replace(renamed)      # replace: sobrescribe si ya existía
+            f = renamed
+        files[ext] = f.name
     return files
 
 
-def build_lyrixa_bundle(outdir: Path, json_name: str | None,
-                        title: str, duration: float) -> str | None:
+def build_lyrixa_bundle(
+    outdir: Path, json_name: str | None, title: str, duration: float,
+    audio_file_name: str | None = None, model: str | None = None,
+    language: str | None = None,
+) -> str | None:
     """Convierte el JSON de Whisper en un proyecto `.lyrixa.json` importable.
 
-    Cada segmento se vuelve un clip cronometrado (startTime/endTime en segundos
-    con decimales = precisión de ms) en la capa principal 'layer-main'. Lyrixa
-    lo carga como proyecto y ya tiene la letra y los tiempos exactos. Si Whisper
-    dio tiempos por palabra, se incluyen en `clip.words` (campo reservado que el
-    renderer ignora hoy pero contempla a futuro).
+    El normalizador puro vive en ``lyrixa_bridge``. Este adaptador se limita a
+    leer el JSON raw de Whisper y escribir el envelope de proyecto de Lyrixa;
+    nunca modifica ni reemplaza la salida original de Whisper.
     """
     if not json_name:
         return None
@@ -278,56 +508,15 @@ def build_lyrixa_bundle(outdir: Path, json_name: str | None,
     except Exception:
         return None
 
-    clips: list[dict] = []
-    lines: list[str] = []
-    for i, seg in enumerate(data.get("segments", [])):
-        text = (seg.get("text") or "").strip()
-        if not text:
-            continue
-        start = round(float(seg.get("start", 0.0)), 3)
-        end = round(float(seg.get("end", start)), 3)
-        if end <= start:                 # respeta MIN_CLIP_DURATION de Lyrixa
-            end = round(start + 0.25, 3)
-        clip = {
-            "id": f"clip-{i}",
-            "text": text,
-            "startTime": start,
-            "endTime": end,
-            "layerId": "layer-main",     # MAIN_LAYER_ID de Lyrixa
-            "sourceIndex": len(lines),
-            "createdBy": "import",
-            "transitionIn": "fade",
-            "transitionOut": "fade",
-            "position": "center",
-        }
-        words = []
-        for w in seg.get("words") or []:
-            wt = (w.get("word") or w.get("text") or "").strip()
-            if not wt or "start" not in w or "end" not in w:
-                continue
-            words.append({"text": wt,
-                          "startTime": round(float(w["start"]), 3),
-                          "endTime": round(float(w["end"]), 3)})
-        if words:
-            clip["words"] = words
-        clips.append(clip)
-        lines.append(text)
-
-    envelope = {
-        "schemaVersion": 1,
-        "app": "Lyrixa",
-        "exportedAt": datetime.now(timezone.utc).isoformat(),
-        "project": {
-            "id": f"transcriptor-{Path(json_name).stem}",
-            "name": title or Path(json_name).stem,
-            "lyricMode": "single",
-            "rawLyricsText": "\n".join(lines),
-            "normalizedLyrics": lines,
-            "clips": clips,
-            "currentTime": 0,
-            "renderMode": "editor",
-        },
-    }
+    envelope = build_lyrixa_envelope(
+        data,
+        title=title,
+        duration=duration,
+        audio_file_name=audio_file_name,
+        model=model,
+        language=language,
+        project_stem=Path(json_name).stem,
+    )
     out = outdir / f"{Path(json_name).stem}.lyrixa.json"
     out.write_text(json.dumps(envelope, ensure_ascii=False, indent=2),
                    encoding="utf-8")
@@ -335,7 +524,8 @@ def build_lyrixa_bundle(outdir: Path, json_name: str | None,
 
 
 def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
-             model: str, language: str, mode: str = "transcribe") -> None:
+             model: str, language: str, mode: str = "transcribe",
+             audio_format: str = "best", audio_quality: str = "192K") -> None:
     job = JOBS[job_id]
 
     def emit(event: str, **data):
@@ -350,9 +540,10 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
     outdir = OUTPUT_DIR / job_id
     outdir.mkdir(parents=True, exist_ok=True)
     try:
-        # Modo "solo audio": descargar el mejor audio y terminar, sin Whisper.
+        # Modo "solo audio": descargar en el formato pedido y terminar, sin Whisper.
         if mode == "audio_only":
-            audio, title, duration = download_best_audio(url, outdir, emit)
+            audio, title, duration = download_audio(
+                url, outdir, emit, audio_format, audio_quality)
             emit("meta", title=title, duration=duration, device=device_name())
             emit("done", title=title, files={"audio": audio.name},
                  job_id=job_id)
@@ -366,16 +557,18 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
 
         ensure_model(model, emit)
 
+        source_audio = None
         if source_type == "url":
-            # Para letra usamos el mejor audio (mejor separación de voz).
-            if mode == "lyrics":
-                audio, title, duration = download_best_audio(url, outdir, emit)
-            else:
-                audio, title, duration = download_youtube(url, outdir, emit)
+            # Para letra conviene el audio sin recodificar: mejor separación de voz.
+            fmt = "best" if mode == "lyrics" else audio_format
+            source_audio, title, duration = download_audio(
+                url, outdir, emit, fmt, audio_quality)
+            audio = source_audio
         else:
             audio = upload_path
-            title = audio.name
+            title = audio.stem          # sin extensión: es el nombre de las salidas
             duration = ffprobe_duration(audio)
+        original_audio = audio
 
         emit("meta", title=title, duration=duration,
              model=model, device=device_name())
@@ -383,11 +576,18 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         if mode == "lyrics":
             audio = separate_vocals(audio, outdir, emit)
 
-        files = run_whisper(audio, model, language, outdir, duration, emit)
+        files = run_whisper(audio, model, language, outdir, duration, emit,
+                            out_stem=title)
         # Puente con Lyrixa: proyecto con clips ya cronometrados.
-        lyrixa = build_lyrixa_bundle(outdir, files.get("json"), title, duration)
+        lyrixa = build_lyrixa_bundle(
+            outdir, files.get("json"), title, duration,
+            audio_file_name=original_audio.name, model=model, language=language,
+        )
         if lyrixa:
             files["lyrixa"] = lyrixa
+        # El audio descargado (con sus metadatos y carátula) también se ofrece.
+        if source_audio is not None and source_audio.exists():
+            files["audio"] = source_audio.name
         emit("done", title=title, files=files, job_id=job_id)
     except Exception as e:  # noqa: BLE001
         emit("error", message=str(e))
@@ -413,6 +613,9 @@ def info():
         "device": device_name(),
         "models": [{"name": m, "cached": model_is_cached(m)} for m in MODELS],
         "languages": [{"value": v, "label": l} for v, l in LANGUAGES],
+        "audio_formats": AUDIO_FORMATS,
+        "audio_qualities": AUDIO_QUALITIES,
+        "demucs": demucs_available(),
     })
 
 
@@ -423,8 +626,16 @@ async def create_job(
     language: str = Form(""),
     url: str = Form(""),
     mode: str = Form("transcribe"),
+    audio_format: str = Form("best"),
+    audio_quality: str = Form("192K"),
     file: UploadFile | None = File(None),
 ):
+    if audio_format not in _FORMATS_BY_VALUE:
+        return JSONResponse({"error": f"Formato desconocido: {audio_format}"},
+                            status_code=400)
+    if audio_quality not in AUDIO_QUALITIES:
+        audio_quality = "192K"
+
     job_id = uuid.uuid4().hex[:12]
     upload_path = None
     if source_type == "file":
@@ -432,7 +643,8 @@ async def create_job(
             return JSONResponse({"error": "Falta el archivo"}, status_code=400)
         outdir = OUTPUT_DIR / job_id
         outdir.mkdir(parents=True, exist_ok=True)
-        upload_path = outdir / file.filename
+        # Nunca confiamos en el nombre que manda el navegador para armar rutas.
+        upload_path = outdir / Path(file.filename or "audio").name
         with open(upload_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
@@ -443,7 +655,8 @@ async def create_job(
     }
     threading.Thread(
         target=pipeline,
-        args=(job_id, source_type, url, upload_path, model, language, mode),
+        args=(job_id, source_type, url, upload_path, model, language, mode,
+              audio_format, audio_quality),
         daemon=True,
     ).start()
     return {"job_id": job_id}
@@ -490,10 +703,13 @@ def events(job_id: str, request: Request):
 
 @app.get("/download/{job_id}/{name}")
 def download(job_id: str, name: str):
-    path = OUTPUT_DIR / job_id / name
-    if not path.exists():
+    # El nombre viene de la URL: nos quedamos solo con el archivo y verificamos
+    # que el resultado siga dentro de la carpeta del job (nada de "../").
+    job_dir = (OUTPUT_DIR / job_id).resolve()
+    path = (job_dir / Path(name).name).resolve()
+    if not path.is_file() or job_dir not in path.parents:
         return JSONResponse({"error": "no existe"}, status_code=404)
-    return FileResponse(path, filename=name)
+    return FileResponse(path, filename=path.name)
 
 
 if __name__ == "__main__":

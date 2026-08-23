@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 python-multipart
+mutagen
 # openai-whisper y yt-dlp ya están instalados en el sistema (pip / brew)
 # demucs: opcional, solo para el modo "letra de canción" (aísla la voz).
 #   pip3 install demucs

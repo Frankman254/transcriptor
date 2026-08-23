@@ -1,0 +1,33 @@
+{
+  "language": "Spanish",
+  "segments": [
+    {
+      "id": 0,
+      "start": 36.0,
+      "end": 59.0,
+      "text": "Esta noche seguimos bailando, porque la música nos llama. Nadie quiere detenerse cuando vuelve el ritmo y la ciudad despierta.",
+      "words": [
+        {"word": "Esta", "start": 36.0, "end": 36.6},
+        {"word": " noche", "start": 36.65, "end": 37.3},
+        {"word": " seguimos", "start": 37.35, "end": 38.1},
+        {"word": " bailando,", "start": 38.15, "end": 39.1},
+        {"word": " porque", "start": 40.0, "end": 40.6},
+        {"word": " la", "start": 40.65, "end": 41.0},
+        {"word": " música", "start": 41.05, "end": 41.8},
+        {"word": " nos", "start": 41.85, "end": 42.2},
+        {"word": " llama.", "start": 42.25, "end": 43.0},
+        {"word": " Nadie", "start": 44.0, "end": 44.6},
+        {"word": " quiere", "start": 44.65, "end": 45.2},
+        {"word": " detenerse", "start": 45.25, "end": 46.2},
+        {"word": " cuando", "start": 47.0, "end": 47.6},
+        {"word": " vuelve", "start": 47.65, "end": 48.2},
+        {"word": " el", "start": 48.25, "end": 48.5},
+        {"word": " ritmo", "start": 48.55, "end": 49.2},
+        {"word": " y", "start": 50.0, "end": 50.2},
+        {"word": " la", "start": 50.25, "end": 50.55},
+        {"word": " ciudad", "start": 50.6, "end": 51.3},
+        {"word": " despierta.", "start": 51.35, "end": 52.4}
+      ]
+    }
+  ]
+}

@@ -14,7 +14,20 @@ con su tiempo `inicio → fin` conforme se genera (vía SSE).
 |------|----------|
 | 🎧 **Transcribir** | Texto con timestamps de un link de YouTube o un archivo. |
 | 🎤 **Letra de canción** | Aísla la voz de la música con Demucs y luego la transcribe. |
-| ⬇️ **Solo audio** | Descarga el mejor audio de un YouTube (sin recodificar), sin transcribir. |
+| ⬇️ **Solo audio** | Descarga audio de YouTube en MP3, M4A, Opus, OGG, FLAC, ALAC, WAV u original. |
+
+## Puente hacia Lyrixa
+
+Además de conservar las salidas originales de Whisper, cada transcripción
+genera un proyecto de autoría `.lyrixa.json`. Los segmentos largos se dividen
+con los timestamps reales de `words[]`, priorizando puntuación y pausas, para
+crear clips editables de aproximadamente 2–6 segundos (8 segundos como límite
+normal). Si los timestamps por palabra faltan o están incompletos, se conserva
+el segmento original completo como fallback.
+
+En Lyrixa usa **More → Import project (.lyrixa.json)** y después carga el mismo
+audio para revisar el timeline. Tras editar, usa **Export lyrics bundle** para
+obtener el `.lyrixa-lyrics.json` que consume LiveWallpaperAnimeGlitch.
 
 ## Arrancar
 
@@ -32,7 +45,17 @@ Abre **http://127.0.0.1:8000** en el navegador.
 - `openai-whisper` (motor de transcripción)
 - `demucs` *(opcional)* — solo para el modo "letra de canción": `pip3 install demucs`
 
-Las dependencias del backend (`fastapi`, `uvicorn`, `python-multipart`) las
+Las dependencias del backend (`fastapi`, `uvicorn`, `python-multipart`, `mutagen`) las
 instala `run.sh` la primera vez.
 
+Las descargas desde YouTube conservan el título original del video. Cuando el
+formato lo permite, también incluyen título, artista, álbum, fecha y portada
+incrustada. WAV no admite portada.
+
 Más detalles en [`webapp/README.md`](webapp/README.md).
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```

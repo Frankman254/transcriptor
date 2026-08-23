@@ -65,6 +65,9 @@
                  background: var(--panel2); border: 1px solid var(--border); color: var(--text);
                  font-size: 13px; }
   .downloads a:hover { border-color: var(--accent); }
+  .downloads a b { display: block; font-size: 11px; color: var(--muted);
+                   font-weight: 400; max-width: 220px; overflow: hidden;
+                   text-overflow: ellipsis; white-space: nowrap; }
   .err { color: var(--danger); font-size: 14px; }
   .hidden { display: none; }
   cite { color: var(--muted); font-style: normal; }
@@ -111,6 +114,20 @@
       </div>
     </div>
 
+    <div id="audio-opts" style="margin-top:16px">
+      <div class="row">
+        <div>
+          <label>Formato de audio</label>
+          <select id="audio_format" onchange="onFormatChange()"></select>
+        </div>
+        <div id="quality-wrap">
+          <label>Calidad</label>
+          <select id="audio_quality"></select>
+        </div>
+      </div>
+      <p class="sub" id="fmt-hint" style="margin:8px 2px 0;font-size:12px"></p>
+    </div>
+
     <button class="go" id="go" onclick="start()">Transcribir</button>
   </div>
 
@@ -136,6 +153,23 @@ function setSource(s) {
     t.classList.toggle("active", t.dataset.src === s));
   document.getElementById("pane-url").classList.toggle("hidden", s !== "url");
   document.getElementById("pane-file").classList.toggle("hidden", s !== "file");
+  syncAudioOpts();
+}
+
+// El formato de audio solo aplica cuando bajamos de YouTube. En "letra de
+// canción" el backend usa siempre el original (separa mejor la voz).
+function syncAudioOpts() {
+  document.getElementById("audio-opts").classList.toggle(
+    "hidden", SOURCE !== "url" || MODE === "lyrics");
+}
+
+function onFormatChange() {
+  const sel = document.getElementById("audio_format");
+  const spec = (INFO?.audio_formats || []).find(f => f.value === sel.value);
+  // Los formatos sin pérdida no tienen bitrate que elegir.
+  document.getElementById("quality-wrap").classList.toggle(
+    "hidden", !spec || spec.lossless);
+  document.getElementById("fmt-hint").textContent = spec ? spec.hint : "";
 }
 
 function setMode(m) {
@@ -154,7 +188,26 @@ function setMode(m) {
   const hint = document.getElementById("mode-hint");
   hint.textContent = hints[m] || "";
   hint.classList.toggle("hidden", !hints[m]);
+  syncAudioOpts();
 }
+
+// Qué mostrar a la derecha de la barra en las etapas que no son transcripción.
+const STAGE_LABELS = {
+  downloading: "descargando",
+  separating: "aislando la voz",
+  postprocessing: "convirtiendo",
+};
+
+// Cómo presentar cada archivo del resultado. El orden manda en la fila.
+const FILE_KINDS = [
+  ["audio", "⬇️", "Audio"],
+  ["txt", "📄", "Texto plano"],
+  ["srt", "🎬", "Subtítulos SRT"],
+  ["vtt", "🌐", "Subtítulos VTT"],
+  ["tsv", "📊", "Tabla TSV"],
+  ["json", "{ }", "JSON con tiempos"],
+  ["lyrixa", "🎵", "Abrir en Lyrixa / Proyecto Lyrixa"],
+];
 
 function fmt(sec) {
   sec = Math.max(0, Math.floor(sec || 0));
@@ -187,6 +240,22 @@ async function loadInfo() {
     o.value = l.value; o.textContent = l.label;
     ls.appendChild(o);
   });
+  const fs = document.getElementById("audio_format");
+  INFO.audio_formats.forEach(f => {
+    const o = document.createElement("option");
+    o.value = f.value; o.textContent = f.label;
+    if (f.value === "mp3") o.selected = true;   // el más compatible
+    fs.appendChild(o);
+  });
+  const qs = document.getElementById("audio_quality");
+  INFO.audio_qualities.forEach(q => {
+    const o = document.createElement("option");
+    o.value = q; o.textContent = q.replace("K", " kbps");
+    if (q === "192K") o.selected = true;
+    qs.appendChild(o);
+  });
+  onFormatChange();
+  syncAudioOpts();
 }
 
 async function start() {
@@ -197,6 +266,8 @@ async function start() {
   fd.append("model", model);
   fd.append("language", language);
   fd.append("mode", MODE);
+  fd.append("audio_format", document.getElementById("audio_format").value);
+  fd.append("audio_quality", document.getElementById("audio_quality").value);
 
   if (MODE === "audio_only") {
     // Solo audio funciona con un link de YouTube.
@@ -276,6 +347,12 @@ function listen(jobId) {
     duration = d.duration;
     setBadges({ model: d.model, device: d.device, title: d.title, duration: d.duration });
   });
+  // Avance de las etapas largas que no son Whisper (descarga, Demucs, conversión).
+  es.addEventListener("progress", e => {
+    const d = JSON.parse(e.data);
+    setProgress(d.progress);
+    document.getElementById("clock").textContent = STAGE_LABELS[d.stage] || "";
+  });
   es.addEventListener("segment", e => {
     const d = JSON.parse(e.data);
     if (d.progress != null) setProgress(d.progress);
@@ -294,15 +371,26 @@ function listen(jobId) {
     const d = JSON.parse(e.data);
     setStage("✅ Listo — " + (d.title || ""), false);
     setProgress(1);
+    document.getElementById("clock").textContent = "";
     const dl = document.getElementById("downloads");
     dl.classList.remove("hidden");
     dl.innerHTML = "<span class='badge'>Descargar:</span>";
-    for (const [ext, name] of Object.entries(d.files)) {
+    for (const [kind, icon, label] of FILE_KINDS) {
+      const name = d.files[kind];
+      if (!name) continue;
       const a = document.createElement("a");
       a.href = `/download/${d.job_id}/${encodeURIComponent(name)}`;
-      a.textContent = ext === "audio" ? "⬇️ audio (" + name + ")"
-                    : ext === "lyrixa" ? "🎵 Lyrixa (.lyrixa.json)"
-                    : "." + ext;
+      a.download = name;          // el navegador conserva el nombre del título
+      a.title = name;
+      if (kind === "lyrixa") {
+        a.title = "En Lyrixa: More → Import project (.lyrixa.json). " +
+                  "Después carga el mismo audio para revisar la sincronización.";
+      }
+      const ext = name.includes(".") ? name.split(".").pop() : "";
+      a.textContent = `${icon} ${label}` + (kind === "audio" ? ` (.${ext})` : "");
+      const small = document.createElement("b");   // el nombre real, debajo
+      small.textContent = name;
+      a.appendChild(small);
       dl.appendChild(a);
     }
     es.close();
