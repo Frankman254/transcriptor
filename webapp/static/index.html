@@ -68,6 +68,10 @@
   .downloads a b { display: block; font-size: 11px; color: var(--muted);
                    font-weight: 400; max-width: 220px; overflow: hidden;
                    text-overflow: ellipsis; white-space: nowrap; }
+  .stem-player { width: 100%; margin-top: 10px; padding: 10px 12px;
+                 border-radius: 9px; background: var(--panel2); border: 1px solid var(--border); }
+  .stem-player label { display: block; margin-bottom: 7px; color: var(--text); }
+  .stem-player audio { display: block; width: 100%; height: 36px; }
   .err { color: var(--danger); font-size: 14px; }
   .hidden { display: none; }
   cite { color: var(--muted); font-style: normal; }
@@ -128,6 +132,12 @@
       <p class="sub" id="fmt-hint" style="margin:8px 2px 0;font-size:12px"></p>
     </div>
 
+    <div id="separator-opts" class="hidden" style="margin-top:16px">
+      <label>Calidad de separación vocal</label>
+      <select id="separation_quality" onchange="onSeparationChange()"></select>
+      <p class="sub" id="separation-hint" style="margin:8px 2px 0;font-size:12px"></p>
+    </div>
+
     <button class="go" id="go" onclick="start()">Transcribir</button>
   </div>
 
@@ -161,6 +171,8 @@ function setSource(s) {
 function syncAudioOpts() {
   document.getElementById("audio-opts").classList.toggle(
     "hidden", SOURCE !== "url" || MODE === "lyrics");
+  document.getElementById("separator-opts").classList.toggle(
+    "hidden", MODE !== "lyrics");
 }
 
 function onFormatChange() {
@@ -170,6 +182,12 @@ function onFormatChange() {
   document.getElementById("quality-wrap").classList.toggle(
     "hidden", !spec || spec.lossless);
   document.getElementById("fmt-hint").textContent = spec ? spec.hint : "";
+}
+
+function onSeparationChange() {
+  const value = document.getElementById("separation_quality").value;
+  const spec = (INFO?.separation_profiles || []).find(p => p.value === value);
+  document.getElementById("separation-hint").textContent = spec ? spec.hint : "";
 }
 
 function setMode(m) {
@@ -182,8 +200,8 @@ function setMode(m) {
     m === "audio_only" ? "Descargar audio" :
     m === "lyrics" ? "Sacar letra" : "Transcribir";
   const hints = {
-    lyrics: "🎤 Aísla la voz con Demucs y luego la transcribe. Solo en CPU la " +
-            "separación tarda varios minutos por canción.",
+    lyrics: "🎤 Aísla la voz con el motor elegido y luego la transcribe. " +
+            "BS-RoFormer recupera mejor las voces débiles; Demucs es más rápido.",
   };
   const hint = document.getElementById("mode-hint");
   hint.textContent = hints[m] || "";
@@ -194,6 +212,7 @@ function setMode(m) {
 // Qué mostrar a la derecha de la barra en las etapas que no son transcripción.
 const STAGE_LABELS = {
   downloading: "descargando",
+  downloading_separator_model: "descargando modelo de separación",
   separating: "aislando la voz",
   postprocessing: "convirtiendo",
 };
@@ -201,6 +220,8 @@ const STAGE_LABELS = {
 // Cómo presentar cada archivo del resultado. El orden manda en la fila.
 const FILE_KINDS = [
   ["audio", "⬇️", "Audio"],
+  ["vocals", "🎤", "Voz aislada"],
+  ["instrumental", "🎹", "Instrumental sin voz"],
   ["txt", "📄", "Texto plano"],
   ["srt", "🎬", "Subtítulos SRT"],
   ["vtt", "🌐", "Subtítulos VTT"],
@@ -254,6 +275,20 @@ async function loadInfo() {
     if (q === "192K") o.selected = true;
     qs.appendChild(o);
   });
+  const ss = document.getElementById("separation_quality");
+  INFO.separation_profiles.forEach(p => {
+    const o = document.createElement("option");
+    o.value = p.value;
+    o.textContent = p.label + (p.available ? "" : " — no instalado");
+    o.disabled = !p.available;
+    if (p.value === "precise" && p.available) o.selected = true;
+    ss.appendChild(o);
+  });
+  if (!ss.value || ss.selectedOptions[0]?.disabled) {
+    const fallback = INFO.separation_profiles.find(p => p.available);
+    if (fallback) ss.value = fallback.value;
+  }
+  onSeparationChange();
   onFormatChange();
   syncAudioOpts();
 }
@@ -268,6 +303,7 @@ async function start() {
   fd.append("mode", MODE);
   fd.append("audio_format", document.getElementById("audio_format").value);
   fd.append("audio_quality", document.getElementById("audio_quality").value);
+  fd.append("separation_quality", document.getElementById("separation_quality").value);
 
   if (MODE === "audio_only") {
     // Solo audio funciona con un link de YouTube.
@@ -376,10 +412,14 @@ function listen(jobId) {
     dl.classList.remove("hidden");
     dl.innerHTML = "<span class='badge'>Descargar:</span>";
     for (const [kind, icon, label] of FILE_KINDS) {
-      const name = d.files[kind];
-      if (!name) continue;
+      const descriptor = d.files[kind];
+      if (!descriptor) continue;
+      const name = typeof descriptor === "string" ? descriptor : descriptor.name;
+      const url = typeof descriptor === "string"
+        ? `/download/${d.job_id}/${encodeURIComponent(name)}`
+        : descriptor.url;
       const a = document.createElement("a");
-      a.href = `/download/${d.job_id}/${encodeURIComponent(name)}`;
+      a.href = url;
       a.download = name;          // el navegador conserva el nombre del título
       a.title = name;
       if (kind === "lyrixa") {
@@ -392,6 +432,18 @@ function listen(jobId) {
       small.textContent = name;
       a.appendChild(small);
       dl.appendChild(a);
+      if (kind === "vocals" || kind === "instrumental") {
+        const player = document.createElement("div");
+        player.className = "stem-player";
+        const playerLabel = document.createElement("label");
+        playerLabel.textContent = `${icon} Escuchar ${label.toLowerCase()}`;
+        const audio = document.createElement("audio");
+        audio.controls = true;
+        audio.preload = "metadata";
+        audio.src = url;
+        player.append(playerLabel, audio);
+        dl.appendChild(player);
+      }
     }
     es.close();
     finishJob();

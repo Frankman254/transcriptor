@@ -37,6 +37,10 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 OUTPUT_DIR = BASE_DIR / "output"
 CACHE_DIR = Path.home() / ".cache" / "whisper"
+ROFORMER_VENV_DIR = BASE_DIR / ".separator-venv"
+ROFORMER_CLI = ROFORMER_VENV_DIR / "bin" / "audio-separator"
+ROFORMER_MODEL_DIR = BASE_DIR / ".separator-models"
+ROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Modelos que ofrecemos en la interfaz (nombre -> etiqueta amigable).
@@ -75,6 +79,31 @@ AUDIO_FORMATS = [
 
 # Bitrates para los formatos con pérdida (mp3/m4a/opus/vorbis).
 AUDIO_QUALITIES = ["320K", "256K", "192K", "128K", "96K"]
+
+# Perfiles de aislamiento. BS-RoFormer es la opción de mayor precisión; Demucs
+# queda disponible como alternativa equilibrada o rápida.
+SEPARATION_PROFILES = {
+    "precise": {
+        "label": "Preciso · BS-RoFormer (recomendado)",
+        "hint": ("Modelo moderno que recupera mejor voces débiles y coros. "
+                 "La primera vez descarga ~610 MB; después queda en caché."),
+        "engine": "roformer",
+    },
+    "quality": {
+        "label": "Equilibrado · Demucs",
+        "hint": "Demucs con 2 pasadas y mayor solapamiento. Buena calidad, pero puede omitir voces mezcladas como instrumentos.",
+        "engine": "demucs",
+        "shifts": 2,
+        "overlap": 0.5,
+    },
+    "fast": {
+        "label": "Rápido · Demucs",
+        "hint": "Una pasada de Demucs. Más rápido, pero puede dejar voces fantasma o perder palabras.",
+        "engine": "demucs",
+        "shifts": 1,
+        "overlap": 0.25,
+    },
+}
 
 _FORMATS_BY_VALUE = {f["value"]: f for f in AUDIO_FORMATS}
 
@@ -364,6 +393,20 @@ def demucs_available() -> bool:
         return False
 
 
+def roformer_available() -> bool:
+    """¿Está instalado el separador moderno en su entorno aislado?"""
+    return ROFORMER_CLI.is_file() and os.access(ROFORMER_CLI, os.X_OK)
+
+
+def separation_profile_available(profile_name: str) -> bool:
+    profile = SEPARATION_PROFILES.get(profile_name)
+    if not profile:
+        return False
+    if profile["engine"] == "roformer":
+        return roformer_available()
+    return demucs_available()
+
+
 # Demucs escribe una barra tqdm en stderr:
 #   " 25%|█████▌      | 5.85/23.4 [00:01<00:03, 5.66seconds/s]"
 # Nos quedamos con la fracción exacta (procesado/total), no con el entero.
@@ -371,8 +414,10 @@ _DEMUCS_RE = re.compile(r"(\d+)%\|.*?\|\s*([\d.]+)/([\d.]+)\s")
 _DEMUCS_BAG_RE = re.compile(r"bag of (\d+) models")
 
 
-def separate_vocals(audio: Path, outdir: Path, emit) -> Path:
-    """Aísla la voz de la música con Demucs y devuelve la ruta de vocals.wav.
+def separate_vocals_demucs(
+    audio: Path, outdir: Path, emit, profile_name: str = "quality",
+) -> tuple[Path, Path]:
+    """Aísla voz/música y devuelve ``(vocals.wav, no_vocals.wav)``.
 
     La primera vez, Demucs descarga sus pesos (~una vez). Separar en CPU es
     lento (varios minutos por canción); por eso vamos emitiendo el avance.
@@ -381,20 +426,24 @@ def separate_vocals(audio: Path, outdir: Path, emit) -> Path:
     dibujan N barras seguidas, así que las encadenamos en un solo porcentaje
     global: cada barra completa vale 1/N del total.
     """
+    profile = SEPARATION_PROFILES.get(profile_name, SEPARATION_PROFILES["quality"])
     emit("status", stage="separating",
-         message="Separando la voz de la música con Demucs (puede tardar)…")
+         message=f"Separando la voz con Demucs — {profile['label']} (puede tardar)…")
     emit("progress", stage="separating", progress=0.0)
 
     sep_dir = outdir / "demucs"
     proc = subprocess.Popen(
-        [sys.executable, "-m", "demucs", "--two-stems=vocals",
+        [sys.executable, "-m", "demucs", "-n", "htdemucs",
+         "--two-stems=vocals", "--shifts", str(profile["shifts"]),
+         "--overlap", str(profile["overlap"]),
          "-o", str(sep_dir), str(audio)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
 
     tail: deque[str] = deque(maxlen=30)
-    n_models = 1        # cuántas pasadas hará (bag of N)
+    n_models = 1        # cuántos modelos contiene el bag
+    n_passes = int(profile["shifts"])  # modelos × shifts
     finished = 0        # pasadas ya completadas
     prev_fraction = 0.0
     last_pct = -1
@@ -408,6 +457,7 @@ def separate_vocals(audio: Path, outdir: Path, emit) -> Path:
         bag = _DEMUCS_BAG_RE.search(line)
         if bag:
             n_models = max(1, int(bag.group(1)))
+            n_passes = n_models * int(profile["shifts"])
             tail.append(line)
             continue
         m = _DEMUCS_RE.search(line)
@@ -417,9 +467,9 @@ def separate_vocals(audio: Path, outdir: Path, emit) -> Path:
         done, total = float(m.group(2)), float(m.group(3))
         fraction = min(done / total, 1.0) if total else 0.0
         if fraction < prev_fraction - 0.01:   # la barra reinició = nuevo modelo
-            finished = min(finished + 1, n_models - 1)
+            finished = min(finished + 1, n_passes - 1)
         prev_fraction = fraction
-        overall = (finished + fraction) / n_models
+        overall = (finished + fraction) / n_passes
         pct = int(overall * 100)
         if pct != last_pct:
             last_pct = pct
@@ -432,8 +482,119 @@ def separate_vocals(audio: Path, outdir: Path, emit) -> Path:
     matches = list(sep_dir.rglob("vocals.wav"))
     if not matches:
         raise RuntimeError("Demucs no produjo la pista de voz.")
+    vocals = matches[0]
+    instrumental = vocals.with_name("no_vocals.wav")
+    if not instrumental.is_file():
+        raise RuntimeError("Demucs no produjo la pista instrumental.")
     emit("progress", stage="separating", progress=1.0)
-    return matches[0]
+    return vocals, instrumental
+
+
+_ROFORMER_PROGRESS_RE = re.compile(r"(\d{1,3})%\|")
+_ROFORMER_CHUNK_RE = re.compile(r"Processing chunk (\d+)/(\d+)")
+
+
+def separate_vocals_roformer(
+    audio: Path, outdir: Path, emit,
+) -> tuple[Path, Path]:
+    """Aísla voz con BS-RoFormer usando un entorno Python independiente.
+
+    ``audio-separator`` trae un stack grande de PyTorch/ONNX que puede entrar en
+    conflicto con Whisper y Demucs. Por eso ``setup_separator.sh`` lo instala en
+    ``.separator-venv`` y aquí sólo invocamos su CLI.
+    """
+    if not roformer_available():
+        raise RuntimeError(
+            "BS-RoFormer no está instalado. Ejecuta: cd webapp && "
+            "./setup_separator.sh"
+        )
+
+    model_cached = (ROFORMER_MODEL_DIR / ROFORMER_MODEL).is_file()
+    if model_cached:
+        emit("status", stage="separating",
+             message="Separando la voz con BS-RoFormer (puede tardar)…")
+    else:
+        emit("status", stage="downloading_separator_model",
+             message="Descargando BS-RoFormer (~610 MB, sólo esta vez)…")
+    emit("progress", stage="separating", progress=0.0)
+
+    sep_dir = outdir / "roformer"
+    sep_dir.mkdir(parents=True, exist_ok=True)
+    ROFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(ROFORMER_CLI), str(audio),
+        "--model_filename", ROFORMER_MODEL,
+        "--model_file_dir", str(ROFORMER_MODEL_DIR),
+        "--output_dir", str(sep_dir),
+        "--output_format", "WAV",
+        # Los mixes de una hora pueden ocupar varios GB al convertirse a
+        # float32. Los bloques de 10 min mantienen estable el uso de memoria.
+        "--chunk_duration", "600",
+        "--custom_output_names",
+        json.dumps({"Vocals": "vocals", "Instrumental": "instrumental"}),
+    ]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+
+    tail: deque[str] = deque(maxlen=40)
+    current_chunk = 0
+    total_chunks = 1
+    separating_started = model_cached
+    last_pct = -1
+    for line in proc.stdout:
+        line = line.rstrip("\n").strip()
+        if not line:
+            continue
+        tail.append(line)
+
+        if not separating_started and "MDXC Separator initialisation complete" in line:
+            separating_started = True
+            emit("status", stage="separating",
+                 message="Separando la voz con BS-RoFormer (puede tardar)…")
+            emit("progress", stage="separating", progress=0.0)
+
+        chunk = _ROFORMER_CHUNK_RE.search(line)
+        if chunk:
+            current_chunk = max(0, int(chunk.group(1)) - 1)
+            total_chunks = max(1, int(chunk.group(2)))
+
+        progress = _ROFORMER_PROGRESS_RE.search(line)
+        if not progress:
+            continue
+        fraction = min(int(progress.group(1)) / 100.0, 1.0)
+        if not separating_started:
+            emit("progress", stage="downloading_separator_model",
+                 progress=fraction)
+            continue
+        overall = min((current_chunk + fraction) / total_chunks, 0.99)
+        pct = int(overall * 100)
+        if pct != last_pct:
+            last_pct = pct
+            emit("progress", stage="separating", progress=overall)
+
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"BS-RoFormer falló: {chr(10).join(tail)[-600:]}"
+        )
+
+    vocals = sep_dir / "vocals.wav"
+    instrumental = sep_dir / "instrumental.wav"
+    if not vocals.is_file() or not instrumental.is_file():
+        raise RuntimeError("BS-RoFormer no produjo ambas pistas de audio.")
+    emit("progress", stage="separating", progress=1.0)
+    return vocals, instrumental
+
+
+def separate_vocals(
+    audio: Path, outdir: Path, emit, profile_name: str = "precise",
+) -> tuple[Path, Path]:
+    profile = SEPARATION_PROFILES.get(profile_name, SEPARATION_PROFILES["precise"])
+    if profile["engine"] == "roformer":
+        return separate_vocals_roformer(audio, outdir, emit)
+    return separate_vocals_demucs(audio, outdir, emit, profile_name)
 
 
 def run_whisper(audio: Path, model: str, language: str, outdir: Path,
@@ -449,7 +610,12 @@ def run_whisper(audio: Path, model: str, language: str, outdir: Path,
            "--verbose", "True", "--model_dir", str(CACHE_DIR),
            # Tiempos por palabra: bordes de segmento más precisos (al ms) y
            # habilita words[] en el JSON para el puente con Lyrixa.
-           "--word_timestamps", "True"]
+           "--word_timestamps", "True",
+           # Reduce bucles de texto sobre silencios/residuos de Demucs. No
+           # elimina coros repetidos por postproceso: la decisión sigue siendo
+           # de Whisper y los resultados raw permanecen auditables.
+           "--condition_on_previous_text", "False",
+           "--hallucination_silence_threshold", "2.0"]
     if language:
         cmd += ["--language", language]
 
@@ -525,7 +691,8 @@ def build_lyrixa_bundle(
 
 def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
              model: str, language: str, mode: str = "transcribe",
-             audio_format: str = "best", audio_quality: str = "192K") -> None:
+             audio_format: str = "best", audio_quality: str = "192K",
+             separation_quality: str = "precise") -> None:
     job = JOBS[job_id]
 
     def emit(event: str, **data):
@@ -549,8 +716,13 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
                  job_id=job_id)
             return
 
-        # Modo "letra de canción" necesita Demucs para aislar la voz.
-        if mode == "lyrics" and not demucs_available():
+        if mode == "lyrics" and not separation_profile_available(separation_quality):
+            profile = SEPARATION_PROFILES[separation_quality]
+            if profile["engine"] == "roformer":
+                raise RuntimeError(
+                    "BS-RoFormer no está instalado. Ejecuta: cd webapp && "
+                    "./setup_separator.sh"
+                )
             raise RuntimeError(
                 "Demucs no está instalado. Instálalo con: pip3 install demucs"
             )
@@ -573,8 +745,27 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         emit("meta", title=title, duration=duration,
              model=model, device=device_name())
 
+        stem_files = {}
         if mode == "lyrics":
-            audio = separate_vocals(audio, outdir, emit)
+            vocals, instrumental = separate_vocals(
+                audio, outdir, emit, separation_quality)
+            audio = vocals
+            job["stem_paths"] = {
+                "vocals": str(vocals.resolve()),
+                "instrumental": str(instrumental.resolve()),
+            }
+            # Los WAV se sirven desde la carpeta del separador elegido, sin
+            # copiarlos ni recomprimirlos. En mixes largos pueden pesar >600 MB.
+            stem_files = {
+                "vocals": {
+                    "name": f"{safe_stem(title)} - voz aislada.wav",
+                    "url": f"/api/jobs/{job_id}/stems/vocals",
+                },
+                "instrumental": {
+                    "name": f"{safe_stem(title)} - instrumental.wav",
+                    "url": f"/api/jobs/{job_id}/stems/instrumental",
+                },
+            }
 
         files = run_whisper(audio, model, language, outdir, duration, emit,
                             out_stem=title)
@@ -588,6 +779,7 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         # El audio descargado (con sus metadatos y carátula) también se ofrece.
         if source_audio is not None and source_audio.exists():
             files["audio"] = source_audio.name
+        files.update(stem_files)
         emit("done", title=title, files=files, job_id=job_id)
     except Exception as e:  # noqa: BLE001
         emit("error", message=str(e))
@@ -615,7 +807,13 @@ def info():
         "languages": [{"value": v, "label": l} for v, l in LANGUAGES],
         "audio_formats": AUDIO_FORMATS,
         "audio_qualities": AUDIO_QUALITIES,
+        "separation_profiles": [
+            {"value": value, "label": spec["label"], "hint": spec["hint"],
+             "available": separation_profile_available(value)}
+            for value, spec in SEPARATION_PROFILES.items()
+        ],
         "demucs": demucs_available(),
+        "roformer": roformer_available(),
     })
 
 
@@ -628,6 +826,7 @@ async def create_job(
     mode: str = Form("transcribe"),
     audio_format: str = Form("best"),
     audio_quality: str = Form("192K"),
+    separation_quality: str = Form("precise"),
     file: UploadFile | None = File(None),
 ):
     if audio_format not in _FORMATS_BY_VALUE:
@@ -635,6 +834,8 @@ async def create_job(
                             status_code=400)
     if audio_quality not in AUDIO_QUALITIES:
         audio_quality = "192K"
+    if separation_quality not in SEPARATION_PROFILES:
+        separation_quality = "precise"
 
     job_id = uuid.uuid4().hex[:12]
     upload_path = None
@@ -656,7 +857,7 @@ async def create_job(
     threading.Thread(
         target=pipeline,
         args=(job_id, source_type, url, upload_path, model, language, mode,
-              audio_format, audio_quality),
+              audio_format, audio_quality, separation_quality),
         daemon=True,
     ).start()
     return {"job_id": job_id}
@@ -710,6 +911,37 @@ def download(job_id: str, name: str):
     if not path.is_file() or job_dir not in path.parents:
         return JSONResponse({"error": "no existe"}, status_code=404)
     return FileResponse(path, filename=path.name)
+
+
+@app.get("/api/jobs/{job_id}/stems/{stem}")
+def download_stem(job_id: str, stem: str):
+    """Sirve los WAV del separador elegido sin duplicar archivos grandes."""
+    names = {
+        "vocals": ("vocals.wav",),
+        "instrumental": ("instrumental.wav", "no_vocals.wav"),
+    }
+    target_names = names.get(stem)
+    if target_names is None:
+        return JSONResponse({"error": "pista desconocida"}, status_code=404)
+    job_dir = (OUTPUT_DIR / job_id).resolve()
+    matches = []
+    job = JOBS.get(job_id)
+    stored = (job or {}).get("stem_paths", {}).get(stem)
+    if stored:
+        matches.append(Path(stored).resolve())
+    if not matches:
+        for target_name in target_names:
+            matches.extend(path.resolve() for path in job_dir.rglob(target_name))
+    matches = [path for path in matches if path.is_file() and job_dir in path.parents]
+    if len(matches) != 1:
+        return JSONResponse({"error": "pista no disponible"}, status_code=404)
+    title = next(
+        (path.stem for path in job_dir.iterdir()
+         if path.is_file() and path.suffix.lower() in {".mp3", ".m4a", ".opus", ".ogg"}),
+        "audio",
+    )
+    label = "voz aislada" if stem == "vocals" else "instrumental"
+    return FileResponse(matches[0], filename=f"{safe_stem(title)} - {label}.wav")
 
 
 if __name__ == "__main__":

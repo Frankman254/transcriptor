@@ -6,8 +6,8 @@ de progreso**, y **cada segmento con su tiempo de inicio → fin** mientras avan
 
 Tiene tres modos:
 - **🎧 Transcribir** — texto con timestamps de un YouTube o archivo.
-- **🎤 Letra de canción** — aísla la voz de la música con Demucs y la transcribe
-  (para sacar la letra). Mucho mejor que transcribir la canción directa.
+- **🎤 Letra de canción** — aísla la voz con BS-RoFormer o Demucs y la
+  transcribe. Mucho mejor que transcribir la canción directa.
 - **⬇️ Solo audio** — descarga un YouTube en MP3, M4A, Opus, OGG,
   FLAC, ALAC, WAV o en su formato original, sin transcribir.
 
@@ -15,7 +15,8 @@ Tiene tres modos:
 - `python3`
 - `yt-dlp` y `ffmpeg` (Homebrew) — para YouTube y para leer audio/video
 - `openai-whisper` (pip) — el motor de transcripción
-- `demucs` (pip, opcional) — solo para el modo "letra de canción"
+- BS-RoFormer (opcional, recomendado) — se instala con `./setup_separator.sh`
+- `demucs` (pip, opcional) — perfiles vocales equilibrado/rápido
 - `mutagen` (pip) — permite que `yt-dlp` incruste portadas en todos los
   contenedores compatibles
 
@@ -30,6 +31,16 @@ Luego abre **http://127.0.0.1:8000** en el navegador.
 
 La primera vez instala `fastapi`, `uvicorn`, `python-multipart` y `mutagen`
 automáticamente.
+
+Para habilitar una vez el perfil vocal **Preciso**:
+
+```bash
+cd webapp
+./setup_separator.sh
+```
+
+Se instala en `.separator-venv`, separado de Whisper y Demucs. El modelo de
+aproximadamente 610 MB se descarga automáticamente al usarlo por primera vez.
 
 ## Cómo funciona
 1. Pegas un **link de YouTube** o subes un **archivo** (mp3, m4a, wav, mp4…).
@@ -51,6 +62,16 @@ derivación independiente: divide los segmentos largos usando exclusivamente los
 timestamps reales por palabra y deja clips de letra manejables. Impórtalo en
 Lyrixa mediante **More → Import project (.lyrixa.json)**, carga el mismo audio
 y revisa la sincronización antes de exportar el bundle para LiveWallpaper.
+
+En el modo **Letra de canción** aparecen además dos reproductores: voz aislada
+y pista instrumental. Son los WAV originales creados por el separador elegido
+y permiten detectar si una frase incorrecta viene de una mala separación o de
+una alucinación de Whisper.
+
+El perfil **Preciso** es el recomendado para mixes: usa BS-RoFormer y procesa
+los audios de más de diez minutos por bloques para contener el uso de memoria.
+**Equilibrado** ejecuta dos shifts de `htdemucs` con solapamiento `0.5` y
+**Rápido** usa una sola pasada con solapamiento `0.25`.
 
 Los resultados quedan en `webapp/output/<job_id>/`.
 

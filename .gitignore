@@ -16,9 +16,14 @@
 
 # --- Salidas y caché de la app ---
 webapp/output/
+webapp/.separator-venv/
+webapp/.separator-models/
 __pycache__/
 *.pyc
 *.pyo
+
+# ONNX Runtime puede crear este archivo de telemetría si no logra abrir su caché.
+:memory:.ses
 
 # --- Sistema / editores ---
 .DS_Store
