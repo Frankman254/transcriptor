@@ -2,8 +2,19 @@ fastapi
 uvicorn[standard]
 python-multipart
 mutagen
+# VAD, medición de la separación y troceado del audio para el modo ultra.
+numpy
+# Motor del modo ultra: mismo modelo, varias veces más rápido, que es lo que
+# hace viable correr cinco pasadas sobre una mezcla de tres horas. Si falta,
+# el modo ultra cae a openai-whisper sin perder ninguna función.
+faster-whisper
+# Romaji sin conexión. Es un diccionario sin análisis morfológico, así que solo
+# se usa cuando no hay un modelo local que resuelva la lectura en contexto.
+pykakasi
 # openai-whisper y yt-dlp ya están instalados en el sistema (pip / brew)
 # demucs: opcional, para los perfiles equilibrado/rápido de "letra de canción".
 #   pip3 install demucs
 # BS-RoFormer se instala aparte con ./setup_separator.sh para no mezclar su
 # versión de PyTorch/ONNX con Whisper y Demucs.
+# Traducción y romaji en contexto: Ollama con un modelo multilingüe
+#   (ollama pull qwen3.5). Es opcional: sin él solo se pierde la segunda capa.

@@ -73,8 +73,30 @@
   .stem-player label { display: block; margin-bottom: 7px; color: var(--text); }
   .stem-player audio { display: block; width: 100%; height: 36px; }
   .err { color: var(--danger); font-size: 14px; }
+  .warn { color: #ffc36b; font-size: 13px; margin: 8px 2px 0; }
   .hidden { display: none; }
   cite { color: var(--muted); font-style: normal; }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 12px;
+           color: var(--text); font-size: 14px; cursor: pointer; }
+  .check input { accent-color: var(--accent); width: 16px; height: 16px; }
+  .panel { margin-top: 14px; padding: 12px 14px; border-radius: 10px;
+           background: var(--panel2); border: 1px solid var(--border); }
+  .panel h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted);
+              font-weight: 600; letter-spacing: .02em; }
+  table.rounds { width: 100%; border-collapse: collapse; font-size: 12.5px;
+                 font-variant-numeric: tabular-nums; }
+  table.rounds th { text-align: left; color: var(--muted); font-weight: 500;
+                    padding: 4px 8px 4px 0; }
+  table.rounds td { padding: 4px 8px 4px 0; border-top: 1px solid var(--border); }
+  .metric { display: inline-flex; gap: 6px; align-items: baseline;
+            margin: 0 16px 6px 0; font-size: 13px; }
+  .metric b { font-variant-numeric: tabular-nums; }
+  .verdict-ok { color: var(--accent2); }
+  .verdict-warn { color: #ffc36b; }
+  .verdict-bad { color: var(--danger); }
+  /* Baja confianza = la fila que conviene escuchar antes de dar por buena. */
+  .seg.shaky { background: rgba(255, 195, 107, .07); }
+  .seg .ag { font-size: 11px; color: #ffc36b; align-self: center; }
 </style>
 </head>
 <body>
@@ -102,6 +124,7 @@
       <div class="tabs">
         <div class="tab active" data-mode="transcribe" onclick="setMode('transcribe')">🎧 Transcribir</div>
         <div class="tab" data-mode="lyrics" onclick="setMode('lyrics')">🎤 Letra de canción</div>
+        <div class="tab" data-mode="ultra" onclick="setMode('ultra')">🎯 Letra ultra precisa</div>
         <div class="tab" data-mode="audio_only" onclick="setMode('audio_only')">⬇️ Solo audio</div>
       </div>
       <p class="sub hidden" id="mode-hint" style="margin:8px 2px 0;font-size:12px"></p>
@@ -138,6 +161,25 @@
       <p class="sub" id="separation-hint" style="margin:8px 2px 0;font-size:12px"></p>
     </div>
 
+    <div id="ultra-opts" class="hidden" style="margin-top:16px">
+      <div class="row">
+        <div>
+          <label>Nivel de precisión</label>
+          <select id="precision_level" onchange="onPrecisionChange()"></select>
+        </div>
+        <div>
+          <label>Traducir a (2ª capa de Lyrixa)</label>
+          <select id="translate_to" onchange="onTranslateChange()"></select>
+        </div>
+      </div>
+      <p class="sub" id="precision-hint" style="margin:8px 2px 0;font-size:12px"></p>
+      <label class="check">
+        <input type="checkbox" id="romaji" checked>
+        Japonés en romaji (no en kana)
+      </label>
+      <p class="sub" id="translator-hint" style="margin:8px 2px 0;font-size:12px"></p>
+    </div>
+
     <button class="go" id="go" onclick="start()">Transcribir</button>
   </div>
 
@@ -147,6 +189,29 @@
     <div class="progress-outer"><div class="progress-inner" id="bar"></div></div>
     <div class="progress-label"><span id="pct">0%</span><span id="clock"></span></div>
     <div id="err" class="err"></div>
+
+    <div class="panel hidden" id="stem-panel">
+      <h3>🎚️ Calidad de la voz aislada</h3>
+      <div id="stem-body"></div>
+    </div>
+
+    <div class="panel hidden" id="rounds-panel">
+      <h3>📊 Convergencia del consenso</h3>
+      <table class="rounds">
+        <thead><tr>
+          <th>Pasadas</th><th>Palabras</th><th>Descartadas</th><th>Bucles</th>
+          <th>Acuerdo</th><th>Unánimes</th><th>Estabilidad</th>
+        </tr></thead>
+        <tbody id="rounds-body"></tbody>
+      </table>
+      <p class="sub" id="rounds-note" style="margin:10px 2px 0;font-size:12px"></p>
+    </div>
+
+    <div class="panel hidden" id="translation-panel">
+      <h3>🌐 Traducción</h3>
+      <div id="translation-body"></div>
+    </div>
+
     <div class="downloads hidden" id="downloads"></div>
     <div class="segments" id="segments"></div>
   </div>
@@ -166,13 +231,52 @@ function setSource(s) {
   syncAudioOpts();
 }
 
-// El formato de audio solo aplica cuando bajamos de YouTube. En "letra de
-// canción" el backend usa siempre el original (separa mejor la voz).
+const SEPARATES = m => m === "lyrics" || m === "ultra";
+
+// El formato de audio solo aplica cuando bajamos de YouTube. En los modos de
+// letra el backend usa siempre el original (separa mejor la voz).
 function syncAudioOpts() {
   document.getElementById("audio-opts").classList.toggle(
-    "hidden", SOURCE !== "url" || MODE === "lyrics");
+    "hidden", SOURCE !== "url" || SEPARATES(MODE));
   document.getElementById("separator-opts").classList.toggle(
-    "hidden", MODE !== "lyrics");
+    "hidden", !SEPARATES(MODE));
+  document.getElementById("ultra-opts").classList.toggle(
+    "hidden", MODE !== "ultra");
+}
+
+// El modo ultra corre con faster-whisper, que guarda sus pesos aparte: sin
+// esto la lista diría "descargado" para un modelo que el modo ultra no tiene.
+function syncModelLabels() {
+  const ultra = MODE === "ultra";
+  for (const option of document.getElementById("model").options) {
+    const cached = ultra ? option.dataset.ultraCached : option.dataset.cached;
+    option.textContent = option.value +
+      (cached ? "  ✓ descargado" : "  ⬇ requiere descarga");
+  }
+}
+
+function onPrecisionChange() {
+  const value = document.getElementById("precision_level").value;
+  const spec = (INFO?.precision_levels || []).find(p => p.value === value);
+  document.getElementById("precision-hint").textContent = spec ? spec.hint : "";
+}
+
+function onTranslateChange() {
+  const wants = document.getElementById("translate_to").value;
+  const hint = document.getElementById("translator-hint");
+  const translator = INFO?.translator || {};
+  if (!wants) {
+    hint.textContent = "Sin traducción: Lyrixa recibe una sola capa de texto.";
+    hint.className = "sub";
+  } else if (translator.available) {
+    hint.textContent = `Traduce en tu máquina con ${translator.model}. `
+      + "Los idiomas de escritura no latina pasan por inglés (ruso → inglés → destino).";
+    hint.className = "sub";
+  } else {
+    hint.textContent = "⚠️ No hay traductor local. Arranca Ollama y baja un "
+      + "modelo multilingüe: ollama pull qwen3.5";
+    hint.className = "warn";
+  }
 }
 
 function onFormatChange() {
@@ -198,22 +302,35 @@ function setMode(m) {
   document.getElementById("opts").classList.toggle("hidden", m === "audio_only");
   document.getElementById("go").textContent =
     m === "audio_only" ? "Descargar audio" :
+    m === "ultra" ? "Sacar letra ultra precisa" :
     m === "lyrics" ? "Sacar letra" : "Transcribir";
   const hints = {
     lyrics: "🎤 Aísla la voz con el motor elegido y luego la transcribe. " +
             "BS-RoFormer recupera mejor las voces débiles; Demucs es más rápido.",
+    ultra: "🎯 Aísla la voz, detecta dónde se canta y transcribe varias veces " +
+           "con ajustes distintos. Después vota palabra por palabra y repite " +
+           "hasta que una pasada más ya no cambie el texto: así se van las " +
+           "frases inventadas y aparecen las omitidas. Al final traduce la " +
+           "letra ya confirmada para la 2ª capa de Lyrixa.",
   };
   const hint = document.getElementById("mode-hint");
   hint.textContent = hints[m] || "";
   hint.classList.toggle("hidden", !hints[m]);
+  syncModelLabels();
   syncAudioOpts();
 }
 
 // Qué mostrar a la derecha de la barra en las etapas que no son transcripción.
 const STAGE_LABELS = {
   downloading: "descargando",
+  downloading_model: "descargando modelo",
   downloading_separator_model: "descargando modelo de separación",
   separating: "aislando la voz",
+  analyzing: "buscando la voz",
+  detecting_language: "detectando idioma",
+  transcribing: "transcribiendo",
+  romanizing: "pasando a romaji",
+  translating: "traduciendo",
   postprocessing: "convirtiendo",
 };
 
@@ -222,6 +339,7 @@ const FILE_KINDS = [
   ["audio", "⬇️", "Audio"],
   ["vocals", "🎤", "Voz aislada"],
   ["instrumental", "🎹", "Instrumental sin voz"],
+  ["lyrics", "📝", "Letra legible (original · romaji · traducción)"],
   ["txt", "📄", "Texto plano"],
   ["srt", "🎬", "Subtítulos SRT"],
   ["vtt", "🌐", "Subtítulos VTT"],
@@ -251,10 +369,12 @@ async function loadInfo() {
   INFO.models.forEach(m => {
     const o = document.createElement("option");
     o.value = m.name;
-    o.textContent = m.name + (m.cached ? "  ✓ descargado" : "  ⬇ requiere descarga");
+    o.dataset.cached = m.cached ? "1" : "";
+    o.dataset.ultraCached = m.ultra_cached ? "1" : "";
     if (m.name === "medium") o.selected = true;
     ms.appendChild(o);
   });
+  syncModelLabels();
   const ls = document.getElementById("language");
   INFO.languages.forEach(l => {
     const o = document.createElement("option");
@@ -288,9 +408,131 @@ async function loadInfo() {
     const fallback = INFO.separation_profiles.find(p => p.available);
     if (fallback) ss.value = fallback.value;
   }
+  const ps = document.getElementById("precision_level");
+  (INFO.precision_levels || []).forEach(p => {
+    const o = document.createElement("option");
+    o.value = p.value; o.textContent = p.label;
+    if (p.value === "balanced") o.selected = true;
+    ps.appendChild(o);
+  });
+  const ts = document.getElementById("translate_to");
+  const none = document.createElement("option");
+  none.value = ""; none.textContent = "Sin traducción";
+  ts.appendChild(none);
+  (INFO.target_languages || []).forEach(l => {
+    const o = document.createElement("option");
+    o.value = l.value; o.textContent = l.label;
+    if (l.value === "es") o.selected = true;   // el destino habitual
+    ts.appendChild(o);
+  });
+  onPrecisionChange();
+  onTranslateChange();
   onSeparationChange();
   onFormatChange();
   syncAudioOpts();
+}
+
+const VERDICTS = {
+  ok: ["verdict-ok", "✅ Limpia"],
+  bleed: ["verdict-warn", "⚠️ Queda instrumental"],
+  clipping: ["verdict-warn", "⚠️ Satura"],
+  instrumental: ["verdict-warn", "⚠️ Casi no hay canto"],
+  silent: ["verdict-bad", "⛔ Voz en silencio"],
+  empty: ["verdict-bad", "⛔ Pista vacía"],
+  unknown: ["", "· sin medir"],
+};
+
+function showStem(d) {
+  const [cls, label] = VERDICTS[d.verdict] || VERDICTS.unknown;
+  const where = d.stage === "final" ? "pista que recibe Whisper"
+    : `pasada ${d.pass_number} del separador`;
+  const html =
+    `<div class="metric"><span class="${cls}">${label}</span>` +
+    `<cite>· ${where}</cite></div><br>` +
+    `<span class="metric"><cite>Canto</cite> <b>${(d.speechCoverage * 100).toFixed(0)}%</b>` +
+    ` <cite>(${fmt(d.speechSeconds)})</cite></span>` +
+    `<span class="metric"><cite>Nivel</cite> <b>${d.vocalDbfs} dBFS</b></span>` +
+    `<span class="metric"><cite>Fuga instrumental</cite> <b>${d.bleedRatio}</b></span>`;
+  const body = document.getElementById("stem-body");
+  body.innerHTML = html + (d.notes || []).map(n =>
+    `<p class="sub" style="margin:8px 0 0;font-size:12px"></p>`).join("");
+  (d.notes || []).forEach((note, i) => {
+    body.querySelectorAll("p")[i].textContent = note;
+  });
+  document.getElementById("stem-panel").classList.remove("hidden");
+}
+
+function pct(value) {
+  return value == null ? "—" : (value * 100).toFixed(1) + "%";
+}
+
+function showRound(d) {
+  const body = document.getElementById("rounds-body");
+  // Una fila por número de pasadas: la ronda se reescribe, no se duplica.
+  let row = body.querySelector(`tr[data-passes="${d.passes}"]`);
+  if (!row) {
+    row = document.createElement("tr");
+    row.dataset.passes = d.passes;
+    body.appendChild(row);
+  }
+  row.innerHTML =
+    `<td>${d.passes}</td><td>${d.words}</td><td>${d.dropped}</td>` +
+    `<td>${d.looped ?? 0}</td>` +
+    `<td>${pct(d.meanAgreement)}</td><td>${pct(d.unanimous)}</td>` +
+    `<td>${pct(d.stability)}</td>`;
+  document.getElementById("rounds-panel").classList.remove("hidden");
+  document.getElementById("rounds-note").textContent =
+    "Descartadas = palabras que una pasada oyó y la mayoría no: casi siempre " +
+    "texto inventado. Bucles = repeticiones descontroladas en las que todas " +
+    "las pasadas se engancharon a la vez, así que el voto no podía verlas. " +
+    "Estabilidad = cuánto coincide esta ronda con la anterior.";
+}
+
+function showPrecision(d) {
+  const context = `motor ${d.engine} · ${d.windows} ventanas de voz ` +
+    `(${fmt(d.speechSeconds)} de canto) · ${d.droppedSlots} palabras ` +
+    `descartadas por falta de acuerdo` +
+    (d.loopedWords ? ` y ${d.loopedWords} recortadas de bucles` : "") + ".";
+  let verdict;
+  if (d.converged) {
+    verdict = `✅ Convergió con ${d.passes} pasadas · `;
+  } else if (!d.checked) {
+    // Nivel Rápido: una sola ronda, así que no hay con qué comparar.
+    verdict = `✅ ${d.passes} pasadas votadas (sin comprobar convergencia) · `;
+  } else {
+    verdict = `⚠️ Se agotaron las ${d.passes} pasadas sin llegar al objetivo ` +
+      `de estabilidad; revisa las líneas en ámbar · `;
+  }
+  document.getElementById("rounds-note").textContent = verdict + context;
+}
+
+function showTranslation(d) {
+  const body = document.getElementById("translation-body");
+  const rows = [];
+  if (d.romajiBackend && d.romajiBackend !== "none") {
+    rows.push(`<span class="metric"><cite>Romaji</cite> <b>${d.romajiBackend}</b></span>`);
+  }
+  if (d.routeLabel) {
+    rows.push(`<span class="metric"><cite>Ruta</cite> <b>${d.routeLabel}</b></span>`);
+  }
+  if (d.backend) {
+    rows.push(`<span class="metric"><cite>Motor</cite> <b>${d.backend}</b></span>`);
+  }
+  body.innerHTML = rows.join("") || "<cite>Sin traducción.</cite>";
+  if (d.error) {
+    const p = document.createElement("p");
+    p.className = "warn";
+    p.textContent = "⚠️ " + d.error;
+    body.appendChild(p);
+  } else if (d.targetLanguage) {
+    const p = document.createElement("p");
+    p.className = "sub";
+    p.style.cssText = "margin:8px 0 0;font-size:12px";
+    p.textContent = "La traducción viaja en el .lyrixa.json como segunda capa "
+      + "(layer-backing), con los mismos tiempos que la letra original.";
+    body.appendChild(p);
+  }
+  document.getElementById("translation-panel").classList.remove("hidden");
 }
 
 async function start() {
@@ -304,6 +546,10 @@ async function start() {
   fd.append("audio_format", document.getElementById("audio_format").value);
   fd.append("audio_quality", document.getElementById("audio_quality").value);
   fd.append("separation_quality", document.getElementById("separation_quality").value);
+  fd.append("precision_level", document.getElementById("precision_level").value);
+  fd.append("translate_to", MODE === "ultra"
+    ? document.getElementById("translate_to").value : "");
+  fd.append("romaji", document.getElementById("romaji").checked ? "1" : "0");
 
   if (MODE === "audio_only") {
     // Solo audio funciona con un link de YouTube.
@@ -327,6 +573,7 @@ async function start() {
   document.getElementById("downloads").classList.add("hidden");
   document.getElementById("downloads").innerHTML = "";
   document.getElementById("err").textContent = "";
+  resetPanels();
   setBadges({ model: MODE === "audio_only" ? null : model, device: INFO.device });
   setStage("Iniciando…", true);
   setProgress(0);
@@ -351,6 +598,15 @@ function setBadges({ model, device, title, duration }) {
 function setStage(text, spinning) {
   document.getElementById("stage").innerHTML =
     (spinning ? '<span class="spin">⏳</span> ' : "") + text;
+}
+
+function resetPanels() {
+  for (const id of ["stem-panel", "rounds-panel", "translation-panel"]) {
+    document.getElementById(id).classList.add("hidden");
+  }
+  document.getElementById("rounds-body").innerHTML = "";
+  document.getElementById("stem-body").innerHTML = "";
+  document.getElementById("translation-body").innerHTML = "";
 }
 function setProgress(p) {
   const pct = p == null ? null : Math.round(p * 100);
@@ -389,15 +645,22 @@ function listen(jobId) {
     setProgress(d.progress);
     document.getElementById("clock").textContent = STAGE_LABELS[d.stage] || "";
   });
+  es.addEventListener("stem", e => showStem(JSON.parse(e.data)));
+  es.addEventListener("consensus", e => showRound(JSON.parse(e.data)));
+  es.addEventListener("precision", e => showPrecision(JSON.parse(e.data)));
+  es.addEventListener("translation", e => showTranslation(JSON.parse(e.data)));
   es.addEventListener("segment", e => {
     const d = JSON.parse(e.data);
     if (d.progress != null) setProgress(d.progress);
     document.getElementById("clock").textContent =
       `${fmt(d.end)}${duration ? " / " + fmt(duration) : ""}`;
     const row = document.createElement("div");
-    row.className = "seg";
+    // Menos del 80% de acuerdo entre pasadas = la línea que hay que escuchar.
+    const shaky = d.agreement != null && d.agreement < 0.8;
+    row.className = shaky ? "seg shaky" : "seg";
     row.innerHTML = `<span class="t">${fmtMs(d.start)} → ${fmtMs(d.end)}</span>` +
-                    `<span class="x"></span>`;
+                    `<span class="x"></span>` +
+                    (shaky ? `<span class="ag">${pct(d.agreement)}</span>` : "");
     row.querySelector(".x").textContent = d.text;
     const box = document.getElementById("segments");
     box.appendChild(row);
@@ -483,6 +746,7 @@ function resumeIfAny() {
   document.getElementById("downloads").classList.add("hidden");
   document.getElementById("err").textContent = "";
   document.getElementById("go").disabled = true;
+  resetPanels();
   setStage("Retomando el trabajo en curso…", true);
   setProgress(0);
   listen(jobId);

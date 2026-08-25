@@ -3,6 +3,11 @@
 The raw Whisper JSON is an input only.  This module never mutates it and has
 no dependency on FastAPI, Whisper, or the filesystem, which keeps the timing
 normalization deterministic and easy to test.
+
+Line splitting is a global optimization, not a left-to-right walk.  A greedy
+cutter fills the first line to the brim and leaves the last one with two words;
+minimizing a cost over *all* cut sets at once is what produces paragraphs of
+comparable weight, which is the whole point of splitting a long line.
 """
 
 from __future__ import annotations
@@ -12,6 +17,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+from textjoin import display_width, is_no_space_char, join_raw
 
 
 # Lyrixa's current hard floor (src/core/types/clip.ts).
@@ -25,11 +32,42 @@ TARGET_MAX_DURATION = 6.0
 HARD_MAX_DURATION = 8.0
 MAX_WORDS = 12
 MAX_CHARACTERS = 72
+TARGET_CHARACTERS = 42
 PAUSE_THRESHOLD = 0.45
 
-BRIDGE_SCHEMA_VERSION = 1
+# --- Cost model -------------------------------------------------------------
+# Running past the ideal length is far worse than falling short of it: a long
+# line is unreadable on screen, a short one is just a short lyric line.
+OVER_DURATION_WEIGHT = 2.0
+UNDER_DURATION_WEIGHT = 0.55
+# Character balance.  Symmetric on purpose — this is the term that stops one
+# paragraph from carrying most of the text while its neighbour carries three
+# words.
+CHARACTER_WEIGHT = 0.25
+# Paid once per line, so an unnecessary extra cut has to earn its place.
+BREAK_COST = 0.25
+# Boundary bonuses (negative = preferred cut).  Punctuation ranks above a bare
+# pause, and a comma that also lands on a pause gets both.
+STRONG_PUNCTUATION_BONUS = -0.30
+WEAK_PUNCTUATION_BONUS = -0.22
+PAUSE_BONUS = -0.18
+# Cutting mid-phrase with no signal at all.  High enough that it only happens
+# when the length limits leave no choice.
+NO_BOUNDARY_COST = 2.0
+# Japanese and Chinese have no spaces, and Whisper's `words[]` splits them into
+# sub-word pieces — so a cut between two such pieces usually lands *inside* a
+# word.  Costlier than a plain unmarked cut, which pushes the optimizer toward
+# the script change a few tokens away, where a real word does end.
+MID_WORD_COST = 3.2
+SCRIPT_CHANGE_COST = 0.9
 
-_STRONG_PUNCTUATION = re.compile(r"[.!?…][\"'’”)\]}]*$")
+BRIDGE_SCHEMA_VERSION = 2
+
+MAIN_LAYER_ID = "layer-main"
+TRANSLATION_LAYER_ID = "layer-backing"
+FX_LAYER_ID = "layer-fx"
+
+_STRONG_PUNCTUATION = re.compile(r"[.!?…。！？][\"'’”)\]}]*$")
 _WEAK_PUNCTUATION = re.compile(r"[,;:،؛，、—–-][\"'’”)\]}]*$")
 _NO_SPACE_BEFORE = re.compile(r"\s+([,.;:!?…)\]}])")
 
@@ -51,14 +89,11 @@ def _canonical_text(text: str) -> str:
 
 
 def _join_tokens(tokens: Iterable[str]) -> str:
-    raw = list(tokens)
-    if not raw:
-        return ""
     # Whisper normally includes the leading space in every token after the
-    # first.  Hand-authored fixtures and other Whisper frontends often do not.
-    if any(token[:1].isspace() for token in raw[1:]):
-        return "".join(raw).strip()
-    return _NO_SPACE_BEFORE.sub(r"\1", " ".join(t.strip() for t in raw)).strip()
+    # first.  Hand-authored fixtures and other Whisper frontends often do not,
+    # and a Japanese line legitimately has no spaces at all — `textjoin` is the
+    # single place that decides which case this is.
+    return join_raw(list(tokens))
 
 
 def _fallback_clip(segment: dict[str, Any], segment_index: int) -> dict[str, Any] | None:
@@ -105,12 +140,19 @@ def _validated_words(segment: dict[str, Any]) -> list[dict[str, Any]] | None:
         if start < previous_end:
             return None
         raw_tokens.append(token)
-        words.append({
+        entry = {
             "text": token.strip(),
             "_raw": token,
             "startTime": _round_time(start),
             "endTime": _round_time(end),
-        })
+        }
+        # Consensus output carries how sure the passes were; keep it so the
+        # editor can highlight the lines worth a human ear.
+        for key in ("agreement", "votes", "probability"):
+            value = raw.get(key)
+            if value is not None:
+                entry[key] = value
+        words.append(entry)
         previous_end = end
 
     if not words:
@@ -123,66 +165,126 @@ def _validated_words(segment: dict[str, Any]) -> list[dict[str, Any]] | None:
     return words
 
 
-def _boundary_priority(words: list[dict[str, Any]], start: int, end: int) -> int:
+# --------------------------------------------------------------------------- #
+# Segmentación balanceada
+# --------------------------------------------------------------------------- #
+def _boundary_bonus(words: list[dict[str, Any]], end: int) -> float:
+    """What a cut after ``words[end]`` is worth.
+
+    Additive by design: a comma that also lands on a musical rest is a better
+    place to break than either signal alone, and the cost model should say so.
+    """
+    if end >= len(words) - 1:
+        return 0.0                      # end of the segment: free
     token = words[end]["text"]
+    bonus = 0.0
     if _STRONG_PUNCTUATION.search(token):
-        return 4
-    gap = words[end + 1]["startTime"] - words[end]["endTime"]
-    if gap >= PAUSE_THRESHOLD:
-        return 3
-    if _WEAK_PUNCTUATION.search(token):
-        return 2
+        bonus += STRONG_PUNCTUATION_BONUS
+    elif _WEAK_PUNCTUATION.search(token):
+        bonus += WEAK_PUNCTUATION_BONUS
+    if words[end + 1]["startTime"] - words[end]["endTime"] >= PAUSE_THRESHOLD:
+        bonus += PAUSE_BONUS
+    if bonus < 0:
+        return bonus
 
-    count = end - start + 1
-    characters = len(_join_tokens(w["_raw"] for w in words[start:end + 1]))
-    if count >= MAX_WORDS or characters >= MAX_CHARACTERS:
-        return 1
-    return 0
+    # Nothing marks this boundary, so fall back to what the scripts say.
+    left, right = words[end]["text"], words[end + 1]["text"]
+    if not left or not right:
+        return NO_BOUNDARY_COST
+    left_joined = is_no_space_char(left[-1])
+    right_joined = is_no_space_char(right[0])
+    if left_joined and right_joined:
+        return MID_WORD_COST
+    if left_joined != right_joined:
+        return SCRIPT_CHANGE_COST
+    return NO_BOUNDARY_COST
 
 
-def _choose_cut(words: list[dict[str, Any]], start: int) -> int:
-    last = len(words) - 1
-    remaining_duration = words[last]["endTime"] - words[start]["startTime"]
-    remaining_text = _join_tokens(w["_raw"] for w in words[start:])
-    if (remaining_duration <= TARGET_MAX_DURATION
-            and last - start + 1 <= MAX_WORDS
-            and len(remaining_text) <= MAX_CHARACTERS):
-        return last
+def _piece_cost(words: list[dict[str, Any]], start: int, end: int) -> float:
+    duration = words[end]["endTime"] - words[start]["startTime"]
+    characters = display_width(_join_tokens(w["_raw"] for w in words[start:end + 1]))
 
-    candidates: list[tuple[int, float, int]] = []
-    for end in range(start, last):
-        duration = words[end]["endTime"] - words[start]["startTime"]
-        if duration > HARD_MAX_DURATION:
-            break
-        if duration < TARGET_MIN_DURATION:
-            continue
-        priority = _boundary_priority(words, start, end)
-        if priority:
-            candidates.append((priority, abs(duration - TARGET_DURATION), end))
+    if duration > TARGET_DURATION:
+        length = OVER_DURATION_WEIGHT * (
+            (duration - TARGET_DURATION) / TARGET_DURATION) ** 2
+    else:
+        length = UNDER_DURATION_WEIGHT * (
+            (TARGET_DURATION - duration) / TARGET_DURATION) ** 2
 
-    if candidates:
-        # Natural-boundary class wins first, then proximity to the ideal length.
-        priority = max(item[0] for item in candidates)
-        return min(
-            (item for item in candidates if item[0] == priority),
-            key=lambda item: (item[1], item[2]),
-        )[2]
+    balance = CHARACTER_WEIGHT * (
+        (characters - TARGET_CHARACTERS) / TARGET_CHARACTERS) ** 2
+    return BREAK_COST + length + balance + _boundary_bonus(words, end)
 
-    # No linguistic/size signal was available: this is the hard-duration cut.
-    # Prefer the latest real boundary within the 6 s target and only stretch to
-    # 8 s when no such boundary exists.  An individual long word cannot split.
-    cut = start
-    found_target = False
-    for end in range(start, last):
-        duration = words[end]["endTime"] - words[start]["startTime"]
-        if duration <= TARGET_MAX_DURATION:
-            cut = end
-            found_target = True
-        elif duration <= HARD_MAX_DURATION and not found_target:
-            cut = end
-        else:
-            break
-    return cut
+
+def _feasible(words: list[dict[str, Any]], start: int, end: int,
+              max_duration: float, max_characters: float,
+              max_words: float) -> bool:
+    if end - start + 1 > max_words:
+        return False
+    if words[end]["endTime"] - words[start]["startTime"] > max_duration:
+        return False
+    if end == start:
+        return True                     # a single word can never be split
+    width = display_width(_join_tokens(w["_raw"] for w in words[start:end + 1]))
+    return width <= max_characters
+
+
+def _solve_cuts(words: list[dict[str, Any]], max_duration: float,
+                max_characters: float, max_words: float) -> list[int] | None:
+    """Minimum-cost partition of ``words`` into lines, or None if impossible.
+
+    O(n·k) where k is how many words fit in one line, so a 12-word cap keeps
+    this linear in practice even on a segment with hundreds of words.
+    """
+    count = len(words)
+    best = [math.inf] * (count + 1)
+    origin = [0] * (count + 1)
+    best[0] = 0.0
+    for end in range(1, count + 1):
+        for start in range(end - 1, -1, -1):
+            if not _feasible(words, start, end - 1, max_duration,
+                             max_characters, max_words):
+                # Constraints only tighten as the line grows, so once this
+                # start is infeasible every earlier one is too.
+                break
+            if best[start] == math.inf:
+                continue
+            candidate = best[start] + _piece_cost(words, start, end - 1)
+            if candidate < best[end]:
+                best[end] = candidate
+                origin[end] = start
+    if best[count] == math.inf:
+        return None
+
+    cuts: list[int] = []
+    cursor = count
+    while cursor > 0:
+        cuts.append(origin[cursor])
+        cursor = origin[cursor]
+    return sorted(cuts)
+
+
+def split_words(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Split one word list into balanced lines.
+
+    The limits relax in steps: first the comfortable target, then the hard
+    ceiling, and only then anything goes.  A single word that lasts nine
+    seconds must still end up in a line, and it must not drag its neighbours
+    into an unreadable one.
+    """
+    if not words:
+        return []
+    ladder = (
+        (TARGET_MAX_DURATION, MAX_CHARACTERS, MAX_WORDS),
+        (HARD_MAX_DURATION, MAX_CHARACTERS * 1.5, MAX_WORDS * 2),
+        (math.inf, math.inf, math.inf),
+    )
+    for max_duration, max_characters, max_words in ladder:
+        cuts = _solve_cuts(words, max_duration, max_characters, max_words)
+        if cuts is not None:
+            bounds = [*cuts, len(words)]
+            return [words[bounds[i]:bounds[i + 1]] for i in range(len(cuts))]
+    return [words]
 
 
 def segment_whisper_segment(
@@ -197,11 +299,8 @@ def segment_whisper_segment(
         return [fallback]
 
     clips: list[dict[str, Any]] = []
-    start = 0
-    while start < len(words):
-        end = _choose_cut(words, start)
-        chunk = words[start:end + 1]
-        clips.append({
+    for chunk in split_words(words):
+        clip = {
             "text": _join_tokens(word["_raw"] for word in chunk),
             "startTime": chunk[0]["startTime"],
             "endTime": chunk[-1]["endTime"],
@@ -211,11 +310,15 @@ def segment_whisper_segment(
                     "text": word["text"],
                     "startTime": word["startTime"],
                     "endTime": word["endTime"],
+                    **({"agreement": word["agreement"]} if "agreement" in word else {}),
                 }
                 for word in chunk
             ],
-        })
-        start = end + 1
+        }
+        agreements = [w["agreement"] for w in chunk if "agreement" in w]
+        if agreements:
+            clip["agreement"] = round(sum(agreements) / len(agreements), 4)
+        clips.append(clip)
     return clips
 
 
@@ -235,6 +338,9 @@ def _merge_clips(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     words = [*(left.get("words") or []), *(right.get("words") or [])]
     if words:
         merged["words"] = words
+    agreements = [c["agreement"] for c in (left, right) if "agreement" in c]
+    if agreements:
+        merged["agreement"] = round(sum(agreements) / len(agreements), 4)
     return merged
 
 
@@ -272,7 +378,7 @@ def normalize_whisper_segments(segments: Any) -> list[dict[str, Any]]:
             "id": f"clip-{index:04d}",
             **clip,
             "sourceIndex": index,
-            "layerId": "layer-main",
+            "layerId": MAIN_LAYER_ID,
             "createdBy": "import",
             "transitionIn": "fade",
             "transitionOut": "fade",
@@ -281,15 +387,143 @@ def normalize_whisper_segments(segments: Any) -> list[dict[str, Any]]:
     return final
 
 
+# --------------------------------------------------------------------------- #
+# Capas
+# --------------------------------------------------------------------------- #
+def clip_lines(whisper_data: dict[str, Any]) -> list[str]:
+    """The exact lines the main layer will carry, before any translation.
+
+    Callers translate *these*, not the raw Whisper segments: the split happens
+    here, so translating anything else would produce a different number of
+    lines than there are clips.  `normalize_whisper_segments` is deterministic,
+    so calling it twice gives the same partition.
+    """
+    return [clip["text"] for clip
+            in normalize_whisper_segments(whisper_data.get("segments"))]
+
+
+def apply_romaji(clips: list[dict[str, Any]],
+                 romaji: list[str]) -> list[dict[str, Any]]:
+    """Swap each main clip's text for its transliteration.
+
+    The original script is kept in `originalText`, and `words[]` keeps its
+    original tokens: the transliteration is per line, so pretending it is also
+    per word would invent word boundaries that were never measured.
+    """
+    out: list[dict[str, Any]] = []
+    for clip, reading in zip(clips, romaji):
+        reading = (reading or "").strip()
+        if not reading or reading == clip["text"]:
+            out.append(clip)
+            continue
+        out.append({**clip, "text": reading, "originalText": clip["text"]})
+    # A shorter romaji list must not truncate the lyric.
+    out.extend(clips[len(out):])
+    return out
+
+
+def translation_clips(clips: list[dict[str, Any]],
+                      translations: list[str]) -> list[dict[str, Any]]:
+    """Mirror the main clips onto the translation layer, timing untouched.
+
+    One translated line per main clip, sharing `sourceId` so both layers can be
+    edited (or re-timed) together in Lyrixa without re-running the alignment.
+    """
+    out: list[dict[str, Any]] = []
+    for clip, text in zip(clips, translations):
+        text = (text or "").strip()
+        if not text:
+            continue
+        out.append({
+            "id": f"{clip['id']}-t",
+            "text": text,
+            "startTime": clip["startTime"],
+            "endTime": clip["endTime"],
+            "sourceId": clip["id"],
+            "sourceIndex": clip["sourceIndex"],
+            "layerId": TRANSLATION_LAYER_ID,
+            "createdBy": "import",
+            "transitionIn": "fade",
+            "transitionOut": "fade",
+            "position": "center",
+        })
+    return out
+
+
+def build_layers(*, source_language: str | None, translation_language: str | None,
+                 translation_name: str | None = None) -> list[dict[str, Any]]:
+    """The three Lyrixa channels, with the roles this bridge assigns them.
+
+    `role` and `language` are additive fields: Lyrixa passes unknown layer keys
+    straight through to the lyrics bundle, so LiveWallpaper can tell the
+    translation channel apart from a backing-vocal one without guessing from
+    the layer name.
+    """
+    layers: list[dict[str, Any]] = [{
+        "id": MAIN_LAYER_ID,
+        "name": "Letra original",
+        "layerType": "lyrics",
+        "role": "primary",
+        "language": source_language,
+        "color": "#2e7afb",
+        "visible": True,
+        "locked": False,
+        "order": 0,
+        "renderSettings": {"positionPreset": "bottom", "textAlign": "center",
+                           "zIndex": 20},
+        "styleDefaults": {"fontSize": "2.8rem", "fontWeight": "800",
+                          "textColor": "#ffffff"},
+    }]
+    if translation_language:
+        layers.append({
+            "id": TRANSLATION_LAYER_ID,
+            "name": translation_name or f"Traducción · {translation_language}",
+            "layerType": "backing",
+            "role": "translation",
+            "language": translation_language,
+            "color": "#8a5cf6",
+            "visible": True,
+            "locked": False,
+            "order": 1,
+            # Directly under the original line, smaller and dimmer: a
+            # translation is a reading aid, not a second lead vocal.
+            "renderSettings": {"positionPreset": "bottom", "textAlign": "center",
+                               "zIndex": 18},
+            "styleDefaults": {"fontSize": "1.6rem", "fontWeight": "600",
+                              "textColor": "rgba(206, 220, 255, 0.9)",
+                              "opacity": 0.9},
+        })
+    layers.append({
+        "id": FX_LAYER_ID,
+        "name": "FX / Adlibs",
+        "layerType": "fx",
+        "role": "fx",
+        "color": "#f6a25c",
+        "visible": True,
+        "locked": False,
+        "order": len(layers),
+        "renderSettings": {"positionPreset": "top-right", "textAlign": "right",
+                           "zIndex": 30, "suppressClipText": True},
+    })
+    return layers
+
+
 def build_lyrixa_envelope(
     whisper_data: dict[str, Any], *, title: str, duration: float,
     audio_file_name: str | None = None, model: str | None = None,
     language: str | None = None, exported_at: str | None = None,
     project_stem: str = "transcription",
+    translations: list[str] | None = None,
+    translation_language: str | None = None,
+    romaji: list[str] | None = None,
+    precision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the schema-v1 Lyrixa authoring-project envelope."""
     clips = normalize_whisper_segments(whisper_data.get("segments"))
+    if romaji:
+        clips = apply_romaji(clips, romaji)
     lines = [clip["text"] for clip in clips]
+    translated = translation_clips(clips, translations) if translations else []
     timestamp = exported_at or datetime.now(timezone.utc).isoformat()
     detected_language = language or whisper_data.get("language") or None
     safe_duration = max(0.0, _finite_number(duration) or 0.0)
@@ -313,6 +547,9 @@ def build_lyrixa_envelope(
             "duration": safe_duration,
             "audioFileName": audio_file_name,
             "generatedAt": timestamp,
+            "romanized": bool(romaji),
+            "translationLanguage": translation_language,
+            "precision": precision,
         },
         "project": {
             "id": f"transcriptor-{Path(project_stem).stem}",
@@ -321,7 +558,11 @@ def build_lyrixa_envelope(
             "audioTracks": audio_tracks,
             "rawLyricsText": "\n".join(lines),
             "normalizedLyrics": lines,
-            "clips": clips,
+            "layers": build_layers(
+                source_language=detected_language,
+                translation_language=translation_language,
+            ),
+            "clips": [*clips, *translated],
             "currentTime": 0,
             "renderMode": "editor",
         },

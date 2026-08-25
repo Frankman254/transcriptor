@@ -31,7 +31,11 @@ from fastapi.responses import (
     JSONResponse,
     StreamingResponse,
 )
-from lyrixa_bridge import build_lyrixa_envelope
+
+import audio_analysis
+import precision
+import translation
+from lyrixa_bridge import build_lyrixa_envelope, clip_lines
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -83,11 +87,20 @@ AUDIO_QUALITIES = ["320K", "256K", "192K", "128K", "96K"]
 # Perfiles de aislamiento. BS-RoFormer es la opción de mayor precisión; Demucs
 # queda disponible como alternativa equilibrada o rápida.
 SEPARATION_PROFILES = {
+    "ultra": {
+        "label": "Ultra · BS-RoFormer ×2 (máxima limpieza)",
+        "hint": ("Dos pasadas de BS-RoFormer: la segunda quita el instrumental "
+                 "que sobrevive a la primera. Se queda con la que mide mejor, "
+                 "así que nunca sale peor que Preciso. Tarda el doble."),
+        "engine": "roformer",
+        "passes": 2,
+    },
     "precise": {
         "label": "Preciso · BS-RoFormer (recomendado)",
         "hint": ("Modelo moderno que recupera mejor voces débiles y coros. "
                  "La primera vez descarga ~610 MB; después queda en caché."),
         "engine": "roformer",
+        "passes": 1,
     },
     "quality": {
         "label": "Equilibrado · Demucs",
@@ -107,7 +120,9 @@ SEPARATION_PROFILES = {
 
 _FORMATS_BY_VALUE = {f["value"]: f for f in AUDIO_FORMATS}
 
-# Idiomas comunes; "" = detección automática.
+# Idiomas comunes; "" = detección automática. En el modo ultra la detección
+# automática vota entre varios puntos del audio, así que sirve también para
+# ruso, japonés o coreano aunque no estén en esta lista.
 LANGUAGES = [
     ("", "Auto (detectar)"),
     ("Spanish", "Español"),
@@ -116,7 +131,38 @@ LANGUAGES = [
     ("French", "Francés"),
     ("Italian", "Italiano"),
     ("German", "Alemán"),
+    ("Japanese", "Japonés"),
+    ("Russian", "Ruso"),
+    ("Korean", "Coreano"),
+    ("Chinese", "Chino"),
 ]
+
+# Idiomas de destino para la capa 2 de Lyrixa (la traducción).
+TARGET_LANGUAGES = ["es", "en", "pt", "fr", "it", "de", "ja", "ko", "zh", "ru"]
+
+# Cuántas pasadas de consenso corre el modo ultra. El bucle para solo cuando
+# una pasada más ya no cambia el texto, así que el máximo es un techo, no una
+# promesa: casi siempre converge antes.
+PRECISION_LEVELS = {
+    "balanced": {
+        "label": "Equilibrado · hasta 5 pasadas",
+        "hint": ("Tres pasadas para votar y hasta dos más si el texto todavía "
+                 "cambia. Es el punto dulce para la mayoría de canciones."),
+        "min_passes": 3, "max_passes": 5, "stability": 0.99,
+    },
+    "fast": {
+        "label": "Rápido · 3 pasadas",
+        "hint": ("El mínimo para que haya mayoría. Ya elimina casi todo el "
+                 "texto inventado y es lo más rápido del modo ultra."),
+        "min_passes": 3, "max_passes": 3, "stability": 0.0,
+    },
+    "maximum": {
+        "label": "Máximo · hasta 8 pasadas",
+        "hint": ("Para letras difíciles: voces tapadas, coros o mezclas de "
+                 "tres horas. Exige más acuerdo antes de darse por satisfecho."),
+        "min_passes": 4, "max_passes": 8, "stability": 0.995,
+    },
+}
 
 app = FastAPI(title="Transcriptor local")
 
@@ -495,7 +541,7 @@ _ROFORMER_CHUNK_RE = re.compile(r"Processing chunk (\d+)/(\d+)")
 
 
 def separate_vocals_roformer(
-    audio: Path, outdir: Path, emit,
+    audio: Path, outdir: Path, emit, tag: str = "roformer",
 ) -> tuple[Path, Path]:
     """Aísla voz con BS-RoFormer usando un entorno Python independiente.
 
@@ -518,7 +564,7 @@ def separate_vocals_roformer(
              message="Descargando BS-RoFormer (~610 MB, sólo esta vez)…")
     emit("progress", stage="separating", progress=0.0)
 
-    sep_dir = outdir / "roformer"
+    sep_dir = outdir / tag
     sep_dir.mkdir(parents=True, exist_ok=True)
     ROFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -588,13 +634,78 @@ def separate_vocals_roformer(
     return vocals, instrumental
 
 
+def measure_stems(vocals: Path, instrumental: Path | None,
+                  duration: float) -> audio_analysis.StemReport:
+    """Mide la voz aislada. Nunca tumba el trabajo: si no se puede medir,
+    devolvemos un informe vacío y seguimos."""
+    try:
+        pcm = audio_analysis.decode_pcm(vocals)
+        other = (audio_analysis.decode_pcm(instrumental)
+                 if instrumental and instrumental.is_file() else None)
+        return audio_analysis.assess_separation(pcm, other, duration)
+    except Exception:  # noqa: BLE001
+        return audio_analysis.StemReport()
+
+
+def _second_pass_is_better(first: audio_analysis.StemReport,
+                           second: audio_analysis.StemReport) -> bool:
+    """¿La segunda pasada limpió sin comerse la voz?
+
+    Volver a pasar el separador sobre su propia salida quita el instrumental
+    que sobrevivió, pero también puede borrar susurros y coros. Solo la
+    aceptamos si además de bajar la fuga conserva casi todo el canto: medir es
+    la única forma de que "más limpio" no signifique "más vacío".
+    """
+    if second.verdict in {"empty", "silent"}:
+        return False
+    if second.speech_coverage < first.speech_coverage * 0.85:
+        return False
+    return second.bleed_ratio < first.bleed_ratio * 0.9
+
+
 def separate_vocals(
     audio: Path, outdir: Path, emit, profile_name: str = "precise",
-) -> tuple[Path, Path]:
+    duration: float = 0.0,
+) -> tuple[Path, Path, audio_analysis.StemReport]:
+    """Aísla la voz y devuelve (voz, instrumental, informe de calidad)."""
     profile = SEPARATION_PROFILES.get(profile_name, SEPARATION_PROFILES["precise"])
-    if profile["engine"] == "roformer":
-        return separate_vocals_roformer(audio, outdir, emit)
-    return separate_vocals_demucs(audio, outdir, emit, profile_name)
+    if profile["engine"] != "roformer":
+        vocals, instrumental = separate_vocals_demucs(
+            audio, outdir, emit, profile_name)
+        return vocals, instrumental, measure_stems(vocals, instrumental, duration)
+
+    vocals, instrumental = separate_vocals_roformer(audio, outdir, emit)
+    report = measure_stems(vocals, instrumental, duration)
+    emit("stem", stage="separated", pass_number=1, **report.as_dict())
+
+    if profile.get("passes", 1) < 2 or report.verdict in {"empty", "silent"}:
+        return vocals, instrumental, report
+
+    emit("status", stage="separating",
+         message="Segunda pasada de BS-RoFormer para quitar el instrumental "
+                 "que quedó en la voz…")
+    try:
+        refined, residue = separate_vocals_roformer(
+            vocals, outdir, emit, tag="roformer-2")
+    except RuntimeError as error:
+        emit("status", stage="separating",
+             message=f"La segunda pasada falló ({error}); me quedo con la primera.")
+        return vocals, instrumental, report
+
+    refined_report = measure_stems(refined, residue, duration)
+    emit("stem", stage="separated", pass_number=2, **refined_report.as_dict())
+    if _second_pass_is_better(report, refined_report):
+        emit("status", stage="separating",
+             message=(f"Me quedo con la segunda pasada: la fuga instrumental "
+                      f"bajó de {report.bleed_ratio:.3f} a "
+                      f"{refined_report.bleed_ratio:.3f}."))
+        # El instrumental sigue siendo el de la primera pasada: es el
+        # complemento real de la mezcla original.
+        return refined, instrumental, refined_report
+
+    emit("status", stage="separating",
+         message="La segunda pasada no mejoró la medición; me quedo con la primera.")
+    return vocals, instrumental, report
 
 
 def run_whisper(audio: Path, model: str, language: str, outdir: Path,
@@ -656,10 +767,152 @@ def run_whisper(audio: Path, model: str, language: str, outdir: Path,
     return files
 
 
+def write_whisper_outputs(result: dict, outdir: Path, stem: str) -> dict:
+    """Escribe txt/srt/vtt/tsv/json usando los writers del propio Whisper.
+
+    El modo ultra no pasa por la CLI de Whisper, pero sus segmentos tienen
+    exactamente la misma forma; reutilizar los writers garantiza que un SRT del
+    modo ultra y uno del modo normal sean indistinguibles para cualquier
+    reproductor.
+    """
+    from whisper.utils import get_writer
+
+    files: dict[str, str] = {}
+    options = {"max_line_width": None, "max_line_count": None,
+               "highlight_words": False, "max_words_per_line": None}
+    for extension in ("txt", "srt", "vtt", "tsv", "json"):
+        try:
+            writer = get_writer(extension, str(outdir))
+            writer(result, f"{stem}.wav", options)
+        except Exception:  # noqa: BLE001
+            continue
+        target = outdir / f"{stem}.{extension}"
+        if target.is_file():
+            files[extension] = target.name
+    return files
+
+
+def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
+                       duration: float, emit, out_stem: str,
+                       level: str, stem_report) -> tuple[dict, precision.PrecisionResult]:
+    """Transcribe por consenso de varias pasadas y escribe las mismas salidas."""
+    spec = PRECISION_LEVELS.get(level, PRECISION_LEVELS["balanced"])
+    config = precision.PrecisionConfig(
+        model=model, language=language or None,
+        min_passes=spec["min_passes"], max_passes=spec["max_passes"],
+        stability_target=spec["stability"],
+    )
+    result = precision.run(audio, config, emit, stem_report)
+    if not result.segments:
+        raise RuntimeError(
+            "No se encontró voz cantada en el audio. Revisa la pista de voz "
+            "aislada: puede que la canción sea instrumental."
+        )
+
+    payload = {
+        "text": "\n".join(segment["text"] for segment in result.segments),
+        "segments": result.segments,
+        "language": result.language or language or "",
+    }
+    target = safe_stem(out_stem, fallback=audio.stem)
+    files = write_whisper_outputs(payload, outdir, target)
+    return files, result
+
+
+def translate_clip_lines(lines: list[str], *, source: str | None, target: str,
+                         romanize: bool, emit) -> dict:
+    """Romaniza y traduce las líneas ya confirmadas por el consenso.
+
+    Se hace al final a propósito: traducir un texto que todavía puede cambiar
+    es trabajo tirado, y una traducción hecha sobre texto inventado se ve
+    perfectamente correcta, que es la peor forma de estar mal.
+    """
+    out: dict = {"lines": None, "romaji": None, "backend": None,
+                 "routeLabel": None, "targetLanguage": None, "error": None}
+    source_code = translation.normalize_code(source)
+
+    if romanize and source_code in translation.ROMANIZABLE:
+        emit("status", stage="romanizing",
+             message="Pasando el japonés a romaji línea por línea…")
+
+        def romaji_progress(done: int, total: int) -> None:
+            emit("progress", stage="romanizing", progress=done / max(total, 1))
+
+        try:
+            romaji, backend = translation.romanize(lines, progress=romaji_progress)
+            out["romaji"] = romaji
+            out["romajiBackend"] = backend
+        except Exception as error:  # noqa: BLE001
+            out["error"] = f"No se pudo romanizar: {error}"
+
+    if not target:
+        return out
+
+    route = translation.plan_route(source_code, target)
+    if not route:
+        out["targetLanguage"] = None
+        return out
+
+    emit("status", stage="translating",
+         message=f"Traduciendo la letra ya confirmada · "
+                 f"{translation.route_label(route)}…")
+    try:
+        translated = translation.translate(
+            lines, source=source_code, target=target,
+            progress=lambda p: emit("progress", stage="translating", progress=p),
+        )
+    except translation.TranslationUnavailable as error:
+        out["error"] = str(error)
+        return out
+    except Exception as error:  # noqa: BLE001
+        out["error"] = f"La traducción falló: {error}"
+        return out
+
+    out["lines"] = translated["lines"]
+    out["backend"] = translated["backend"]
+    out["routeLabel"] = translated["routeLabel"]
+    out["targetLanguage"] = translation.normalize_code(target)
+    return out
+
+
+def read_clip_lines(json_path: Path) -> list[str]:
+    """Las líneas exactas que serán clips, para traducirlas 1 a 1."""
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    return clip_lines(data)
+
+
+def write_lyrics_sheet(outdir: Path, title: str, original: list[str],
+                       romaji: list[str] | None,
+                       translated: list[str] | None) -> str | None:
+    """Hoja de letra legible: original, romaji y traducción una debajo de otra.
+
+    El `.lyrixa.json` es para Lyrixa; esto es para leerlo. Sin ella, comprobar
+    una traducción obliga a abrir un JSON de varios megas.
+    """
+    if not original or not (romaji or translated):
+        return None
+    blocks: list[str] = [f"# {title}", ""]
+    for index, line in enumerate(original):
+        blocks.append(line)
+        if romaji and index < len(romaji) and romaji[index] != line:
+            blocks.append(f"    {romaji[index]}")
+        if translated and index < len(translated):
+            blocks.append(f"    → {translated[index]}")
+        blocks.append("")
+    target = outdir / f"{safe_stem(title)}.letra.txt"
+    target.write_text("\n".join(blocks), encoding="utf-8")
+    return target.name
+
+
 def build_lyrixa_bundle(
     outdir: Path, json_name: str | None, title: str, duration: float,
     audio_file_name: str | None = None, model: str | None = None,
-    language: str | None = None,
+    language: str | None = None, translations: list[str] | None = None,
+    translation_language: str | None = None, romaji: list[str] | None = None,
+    precision_report: dict | None = None,
 ) -> str | None:
     """Convierte el JSON de Whisper en un proyecto `.lyrixa.json` importable.
 
@@ -682,6 +935,10 @@ def build_lyrixa_bundle(
         model=model,
         language=language,
         project_stem=Path(json_name).stem,
+        translations=translations,
+        translation_language=translation_language,
+        romaji=romaji,
+        precision=precision_report,
     )
     out = outdir / f"{Path(json_name).stem}.lyrixa.json"
     out.write_text(json.dumps(envelope, ensure_ascii=False, indent=2),
@@ -692,7 +949,9 @@ def build_lyrixa_bundle(
 def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
              model: str, language: str, mode: str = "transcribe",
              audio_format: str = "best", audio_quality: str = "192K",
-             separation_quality: str = "precise") -> None:
+             separation_quality: str = "precise",
+             precision_level: str = "balanced", translate_to: str = "",
+             romaji: bool = True) -> None:
     job = JOBS[job_id]
 
     def emit(event: str, **data):
@@ -716,7 +975,8 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
                  job_id=job_id)
             return
 
-        if mode == "lyrics" and not separation_profile_available(separation_quality):
+        separates = mode in {"lyrics", "ultra"}
+        if separates and not separation_profile_available(separation_quality):
             profile = SEPARATION_PROFILES[separation_quality]
             if profile["engine"] == "roformer":
                 raise RuntimeError(
@@ -726,13 +986,21 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
             raise RuntimeError(
                 "Demucs no está instalado. Instálalo con: pip3 install demucs"
             )
+        if mode == "ultra" and translate_to and not translation.translation_available():
+            raise RuntimeError(
+                "Pediste traducción pero no hay traductor local. Arranca Ollama "
+                "y baja un modelo multilingüe: ollama pull qwen3.5"
+            )
 
-        ensure_model(model, emit)
+        # El modo ultra usa faster-whisper con sus propios pesos; los .pt de
+        # ~/.cache/whisper solo hacen falta cuando corre el motor de referencia.
+        if mode != "ultra":
+            ensure_model(model, emit)
 
         source_audio = None
         if source_type == "url":
             # Para letra conviene el audio sin recodificar: mejor separación de voz.
-            fmt = "best" if mode == "lyrics" else audio_format
+            fmt = "best" if separates else audio_format
             source_audio, title, duration = download_audio(
                 url, outdir, emit, fmt, audio_quality)
             audio = source_audio
@@ -746,14 +1014,16 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
              model=model, device=device_name())
 
         stem_files = {}
-        if mode == "lyrics":
-            vocals, instrumental = separate_vocals(
-                audio, outdir, emit, separation_quality)
+        stem_report = None
+        if separates:
+            vocals, instrumental, stem_report = separate_vocals(
+                audio, outdir, emit, separation_quality, duration)
             audio = vocals
             job["stem_paths"] = {
                 "vocals": str(vocals.resolve()),
                 "instrumental": str(instrumental.resolve()),
             }
+            emit("stem", stage="final", pass_number=0, **stem_report.as_dict())
             # Los WAV se sirven desde la carpeta del separador elegido, sin
             # copiarlos ni recomprimirlos. En mixes largos pueden pesar >600 MB.
             stem_files = {
@@ -767,12 +1037,53 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
                 },
             }
 
-        files = run_whisper(audio, model, language, outdir, duration, emit,
-                            out_stem=title)
+        precision_report = None
+        detected_language = language
+        if mode == "ultra":
+            # Nivelar y filtrar el grave antes de transcribir: no cambia lo que
+            # se canta, pero sí lo estable que es el umbral de Whisper.
+            audio = audio_analysis.condition_for_asr(
+                audio, outdir / "asr-input.wav")
+            files, result = run_precision_mode(
+                audio, model, language, outdir, duration, emit,
+                out_stem=title, level=precision_level, stem_report=stem_report)
+            precision_report = result.as_report()
+            detected_language = result.language or language
+            emit("precision", **precision_report)
+        else:
+            files = run_whisper(audio, model, language, outdir, duration, emit,
+                                out_stem=title)
+
+        # Traducción y romaji: sólo después de que la letra ya está decidida.
+        translated_lines = None
+        romaji_lines = None
+        translation_language = None
+        if mode == "ultra" and files.get("json"):
+            lines = read_clip_lines(outdir / files["json"])
+            language_report = translate_clip_lines(
+                lines, source=detected_language, target=translate_to,
+                romanize=romaji, emit=emit)
+            translated_lines = language_report["lines"]
+            romaji_lines = language_report["romaji"]
+            translation_language = language_report["targetLanguage"]
+            emit("translation",
+                 routeLabel=language_report["routeLabel"],
+                 backend=language_report["backend"],
+                 romajiBackend=language_report.get("romajiBackend"),
+                 targetLanguage=translation_language,
+                 error=language_report["error"])
+            lyrics_file = write_lyrics_sheet(
+                outdir, title, lines, romaji_lines, translated_lines)
+            if lyrics_file:
+                files["lyrics"] = lyrics_file
+
         # Puente con Lyrixa: proyecto con clips ya cronometrados.
         lyrixa = build_lyrixa_bundle(
             outdir, files.get("json"), title, duration,
-            audio_file_name=original_audio.name, model=model, language=language,
+            audio_file_name=original_audio.name, model=model,
+            language=detected_language, translations=translated_lines,
+            translation_language=translation_language, romaji=romaji_lines,
+            precision_report=precision_report,
         )
         if lyrixa:
             files["lyrixa"] = lyrixa
@@ -803,7 +1114,12 @@ def index():
 def info():
     return JSONResponse({
         "device": device_name(),
-        "models": [{"name": m, "cached": model_is_cached(m)} for m in MODELS],
+        # Los dos motores guardan pesos distintos: los .pt de openai-whisper y
+        # la conversión CTranslate2 que usa el modo ultra. Un modelo puede
+        # estar en caché para uno y no para el otro.
+        "models": [{"name": m, "cached": model_is_cached(m),
+                    "ultra_cached": precision.te.faster_model_cached(m)}
+                   for m in MODELS],
         "languages": [{"value": v, "label": l} for v, l in LANGUAGES],
         "audio_formats": AUDIO_FORMATS,
         "audio_qualities": AUDIO_QUALITIES,
@@ -812,8 +1128,22 @@ def info():
              "available": separation_profile_available(value)}
             for value, spec in SEPARATION_PROFILES.items()
         ],
+        "precision_levels": [
+            {"value": value, "label": spec["label"], "hint": spec["hint"],
+             "min_passes": spec["min_passes"], "max_passes": spec["max_passes"]}
+            for value, spec in PRECISION_LEVELS.items()
+        ],
+        "target_languages": [
+            {"value": code, "label": translation.language_label(code)}
+            for code in TARGET_LANGUAGES
+        ],
         "demucs": demucs_available(),
         "roformer": roformer_available(),
+        "faster_whisper": precision.te.faster_whisper_available(),
+        "translator": {
+            "available": translation.translation_available(),
+            "model": translation.pick_model(),
+        },
     })
 
 
@@ -827,6 +1157,9 @@ async def create_job(
     audio_format: str = Form("best"),
     audio_quality: str = Form("192K"),
     separation_quality: str = Form("precise"),
+    precision_level: str = Form("balanced"),
+    translate_to: str = Form(""),
+    romaji: str = Form("1"),
     file: UploadFile | None = File(None),
 ):
     if audio_format not in _FORMATS_BY_VALUE:
@@ -836,6 +1169,13 @@ async def create_job(
         audio_quality = "192K"
     if separation_quality not in SEPARATION_PROFILES:
         separation_quality = "precise"
+    if precision_level not in PRECISION_LEVELS:
+        precision_level = "balanced"
+    translate_to = translation.normalize_code(translate_to) or ""
+    if translate_to and translate_to not in TARGET_LANGUAGES:
+        return JSONResponse(
+            {"error": f"Idioma de traducción desconocido: {translate_to}"},
+            status_code=400)
 
     job_id = uuid.uuid4().hex[:12]
     upload_path = None
@@ -857,7 +1197,8 @@ async def create_job(
     threading.Thread(
         target=pipeline,
         args=(job_id, source_type, url, upload_path, model, language, mode,
-              audio_format, audio_quality, separation_quality),
+              audio_format, audio_quality, separation_quality, precision_level,
+              translate_to, romaji not in {"", "0", "false"}),
         daemon=True,
     ).start()
     return {"job_id": job_id}
