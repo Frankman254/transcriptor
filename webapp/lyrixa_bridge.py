@@ -61,6 +61,16 @@ NO_BOUNDARY_COST = 2.0
 MID_WORD_COST = 3.2
 SCRIPT_CHANGE_COST = 0.9
 
+# Whisper's word-level end timestamp marks where the *token* alignment stops,
+# and in singing that is clearly before the held vowel does.  A line that
+# disappears on that timestamp reads as changing while the voice is still
+# going, so each line lingers past its last word — into the silence that
+# follows it, never into the next line.
+CLIP_TAIL_HOLD = 0.7
+# Two lines must never be on screen at once, so a line always stops short of
+# its successor by this much.
+CLIP_HANDOVER_GAP = 0.05
+
 BRIDGE_SCHEMA_VERSION = 2
 
 MAIN_LAYER_ID = "layer-main"
@@ -363,7 +373,27 @@ def _merge_subminimum_clips(clips: list[dict[str, Any]]) -> list[dict[str, Any]]
     return result
 
 
-def normalize_whisper_segments(segments: Any) -> list[dict[str, Any]]:
+def hold_clip_tails(clips: list[dict[str, Any]],
+                    duration: float | None = None) -> list[dict[str, Any]]:
+    """Let each line stay on screen until the voice has actually stopped.
+
+    The extension only ever consumes the silence *after* a line: it stops
+    ``CLIP_HANDOVER_GAP`` short of the next line, so a line followed
+    immediately by another still hands over cleanly instead of overlapping it.
+    """
+    for index, clip in enumerate(clips):
+        limit = clip["endTime"] + CLIP_TAIL_HOLD
+        if index + 1 < len(clips):
+            limit = min(limit, clips[index + 1]["startTime"] - CLIP_HANDOVER_GAP)
+        elif duration and duration > 0:
+            limit = min(limit, duration)
+        if limit > clip["endTime"]:
+            clip["endTime"] = _round_time(limit)
+    return clips
+
+
+def normalize_whisper_segments(segments: Any,
+                               duration: float | None = None) -> list[dict[str, Any]]:
     """Normalize all segments and assign final deterministic Lyrixa fields."""
     provisional: list[dict[str, Any]] = []
     if isinstance(segments, list):
@@ -371,7 +401,7 @@ def normalize_whisper_segments(segments: Any) -> list[dict[str, Any]]:
             if isinstance(segment, dict):
                 provisional.extend(segment_whisper_segment(segment, segment_index))
 
-    normalized = _merge_subminimum_clips(provisional)
+    normalized = hold_clip_tails(_merge_subminimum_clips(provisional), duration)
     final: list[dict[str, Any]] = []
     for index, clip in enumerate(normalized):
         final.append({
@@ -485,9 +515,12 @@ def build_layers(*, source_language: str | None, translation_language: str | Non
             "visible": True,
             "locked": False,
             "order": 1,
-            # Directly under the original line, smaller and dimmer: a
-            # translation is a reading aid, not a second lead vocal.
-            "renderSettings": {"positionPreset": "bottom", "textAlign": "center",
+            # Opposite anchor from the main layer, and never the same one.
+            # Both renderers place a layer's clips absolutely at its preset, so
+            # two text layers sharing `bottom` draw exactly on top of each
+            # other. Smaller and dimmer besides: a translation is a reading
+            # aid, not a second lead vocal.
+            "renderSettings": {"positionPreset": "top", "textAlign": "center",
                                "zIndex": 18},
             "styleDefaults": {"fontSize": "1.6rem", "fontWeight": "600",
                               "textColor": "rgba(206, 220, 255, 0.9)",
@@ -519,14 +552,15 @@ def build_lyrixa_envelope(
     precision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the schema-v1 Lyrixa authoring-project envelope."""
-    clips = normalize_whisper_segments(whisper_data.get("segments"))
+    safe_duration = max(0.0, _finite_number(duration) or 0.0)
+    clips = normalize_whisper_segments(whisper_data.get("segments"),
+                                       safe_duration or None)
     if romaji:
         clips = apply_romaji(clips, romaji)
     lines = [clip["text"] for clip in clips]
     translated = translation_clips(clips, translations) if translations else []
     timestamp = exported_at or datetime.now(timezone.utc).isoformat()
     detected_language = language or whisper_data.get("language") or None
-    safe_duration = max(0.0, _finite_number(duration) or 0.0)
     audio_tracks = {
         "master": ({"fileName": audio_file_name, "duration": safe_duration}
                    if audio_file_name else None)

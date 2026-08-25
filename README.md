@@ -77,6 +77,22 @@ Con traducción activa, el proyecto llega a Lyrixa con **dos capas de texto**:
 Cada clip traducido apunta con `sourceId` al clip que traduce, así que las dos
 capas siguen emparejadas aunque después edites los tiempos.
 
+Las dos capas de texto salen **en anclas distintas** (letra abajo, traducción
+arriba). Los dos renderizadores colocan los clips de una capa de forma absoluta
+según su ancla, así que dos capas con la misma se dibujarían una encima de la
+otra. Si prefieres la traducción justo debajo de la letra, muévela con
+*Position Y* en LiveWallpaper (pestaña Lyrics → Capas del Bundle) o cambia el
+ancla en el inspector de capas de Lyrixa.
+
+### Cuándo desaparece una línea
+
+El timestamp de la última palabra marca dónde acaba el *alineamiento del
+token*, no dónde deja de sonar la vocal cantada. Una línea que se apaga en ese
+instante se siente como si el párrafo cambiara antes de que termine la voz. Por
+eso cada línea **se queda 0,7 s de más**, pero solo hacia el silencio que la
+sigue: si otra línea entra antes, se corta 50 ms antes de ella y le cede el
+turno. Nunca hay dos líneas de la misma capa en pantalla a la vez.
+
 En Lyrixa usa **More → Import project (.lyrixa.json)** y después carga el mismo
 audio para revisar el timeline. Tras editar, usa **Export lyrics bundle** para
 obtener el `.lyrixa-lyrics.json` que consume LiveWallpaperAnimeGlitch, donde la

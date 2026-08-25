@@ -143,6 +143,28 @@ class TwoLayerEnvelopeTests(unittest.TestCase):
         self.assertEqual(layers[TRANSLATION_LAYER_ID]["role"], "translation")
         self.assertEqual(layers[TRANSLATION_LAYER_ID]["language"], "es")
 
+    def test_the_two_text_layers_never_share_an_anchor(self):
+        # Both renderers place a layer's clips absolutely at its preset, so two
+        # text layers on the same preset draw on top of each other.
+        layers = self.envelope()["project"]["layers"]
+        anchors = [layer["renderSettings"]["positionPreset"] for layer in layers
+                   if layer["id"] in {MAIN_LAYER_ID, TRANSLATION_LAYER_ID}]
+        self.assertEqual(len(anchors), 2)
+        self.assertEqual(len(set(anchors)), 2, anchors)
+
+    def test_a_translation_shares_its_line_timing_including_the_hold(self):
+        clips = self.envelope()["project"]["clips"]
+        pairs = list(zip([c for c in clips if c["layerId"] == MAIN_LAYER_ID],
+                         [c for c in clips if c["layerId"] == TRANSLATION_LAYER_ID]))
+        self.assertTrue(pairs)
+        for source, target in pairs:
+            self.assertEqual(target["endTime"], source["endTime"])
+        # And no two lines of the same layer are ever on screen at once.
+        for layer_id in (MAIN_LAYER_ID, TRANSLATION_LAYER_ID):
+            layer_clips = [c for c in clips if c["layerId"] == layer_id]
+            self.assertTrue(all(a["endTime"] <= b["startTime"]
+                                for a, b in zip(layer_clips, layer_clips[1:])))
+
     def test_every_lyric_line_gets_exactly_one_translation_at_the_same_time(self):
         clips = self.envelope()["project"]["clips"]
         main = [c for c in clips if c["layerId"] == MAIN_LAYER_ID]

@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "webapp"))
 
 from lyrixa_bridge import (  # noqa: E402
+    CLIP_HANDOVER_GAP,
+    CLIP_TAIL_HOLD,
     HARD_MAX_DURATION,
     MIN_CLIP_DURATION,
     build_lyrixa_envelope,
@@ -37,7 +39,10 @@ class LyrixaBridgeTests(unittest.TestCase):
         )
         clips = normalize_whisper_segments([segment])
         self.assertEqual(len(clips), 1)
-        self.assertEqual((clips[0]["startTime"], clips[0]["endTime"]), (1.0, 4.0))
+        # The line lingers past its last word: Whisper's word end marks the
+        # token alignment, not the end of the sung vowel.
+        self.assertEqual((clips[0]["startTime"], clips[0]["endTime"]),
+                         (1.0, 4.0 + CLIP_TAIL_HOLD))
 
     def test_23_second_fixture_becomes_multiple_reasonable_clips(self):
         fixture = json.loads(
@@ -45,9 +50,13 @@ class LyrixaBridgeTests(unittest.TestCase):
         )
         clips = normalize_whisper_segments(fixture["segments"])
         self.assertGreater(len(clips), 1)
-        self.assertTrue(all(c["endTime"] - c["startTime"] <= HARD_MAX_DURATION for c in clips))
+        # The hold is display linger, not more text, so it may push a clip
+        # past the splitting ceiling; the text itself still respects it.
+        self.assertTrue(all(
+            c["endTime"] - c["startTime"] <= HARD_MAX_DURATION + CLIP_TAIL_HOLD
+            for c in clips))
         self.assertEqual(clips[0]["startTime"], 36.0)
-        self.assertEqual(clips[-1]["endTime"], 52.4)
+        self.assertEqual(clips[-1]["endTime"], 52.4 + CLIP_TAIL_HOLD)
 
     def test_strong_punctuation_wins_over_pause_and_comma(self):
         tokens = ["Uno,", "dos", "tres", "cuatro.", "cinco", "seis", "siete", "ocho"]
@@ -77,7 +86,8 @@ class LyrixaBridgeTests(unittest.TestCase):
         ])
         self.assertEqual(len(clips), 1)
         self.assertEqual(clips[0]["text"], "No se pierde este texto")
-        self.assertEqual((clips[0]["startTime"], clips[0]["endTime"]), (10.0, 15.0))
+        self.assertEqual((clips[0]["startTime"], clips[0]["endTime"]),
+                         (10.0, 15.0 + CLIP_TAIL_HOLD))
         self.assertNotIn("words", clips[0])
 
     def test_partially_invalid_words_fall_back_without_losing_text(self):
@@ -112,6 +122,29 @@ class LyrixaBridgeTests(unittest.TestCase):
         self.assertTrue(all(c["endTime"] > c["startTime"] for c in clips))
         self.assertTrue(all(c["endTime"] - c["startTime"] >= MIN_CLIP_DURATION for c in clips))
         self.assertTrue(all(a["endTime"] <= b["startTime"] for a, b in zip(clips, clips[1:])))
+
+    def test_a_line_holds_into_the_silence_that_follows_it(self):
+        # 2 s of silence after the phrase: the line should use part of it
+        # instead of vanishing the instant the token alignment ends.
+        early = make_segment(["hola", "mundo"], [0.0, 1.0], [0.8, 1.8])
+        late = make_segment(["otra", "frase"], [4.0, 5.0], [4.8, 5.8])
+        clips = normalize_whisper_segments([early, late])
+        self.assertEqual(clips[0]["endTime"], 1.8 + CLIP_TAIL_HOLD)
+
+    def test_a_line_never_runs_into_the_next_one(self):
+        # Back-to-back phrases: the hold has nowhere to go, so it hands over.
+        first = make_segment(["hola", "mundo"], [0.0, 1.0], [0.8, 1.8])
+        second = make_segment(["otra", "frase"], [1.85, 2.9], [2.7, 3.7])
+        clips = normalize_whisper_segments([first, second])
+        self.assertTrue(all(a["endTime"] <= b["startTime"]
+                            for a, b in zip(clips, clips[1:])))
+        self.assertLessEqual(clips[0]["endTime"],
+                             clips[1]["startTime"] - CLIP_HANDOVER_GAP + 1e-9)
+
+    def test_the_last_line_does_not_hold_past_the_end_of_the_audio(self):
+        segment = make_segment(["fin"], [9.0], [9.6])
+        clips = normalize_whisper_segments([segment], 9.9)
+        self.assertEqual(clips[0]["endTime"], 9.9)
 
     def test_subminimum_word_clip_is_merged(self):
         segment = make_segment(["a", "continuación"], [0.0, 1.0], [0.1, 1.6])
