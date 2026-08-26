@@ -17,6 +17,14 @@ con su tiempo `inicio → fin` conforme se genera (vía SSE).
 | 🎯 **Letra ultra precisa** | Consenso de varias transcripciones + traducción. Ver abajo. |
 | ⬇️ **Solo audio** | Descarga audio de YouTube en MP3, M4A, Opus, OGG, FLAC, ALAC, WAV u original. |
 
+## Trabajos guardados e iteraciones
+
+La pantalla **Trabajos guardados** descubre automáticamente las carpetas de
+`webapp/output/`. Desde ahí puedes volver a abrir descargas y reproductores o
+reprocesar un modo ultra reutilizando `asr-input.wav`/`vocals.wav`. Cada nueva
+iteración archiva los JSON, subtítulos y textos anteriores bajo
+`iterations/iteration-NN`; el audio y los stems grandes no se duplican.
+
 ## Modo ultra: por qué deja de inventar letra
 
 Una pasada de Whisper a veces inventa una frase sobre una nota sostenida y a
@@ -35,6 +43,22 @@ Antes de transcribir mide la separación (nivel, cobertura de canto y fuga
 instrumental) y usa detección de actividad vocal para transcribir **solo donde
 se canta**: eso elimina de raíz la alucinación sobre silencio y, en una mezcla
 de tres horas, ahorra la mitad del cómputo.
+
+### Guía de canciones para mixes
+
+En modo ultra puedes pegar o cargar un `.txt` con una línea por canción:
+
+```text
+00:00 Rollergirl - Dear Jessie (Green Court Remix)
+01:25 T-Pau - China in Your Hand
+```
+
+Si la lista contiene secciones como `Original Tracklist:` y
+`Nightcore Tracklist:`, la app elige la que encaja con la duración real. De
+forma opcional consulta LRCLIB y guarda `track-guide.json`: cada ventana de
+Whisper recibe únicamente el título y vocabulario de la canción que suena en
+ese tramo. Una línea pública solo reemplaza la ortografía de Whisper cuando la
+coincidencia ya es alta, porque un remix puede cortar o reordenar la letra.
 
 El desglose completo — perfil de separación de doble pasada, ventanas
 desfasadas, alineación con Needleman–Wunsch, guardia de bucles de repetición y
@@ -125,6 +149,11 @@ cd webapp
 ```
 
 Abre **http://127.0.0.1:8000** en el navegador.
+
+Si macOS cierra la sesión o el servidor se reinicia durante un modo ultra, al
+volver a abrir la página aparece **Retomar desde el audio guardado**. La app
+reutiliza `asr-input.wav` (o la voz aislada si aún no existía) y no repite la
+descarga ni la separación vocal.
 
 ## Requisitos
 

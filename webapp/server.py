@@ -21,6 +21,7 @@ import sys
 import threading
 import uuid
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 import whisper  # solo para conocer las URLs de los modelos
@@ -34,6 +35,7 @@ from fastapi.responses import (
 
 import audio_analysis
 import precision
+import track_guides
 import translation
 from lyrixa_bridge import build_lyrixa_envelope, clip_languages, clip_lines
 
@@ -46,6 +48,8 @@ ROFORMER_CLI = ROFORMER_VENV_DIR / "bin" / "audio-separator"
 ROFORMER_MODEL_DIR = BASE_DIR / ".separator-models"
 ROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 OUTPUT_DIR.mkdir(exist_ok=True)
+LYRICS_CACHE_DIR = OUTPUT_DIR / ".lyrics-cache"
+MANIFEST_NAME = "job.json"
 
 # Modelos que ofrecemos en la interfaz (nombre -> etiqueta amigable).
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "turbo"]
@@ -168,6 +172,11 @@ app = FastAPI(title="Transcriptor local")
 
 # job_id -> dict(queue, done, ...)
 JOBS: dict[str, dict] = {}
+_JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_SOURCE_SUFFIXES = {
+    ".mp3", ".m4a", ".opus", ".ogg", ".flac", ".wav",
+    ".mp4", ".webm", ".mov", ".mkv",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -245,6 +254,239 @@ def ffprobe_duration(path: Path) -> float:
         return float(out)
     except Exception:
         return 0.0
+
+
+def recovery_assets(job_id: str) -> dict | None:
+    """Descubre checkpoints útiles de un job cuyo servidor se reinició.
+
+    Los procesos no sobreviven al cierre de la sesión de macOS, pero los WAV sí.
+    Si existe ``asr-input.wav`` podemos retomar justo antes del consenso, que es
+    la etapa cara posterior a la separación.
+    """
+    if not _JOB_ID_RE.fullmatch(job_id):
+        return None
+    outdir = (OUTPUT_DIR / job_id).resolve()
+    if not outdir.is_dir() or OUTPUT_DIR.resolve() not in outdir.parents:
+        return None
+
+    asr = outdir / "asr-input.wav"
+    vocals = next((p for p in outdir.rglob("vocals.wav") if p.is_file()), None)
+    instrumental = next(
+        (p for name in ("instrumental.wav", "no_vocals.wav")
+         for p in outdir.rglob(name) if p.is_file()),
+        None,
+    )
+    sources = [
+        p for p in outdir.iterdir()
+        if p.is_file() and p.suffix.lower() in _SOURCE_SUFFIXES
+        and p.name != "asr-input.wav"
+    ]
+    original = max(sources, key=lambda p: p.stat().st_mtime) if sources else None
+    checkpoint = asr if asr.is_file() else vocals
+    title = original.stem if original else "transcripcion recuperada"
+    duration_source = original or checkpoint
+    duration = ffprobe_duration(duration_source) if duration_source else 0.0
+    return {
+        "outdir": outdir,
+        "asr": asr if asr.is_file() else None,
+        "vocals": vocals,
+        "instrumental": instrumental,
+        "original": original,
+        "checkpoint": checkpoint,
+        "title": title,
+        "duration": duration,
+    }
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def read_manifest(outdir: Path) -> dict:
+    try:
+        data = json.loads((outdir / MANIFEST_NAME).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def update_manifest(job_id: str, **changes) -> dict:
+    """Persist the small part of a job that must survive a server restart."""
+    outdir = OUTPUT_DIR / job_id
+    outdir.mkdir(parents=True, exist_ok=True)
+    manifest = read_manifest(outdir)
+    manifest.update(changes)
+    manifest.setdefault("id", job_id)
+    manifest.setdefault("createdAt", _now())
+    manifest["updatedAt"] = _now()
+    target = outdir / MANIFEST_NAME
+    temporary = outdir / f".{MANIFEST_NAME}.tmp"
+    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+    temporary.replace(target)
+    return manifest
+
+
+def load_track_guide(outdir: Path) -> dict | None:
+    try:
+        data = json.loads((outdir / "track-guide.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def prepare_track_guide(outdir: Path, text: str, duration: float,
+                        fetch_lyrics: bool, emit) -> dict | None:
+    """Build once, cache on disk, and reuse on every later iteration."""
+    tracklist_path = outdir / "tracklist.txt"
+    incoming = (text or "").strip()
+    if incoming:
+        tracklist_path.write_text(incoming + "\n", encoding="utf-8")
+    elif tracklist_path.is_file():
+        incoming = tracklist_path.read_text(encoding="utf-8")
+        existing = load_track_guide(outdir)
+        if existing:
+            emit("reference", stage="loaded", **existing.get("references", {}),
+                 section=existing.get("section"))
+            return existing
+    if not incoming:
+        return None
+
+    emit("status", stage="references",
+         message="Leyendo el tracklist y preparando una guía por canción…")
+
+    def progress(done: int, total: int, track: track_guides.Track) -> None:
+        emit("progress", stage="references", progress=done / max(total, 1))
+        if fetch_lyrics:
+            emit("status", stage="references",
+                 message=(f"Buscando letras de referencia {done}/{total} · "
+                          f"{track.artist} — {track.title}"))
+
+    guide = track_guides.build_guide(
+        incoming, duration, fetch_lyrics=fetch_lyrics,
+        cache_dir=LYRICS_CACHE_DIR, progress=progress,
+    )
+    if not guide:
+        raise RuntimeError(
+            "No pude leer el tracklist. Usa una línea por canción: "
+            "00:00 Artista - Título"
+        )
+    (outdir / "track-guide.json").write_text(
+        json.dumps(guide, ensure_ascii=False, indent=2), encoding="utf-8")
+    emit("reference", stage="prepared", **guide["references"],
+         section=guide["section"], tracks=guide["tracks"])
+    return guide
+
+
+def _archive_outputs(outdir: Path) -> int:
+    """Keep small prior transcripts when the user iterates the same stems."""
+    manifest = read_manifest(outdir)
+    iteration = int(manifest.get("iteration") or 0) + 1
+    archive = outdir / "iterations" / f"iteration-{iteration:02d}"
+    candidates: list[Path] = []
+    for path in outdir.iterdir():
+        if not path.is_file() or path.name in {
+            MANIFEST_NAME, "track-guide.json", "tracklist.txt", "asr-input.wav",
+        }:
+            continue
+        name = path.name.lower()
+        if (path.suffix.lower() in {".srt", ".vtt", ".tsv"}
+                or name.endswith(".lyrixa.json")
+                or name.endswith(".letra.txt")
+                or (path.suffix.lower() == ".json" and name != MANIFEST_NAME)
+                or path.suffix.lower() == ".txt"):
+            candidates.append(path)
+    if candidates:
+        archive.mkdir(parents=True, exist_ok=True)
+        for path in candidates:
+            shutil.move(str(path), str(archive / path.name))
+    update_manifest(outdir.name, iteration=iteration)
+    return iteration
+
+
+def _discover_result_files(job_id: str, outdir: Path, assets: dict | None) -> dict:
+    manifest_files = read_manifest(outdir).get("files") or {}
+    files: dict = {}
+    for kind, descriptor in manifest_files.items():
+        name = descriptor if isinstance(descriptor, str) else descriptor.get("name", "")
+        if kind in {"vocals", "instrumental"}:
+            continue
+        if name and (outdir / Path(name).name).is_file():
+            files[kind] = Path(name).name
+
+    root_files = [path for path in outdir.iterdir() if path.is_file()]
+    def newest(predicate):
+        matches = [path for path in root_files if predicate(path)]
+        return max(matches, key=lambda path: path.stat().st_mtime).name if matches else None
+
+    guesses = {
+        "lyrixa": newest(lambda p: p.name.endswith(".lyrixa.json")),
+        "lyrics": newest(lambda p: p.name.endswith(".letra.txt")),
+        "srt": newest(lambda p: p.suffix.lower() == ".srt"),
+        "vtt": newest(lambda p: p.suffix.lower() == ".vtt"),
+        "tsv": newest(lambda p: p.suffix.lower() == ".tsv"),
+        "json": newest(lambda p: p.suffix.lower() == ".json" and
+                       p.name not in {MANIFEST_NAME, "track-guide.json"} and
+                       not p.name.endswith(".lyrixa.json")),
+        "txt": newest(lambda p: p.suffix.lower() == ".txt" and
+                      p.name != "tracklist.txt" and
+                      not p.name.endswith(".letra.txt")),
+    }
+    for kind, name in guesses.items():
+        if name:
+            files.setdefault(kind, name)
+    if (outdir / "track-guide.json").is_file():
+        files["guide"] = "track-guide.json"
+    if assets and assets.get("original"):
+        files.setdefault("audio", assets["original"].name)
+    if assets and assets.get("vocals"):
+        files["vocals"] = {
+            "name": "voz aislada.wav",
+            "url": f"/api/jobs/{job_id}/stems/vocals",
+        }
+    if assets and assets.get("instrumental"):
+        files["instrumental"] = {
+            "name": "instrumental.wav",
+            "url": f"/api/jobs/{job_id}/stems/instrumental",
+        }
+    return files
+
+
+def saved_job(job_id: str) -> dict | None:
+    assets = recovery_assets(job_id)
+    if assets is None:
+        return None
+    outdir = assets["outdir"]
+    manifest = read_manifest(outdir)
+    live = JOBS.get(job_id)
+    files = _discover_result_files(job_id, outdir, assets)
+    completed = any(kind in files for kind in ("json", "txt", "lyrixa"))
+    if live and not live["done"]:
+        status = "running"
+    elif completed:
+        status = "completed"
+    elif assets.get("checkpoint"):
+        status = "interrupted"
+    else:
+        status = manifest.get("status") or "saved"
+    guide = load_track_guide(outdir)
+    modified = datetime.fromtimestamp(outdir.stat().st_mtime, timezone.utc).isoformat()
+    return {
+        "id": job_id,
+        "title": manifest.get("title") or assets["title"],
+        "duration": float(manifest.get("duration") or assets["duration"] or 0),
+        "status": status,
+        "recoverable": assets.get("checkpoint") is not None,
+        "checkpoint": "asr" if assets.get("asr") else
+                      "vocals" if assets.get("vocals") else None,
+        "createdAt": manifest.get("createdAt") or modified,
+        "updatedAt": manifest.get("updatedAt") or modified,
+        "iteration": int(manifest.get("iteration") or 0),
+        "files": files,
+        "reference": (guide or {}).get("references"),
+        "section": (guide or {}).get("section"),
+        "error": manifest.get("error"),
+    }
 
 
 # Caracteres que no pueden ir en un nombre de archivo (o que rompen la
@@ -794,13 +1036,19 @@ def write_whisper_outputs(result: dict, outdir: Path, stem: str) -> dict:
 
 def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
                        duration: float, emit, out_stem: str,
-                       level: str, stem_report) -> tuple[dict, precision.PrecisionResult]:
+                       level: str, stem_report, guide: dict | None = None
+                       ) -> tuple[dict, precision.PrecisionResult]:
     """Transcribe por consenso de varias pasadas y escribe las mismas salidas."""
     spec = PRECISION_LEVELS.get(level, PRECISION_LEVELS["balanced"])
     config = precision.PrecisionConfig(
         model=model, language=language or None,
         min_passes=spec["min_passes"], max_passes=spec["max_passes"],
         stability_target=spec["stability"],
+        prompt_spans=track_guides.prompt_spans(guide),
+        segment_refiner=(
+            (lambda segments: track_guides.refine_segments(segments, guide))
+            if guide else None
+        ),
     )
     result = precision.run(audio, config, emit, stem_report)
     if not result.segments:
@@ -808,6 +1056,15 @@ def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
             "No se encontró voz cantada en el audio. Revisa la pista de voz "
             "aislada: puede que la canción sea instrumental."
         )
+
+    if guide:
+        references = dict(guide.get("references") or {})
+        references["matchedLines"] = sum(
+            1 for segment in result.segments if segment.get("referenceScore")
+        )
+        result.reference = references
+        emit("reference", stage="aligned", section=guide.get("section"),
+             **references)
 
     payload = {
         "text": "\n".join(segment["text"] for segment in result.segments),
@@ -997,7 +1254,8 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
              audio_format: str = "best", audio_quality: str = "192K",
              separation_quality: str = "precise",
              precision_level: str = "balanced", translate_to: str = "",
-             romaji: bool = True) -> None:
+             romaji: bool = True, tracklist_text: str = "",
+             fetch_lyrics: bool = True) -> None:
     job = JOBS[job_id]
 
     def emit(event: str, **data):
@@ -1011,13 +1269,17 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
 
     outdir = OUTPUT_DIR / job_id
     outdir.mkdir(parents=True, exist_ok=True)
+    update_manifest(job_id, status="running", error=None)
     try:
         # Modo "solo audio": descargar en el formato pedido y terminar, sin Whisper.
         if mode == "audio_only":
             audio, title, duration = download_audio(
                 url, outdir, emit, audio_format, audio_quality)
             emit("meta", title=title, duration=duration, device=device_name())
-            emit("done", title=title, files={"audio": audio.name},
+            files = {"audio": audio.name}
+            update_manifest(job_id, status="completed", title=title,
+                            duration=duration, files=files)
+            emit("done", title=title, files=files,
                  job_id=job_id)
             return
 
@@ -1058,6 +1320,13 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
 
         emit("meta", title=title, duration=duration,
              model=model, device=device_name())
+        update_manifest(job_id, title=title, duration=duration,
+                        sourceFile=original_audio.name)
+
+        guide = None
+        if mode == "ultra" and tracklist_text.strip():
+            guide = prepare_track_guide(
+                outdir, tracklist_text, duration, fetch_lyrics, emit)
 
         stem_files = {}
         stem_report = None
@@ -1092,7 +1361,8 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
                 audio, outdir / "asr-input.wav")
             files, result = run_precision_mode(
                 audio, model, language, outdir, duration, emit,
-                out_stem=title, level=precision_level, stem_report=stem_report)
+                out_stem=title, level=precision_level, stem_report=stem_report,
+                guide=guide)
             precision_report = result.as_report()
             detected_language = result.language or language
             emit("precision", **precision_report)
@@ -1136,15 +1406,136 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         # El audio descargado (con sus metadatos y carátula) también se ofrece.
         if source_audio is not None and source_audio.exists():
             files["audio"] = source_audio.name
+        if guide:
+            files["guide"] = "track-guide.json"
         files.update(stem_files)
+        update_manifest(job_id, status="completed", title=title,
+                        duration=duration, files=files, error=None)
         emit("done", title=title, files=files, job_id=job_id)
     except Exception as e:  # noqa: BLE001
+        update_manifest(job_id, status="error", error=str(e))
         emit("error", message=str(e))
     finally:
         if caffeinate is not None:
             caffeinate.terminate()  # deja que la Mac vuelva a poder dormir
         with job["cond"]:
             job["done"] = True  # marca fin del stream (para todos los lectores)
+            job["cond"].notify_all()
+
+
+def resume_precision_pipeline(
+    job_id: str, model: str, language: str, precision_level: str,
+    translate_to: str, romaji: bool, tracklist_text: str = "",
+    fetch_lyrics: bool = True,
+) -> None:
+    """Continúa un modo ultra desde los WAV que sobrevivieron al reinicio."""
+    job = JOBS[job_id]
+
+    def emit(event: str, **data):
+        with job["cond"]:
+            job["events"].append({"event": event, "data": data})
+            job["cond"].notify_all()
+
+    caffeinate = start_caffeinate()
+    update_manifest(job_id, status="running", error=None)
+    try:
+        assets = recovery_assets(job_id)
+        if not assets or not assets["checkpoint"]:
+            raise RuntimeError("No quedó un audio intermedio que se pueda retomar.")
+
+        outdir: Path = assets["outdir"]
+        title = assets["title"]
+        duration = assets["duration"]
+        original: Path | None = assets["original"]
+        vocals: Path | None = assets["vocals"]
+        instrumental: Path | None = assets["instrumental"]
+        audio: Path = assets["checkpoint"]
+
+        emit("status", stage="recovering",
+             message="Retomando desde el audio ya separado; no repetiré BS-RoFormer…")
+        emit("meta", title=title, duration=duration,
+             model=model, device=device_name())
+
+        guide = prepare_track_guide(
+            outdir, tracklist_text, duration, fetch_lyrics, emit)
+
+        stem_files: dict = {}
+        stem_report = None
+        if vocals:
+            if assets["asr"] is None:
+                audio = audio_analysis.condition_for_asr(
+                    vocals, outdir / "asr-input.wav")
+            stem_report = measure_stems(vocals, instrumental, duration)
+            emit("stem", stage="recovered", pass_number=0,
+                 **stem_report.as_dict())
+            job["stem_paths"] = {"vocals": str(vocals.resolve())}
+            stem_files["vocals"] = {
+                "name": f"{safe_stem(title)} - voz aislada.wav",
+                "url": f"/api/jobs/{job_id}/stems/vocals",
+            }
+            if instrumental:
+                job["stem_paths"]["instrumental"] = str(instrumental.resolve())
+                stem_files["instrumental"] = {
+                    "name": f"{safe_stem(title)} - instrumental.wav",
+                    "url": f"/api/jobs/{job_id}/stems/instrumental",
+                }
+
+        files, result = run_precision_mode(
+            audio, model, language, outdir, duration, emit,
+            out_stem=title, level=precision_level, stem_report=stem_report,
+            guide=guide)
+        precision_report = result.as_report()
+        detected_language = result.language or language
+        emit("precision", **precision_report)
+
+        translated_lines = None
+        romaji_lines = None
+        translation_language = None
+        if files.get("json"):
+            lines, line_languages = read_clip_lines(outdir / files["json"])
+            language_report = translate_clip_lines(
+                lines, line_languages, source=detected_language,
+                target=translate_to, romanize=romaji, emit=emit)
+            translated_lines = language_report["lines"]
+            romaji_lines = language_report["romaji"]
+            translation_language = language_report["targetLanguage"]
+            emit("translation",
+                 routeLabel=language_report["routeLabel"],
+                 backend=language_report["backend"],
+                 romajiBackend=language_report.get("romajiBackend"),
+                 targetLanguage=translation_language,
+                 error=language_report["error"])
+            lyrics_file = write_lyrics_sheet(
+                outdir, title, lines, romaji_lines, translated_lines)
+            if lyrics_file:
+                files["lyrics"] = lyrics_file
+
+        lyrixa = build_lyrixa_bundle(
+            outdir, files.get("json"), title, duration,
+            audio_file_name=(original.name if original else audio.name),
+            model=model, language=detected_language,
+            translations=translated_lines,
+            translation_language=translation_language, romaji=romaji_lines,
+            precision_report=precision_report,
+        )
+        if lyrixa:
+            files["lyrixa"] = lyrixa
+        if original and original.exists():
+            files["audio"] = original.name
+        if guide:
+            files["guide"] = "track-guide.json"
+        files.update(stem_files)
+        update_manifest(job_id, status="completed", title=title,
+                        duration=duration, files=files, error=None)
+        emit("done", title=title, files=files, job_id=job_id)
+    except Exception as error:  # noqa: BLE001
+        update_manifest(job_id, status="error", error=str(error))
+        emit("error", message=str(error))
+    finally:
+        if caffeinate is not None:
+            caffeinate.terminate()
+        with job["cond"]:
+            job["done"] = True
             job["cond"].notify_all()
 
 
@@ -1193,6 +1584,62 @@ def info():
     })
 
 
+@app.get("/api/jobs")
+def list_saved_jobs():
+    jobs = []
+    for outdir in OUTPUT_DIR.iterdir():
+        if not outdir.is_dir() or not _JOB_ID_RE.fullmatch(outdir.name):
+            continue
+        record = saved_job(outdir.name)
+        if record:
+            jobs.append(record)
+    jobs.sort(key=lambda item: item["updatedAt"], reverse=True)
+    return {"jobs": jobs}
+
+
+@app.get("/api/jobs/{job_id}")
+def saved_job_detail(job_id: str):
+    record = saved_job(job_id)
+    if record is None:
+        return JSONResponse({"error": "job no existe"}, status_code=404)
+    tracklist = OUTPUT_DIR / job_id / "tracklist.txt"
+    record["tracklistText"] = (
+        tracklist.read_text(encoding="utf-8") if tracklist.is_file() else ""
+    )
+    return record
+
+
+@app.post("/api/tracklists/preview")
+async def preview_tracklist(
+    tracklist_text: str = Form(...),
+    duration: float = Form(0.0),
+):
+    sections = track_guides.parse_tracklist(tracklist_text)
+    selected = track_guides.choose_section(sections, duration)
+    if not selected:
+        return JSONResponse(
+            {"error": "No encontré líneas con formato 00:00 Artista - Título."},
+            status_code=400,
+        )
+    return {
+        "selected": selected.name,
+        "sections": [
+            {
+                "name": section.name,
+                "tracks": len(section.tracks),
+                "first": section.tracks[0].start if section.tracks else 0,
+                "last": section.tracks[-1].start if section.tracks else 0,
+            }
+            for section in sections
+        ],
+        "tracks": [
+            {"start": track.start, "artist": track.artist,
+             "title": track.title, "label": track.label}
+            for track in selected.tracks
+        ],
+    }
+
+
 @app.post("/api/jobs")
 async def create_job(
     source_type: str = Form(...),
@@ -1206,6 +1653,8 @@ async def create_job(
     precision_level: str = Form("balanced"),
     translate_to: str = Form(""),
     romaji: str = Form("1"),
+    tracklist_text: str = Form(""),
+    fetch_lyrics: str = Form("1"),
     file: UploadFile | None = File(None),
 ):
     if audio_format not in _FORMATS_BY_VALUE:
@@ -1223,17 +1672,37 @@ async def create_job(
             {"error": f"Idioma de traducción desconocido: {translate_to}"},
             status_code=400)
 
+    if source_type not in {"url", "file"}:
+        return JSONResponse({"error": "Fuente desconocida"}, status_code=400)
+    if source_type == "file" and file is None:
+        return JSONResponse({"error": "Falta el archivo"}, status_code=400)
+    if len(tracklist_text.encode("utf-8")) > 2_000_000:
+        return JSONResponse({"error": "El tracklist supera 2 MB."}, status_code=400)
+
     job_id = uuid.uuid4().hex[:12]
     upload_path = None
+    outdir = OUTPUT_DIR / job_id
+    outdir.mkdir(parents=True, exist_ok=True)
     if source_type == "file":
-        if file is None:
-            return JSONResponse({"error": "Falta el archivo"}, status_code=400)
-        outdir = OUTPUT_DIR / job_id
-        outdir.mkdir(parents=True, exist_ok=True)
         # Nunca confiamos en el nombre que manda el navegador para armar rutas.
         upload_path = outdir / Path(file.filename or "audio").name
         with open(upload_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
+
+    if tracklist_text.strip():
+        (outdir / "tracklist.txt").write_text(
+            tracklist_text.strip() + "\n", encoding="utf-8")
+    update_manifest(
+        job_id, status="queued", mode=mode, iteration=0,
+        settings={
+            "model": model, "language": language,
+            "separationQuality": separation_quality,
+            "precisionLevel": precision_level, "translateTo": translate_to,
+            "romaji": romaji not in {"", "0", "false"},
+            "hasTracklist": bool(tracklist_text.strip()),
+            "fetchLyrics": fetch_lyrics not in {"", "0", "false"},
+        },
+    )
 
     JOBS[job_id] = {
         "events": [],                 # buffer de todos los eventos (para reconexión)
@@ -1244,10 +1713,105 @@ async def create_job(
         target=pipeline,
         args=(job_id, source_type, url, upload_path, model, language, mode,
               audio_format, audio_quality, separation_quality, precision_level,
-              translate_to, romaji not in {"", "0", "false"}),
+              translate_to, romaji not in {"", "0", "false"},
+              tracklist_text, fetch_lyrics not in {"", "0", "false"}),
         daemon=True,
     ).start()
     return {"job_id": job_id}
+
+
+@app.get("/api/jobs/{job_id}/state")
+def job_state(job_id: str):
+    """Indica si el job sigue vivo o si quedó un checkpoint recuperable."""
+    job = JOBS.get(job_id)
+    if job is not None:
+        return {"status": "known", "active": not job["done"],
+                "recoverable": False}
+
+    assets = recovery_assets(job_id)
+    if assets is None:
+        return JSONResponse({"error": "job no existe"}, status_code=404)
+    saved = [
+        path.name for key in ("original", "vocals", "instrumental", "asr")
+        if (path := assets.get(key)) is not None
+    ]
+    return {
+        "status": "interrupted",
+        "active": False,
+        "recoverable": assets["checkpoint"] is not None,
+        "checkpoint": "asr" if assets["asr"] else "vocals" if assets["vocals"] else None,
+        "title": assets["title"],
+        "duration": assets["duration"],
+        "saved": saved,
+    }
+
+
+@app.post("/api/jobs/{job_id}/resume")
+async def resume_job(
+    job_id: str,
+    model: str = Form("small"),
+    language: str = Form(""),
+    precision_level: str = Form("balanced"),
+    translate_to: str = Form(""),
+    romaji: str = Form("1"),
+    tracklist_text: str = Form(""),
+    fetch_lyrics: str = Form("1"),
+):
+    current = JOBS.get(job_id)
+    if current is not None and not current["done"]:
+        return JSONResponse({"error": "El trabajo ya está corriendo."},
+                            status_code=409)
+    assets = recovery_assets(job_id)
+    if assets is None or assets["checkpoint"] is None:
+        return JSONResponse(
+            {"error": "No quedó un audio intermedio recuperable."},
+            status_code=404,
+        )
+    if model not in MODELS:
+        model = "small"
+    if precision_level not in PRECISION_LEVELS:
+        precision_level = "balanced"
+    translate_to = translation.normalize_code(translate_to) or ""
+    if translate_to and translate_to not in TARGET_LANGUAGES:
+        return JSONResponse(
+            {"error": f"Idioma de traducción desconocido: {translate_to}"},
+            status_code=400,
+        )
+    if translate_to and not translation.translation_available():
+        return JSONResponse(
+            {"error": "No hay traductor local disponible."}, status_code=409)
+    if len(tracklist_text.encode("utf-8")) > 2_000_000:
+        return JSONResponse({"error": "El tracklist supera 2 MB."}, status_code=400)
+
+    iteration = _archive_outputs(assets["outdir"])
+    if tracklist_text.strip():
+        (assets["outdir"] / "tracklist.txt").write_text(
+            tracklist_text.strip() + "\n", encoding="utf-8")
+        # A new guide must be rebuilt; the previous one belongs to another
+        # version/section of the pasted list.
+        (assets["outdir"] / "track-guide.json").unlink(missing_ok=True)
+    update_manifest(
+        job_id, status="queued", iteration=iteration,
+        settings={
+            "model": model, "language": language,
+            "precisionLevel": precision_level, "translateTo": translate_to,
+            "romaji": romaji not in {"", "0", "false"},
+            "hasTracklist": (assets["outdir"] / "tracklist.txt").is_file(),
+            "fetchLyrics": fetch_lyrics not in {"", "0", "false"},
+        },
+    )
+
+    JOBS[job_id] = {
+        "events": [], "cond": threading.Condition(), "done": False,
+    }
+    threading.Thread(
+        target=resume_precision_pipeline,
+        args=(job_id, model, language, precision_level, translate_to,
+              romaji not in {"", "0", "false"}, tracklist_text,
+              fetch_lyrics not in {"", "0", "false"}),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "resumed": True}
 
 
 @app.get("/api/jobs/{job_id}/events")

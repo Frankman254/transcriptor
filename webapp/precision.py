@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -56,6 +57,8 @@ class PrecisionConfig:
     stability_target: float = DEFAULT_STABILITY_TARGET
     workers: int | None = None
     initial_prompt: str | None = None
+    prompt_spans: list[dict] = field(default_factory=list)
+    segment_refiner: Callable[[list[dict]], list[dict]] | None = None
 
 
 @dataclass
@@ -73,6 +76,7 @@ class PrecisionResult:
     dropped: int = 0
     looped: int = 0
     stem: dict | None = None
+    reference: dict | None = None
 
     @property
     def text(self) -> str:
@@ -95,6 +99,7 @@ class PrecisionResult:
             "languageProbability": round(self.language_probability, 4),
             "languages": self.languages,
             "stem": self.stem,
+            "reference": self.reference,
         }
 
 
@@ -326,7 +331,9 @@ def _run_round(executor: ProcessPoolExecutor, name: str, samples: int,
                 "window_index": window.index,
                 "offset": window.start,
                 "language": languages.at(window.start, window.end),
-                "initial_prompt": config.initial_prompt,
+                "initial_prompt": _prompt_at(
+                    config.prompt_spans, window.start, window.end)
+                    or config.initial_prompt,
             })
 
     collected: dict[int, list[dict]] = {spec.index: [] for spec in specs}
@@ -341,6 +348,22 @@ def _run_round(executor: ProcessPoolExecutor, name: str, samples: int,
     for words in collected.values():
         words.sort(key=lambda word: (word["start"], word["end"]))
     return collected, done
+
+
+def _prompt_at(spans: list[dict], start: float, end: float) -> str | None:
+    """Choose the song reference that overlaps most of an ASR window."""
+    if not spans:
+        return None
+
+    def overlap(span: dict) -> float:
+        return max(
+            0.0,
+            min(end, float(span.get("end", 0))) -
+            max(start, float(span.get("start", 0))),
+        )
+
+    winner = max(spans, key=overlap)
+    return winner.get("prompt") if overlap(winner) > 0 else None
 
 
 def run(audio: Path, config: PrecisionConfig, emit,
@@ -456,8 +479,12 @@ def run(audio: Path, config: PrecisionConfig, emit,
     result.dropped = stats.dropped
     result.looped = stats.looped
     result.segments = cs.to_segments(words, language_at=languages.at)
+    if config.segment_refiner:
+        result.segments = config.segment_refiner(result.segments)
     for segment in result.segments:
         emit("segment", start=segment["start"], end=segment["end"],
              text=segment["text"], agreement=segment.get("agreement"),
+             referenceScore=segment.get("referenceScore"),
+             track=segment.get("track"),
              progress=1.0)
     return result

@@ -38,6 +38,15 @@ cd webapp
 
 Luego abre **http://127.0.0.1:8000** en el navegador.
 
+Un cierre de sesión de macOS también termina el servidor, pero no borra los
+WAV intermedios. Al recargar, la app detecta el trabajo interrumpido y ofrece
+**Retomar desde el audio guardado** para continuar el modo ultra sin descargar
+ni separar otra vez.
+
+La sección **Trabajos guardados** también permite abrir cualquier carpeta de
+`output/` y volver a procesar las que conservan voz aislada. Los resultados
+anteriores se archivan por iteración sin copiar de nuevo los WAV.
+
 La primera vez instala `fastapi`, `uvicorn`, `python-multipart` y `mutagen`
 automáticamente.
 
@@ -130,6 +139,20 @@ separar voz → medir la separación → VAD → ventanas → N pasadas en paral
 Solo entonces se traduce. Traducir texto que todavía puede cambiar es trabajo
 tirado, y una traducción hecha sobre texto inventado se ve perfectamente
 correcta — que es la peor forma de estar mal.
+
+### Tracklist y letras de referencia
+
+El modo ultra acepta un `.txt` o texto pegado con `HH:MM:SS Artista - Título`.
+Las secciones alternativas (por ejemplo Original/Nightcore) se comparan con la
+duración del mix. Si está activa la búsqueda pública, se consulta LRCLIB y el
+resultado queda cacheado en `output/.lyrics-cache`; los metadatos del mix se
+guardan en `track-guide.json`.
+
+La referencia participa de dos maneras conservadoras:
+
+1. cada ventana recibe como prompt solo la canción de su intervalo;
+2. al final se recupera la ortografía/puntuación exacta únicamente para líneas
+   con coincidencia fuerte. Una letra distinta a la versión remix se ignora.
 
 ### Idioma, romaji y traducción
 
