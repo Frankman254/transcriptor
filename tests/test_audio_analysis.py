@@ -120,5 +120,85 @@ class SeparationReportTests(unittest.TestCase):
         self.assertIsInstance(payload["notes"], list)
 
 
+class LanguageMapTests(unittest.TestCase):
+    """A one-hour DJ set moves between languages; the map says where."""
+
+    def setUp(self):
+        import precision
+        self.LanguageMap = precision.LanguageMap
+        self.smooth = precision._smooth
+
+    def single(self):
+        return self.LanguageMap(dominant="ja", share=1.0,
+                                spans=[(0.0, 600.0, "ja")], seconds={"ja": 600.0})
+
+    def mixed(self):
+        spans = [(0.0, 100.0, "ja"), (100.0, 200.0, "en"), (200.0, 260.0, "ja")]
+        return self.LanguageMap(dominant="ja", share=0.61, spans=spans,
+                                seconds={"ja": 160.0, "en": 100.0})
+
+    def test_one_language_collapses_to_the_simple_case(self):
+        mapping = self.single()
+        self.assertFalse(mapping.multilingual)
+        self.assertEqual(mapping.at(0.0, 30.0), "ja")
+        self.assertEqual(mapping.at(9999.0, 10000.0), "ja")
+
+    def test_a_mix_answers_with_the_language_of_that_moment(self):
+        mapping = self.mixed()
+        self.assertTrue(mapping.multilingual)
+        self.assertEqual(mapping.at(10.0, 40.0), "ja")
+        self.assertEqual(mapping.at(120.0, 150.0), "en")
+        self.assertEqual(mapping.at(210.0, 240.0), "ja")
+
+    def test_a_window_straddling_a_change_takes_the_side_it_mostly_covers(self):
+        mapping = self.mixed()
+        self.assertEqual(mapping.at(80.0, 105.0), "ja")
+        self.assertEqual(mapping.at(95.0, 130.0), "en")
+
+    def test_a_window_outside_every_span_still_gets_an_answer(self):
+        self.assertEqual(self.mixed().at(5000.0, 5030.0), "ja")
+
+    def test_an_empty_map_answers_nothing_rather_than_guessing(self):
+        self.assertIsNone(self.LanguageMap().at(0.0, 30.0))
+
+
+    def test_a_region_gets_one_language_no_matter_where_a_pass_cuts(self):
+        # Every pass cuts the timeline at a different phase. If a window near a
+        # language change could get a different answer per pass, the two passes
+        # would transcribe the same audio in two languages and the vote would
+        # have nothing to agree on.
+        import precision
+        regions = [aa.SpeechRegion(0.0, 60.0), aa.SpeechRegion(80.0, 140.0)]
+        detected = [(0.0, 26.0, "ja"), (26.0, 52.0, "ja"), (52.0, 60.0, "en"),
+                    (80.0, 106.0, "en"), (106.0, 140.0, "en")]
+        spans = precision._by_region(detected, regions)
+        self.assertEqual(spans, [(0.0, 60.0, "ja"), (80.0, 140.0, "en")])
+
+        mapping = self.LanguageMap(dominant="en", share=0.5, spans=spans,
+                                   seconds={"ja": 60.0, "en": 60.0})
+        # Any window inside a region — whatever its phase — sees one answer.
+        for start, end in [(0.0, 26.0), (13.0, 39.0), (40.0, 60.0), (52.0, 58.0)]:
+            self.assertEqual(mapping.at(start, end), "ja", (start, end))
+        for start, end in [(80.0, 106.0), (93.0, 119.0), (120.0, 140.0)]:
+            self.assertEqual(mapping.at(start, end), "en", (start, end))
+
+    def test_a_region_with_no_detection_is_left_out_rather_than_guessed(self):
+        import precision
+        regions = [aa.SpeechRegion(0.0, 30.0), aa.SpeechRegion(200.0, 230.0)]
+        spans = precision._by_region([(0.0, 26.0, "ja")], regions)
+        self.assertEqual(spans, [(0.0, 30.0, "ja")])
+
+    def test_a_single_window_flip_between_agreeing_neighbours_is_noise(self):
+        # One window of "oh oh oh" can be detected as anything.
+        spans = [(0.0, 26.0, "ja"), (26.0, 52.0, "cy"), (52.0, 78.0, "ja")]
+        self.assertEqual([s[2] for s in self.smooth(spans)], ["ja", "ja", "ja"])
+
+    def test_a_real_language_change_survives_smoothing(self):
+        spans = [(0.0, 26.0, "ja"), (26.0, 52.0, "en"),
+                 (52.0, 78.0, "en"), (78.0, 104.0, "en")]
+        self.assertEqual([s[2] for s in self.smooth(spans)],
+                         ["ja", "en", "en", "en"])
+
+
 if __name__ == "__main__":
     unittest.main()

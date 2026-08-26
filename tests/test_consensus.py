@@ -10,6 +10,7 @@ from consensus import (  # noqa: E402
     ConsensusWord,
     collapse_repetition_loops,
     consensus_words,
+    is_filler_line,
     summarize,
     text_stability,
     to_segments,
@@ -198,6 +199,38 @@ class ConvergenceTests(unittest.TestCase):
         second = summarize(words, stats, 4, words)
         self.assertEqual(second.stability, 1.0)
         self.assertEqual(second.as_dict()["stability"], 1.0)
+
+
+class FillerPhraseTests(unittest.TestCase):
+    """Whisper's subtitle reflexes survive voting: every pass emits them."""
+
+    def test_the_common_caption_signoffs_are_recognised(self):
+        for phrase in ["ご視聴ありがとうございました", "Thank you.",
+                       "字幕をご視聴頂きましてありがとうございました。",
+                       "thanks for watching", "Bye"]:
+            self.assertTrue(is_filler_line(phrase), phrase)
+
+    def test_a_real_lyric_containing_those_words_is_left_alone(self):
+        for phrase in ["Thank you for the love you gave me",
+                       "おばあちゃんの", "Say goodbye, my love",
+                       "Esta noche seguimos bailando"]:
+            self.assertFalse(is_filler_line(phrase), phrase)
+
+    def test_a_filler_line_never_reaches_the_segments(self):
+        real = hypothesis(["Esta", "noche", "bailamos"], start=0.0)
+        filler = hypothesis(["Thank", "you."], start=20.0)
+        words, _ = consensus_words([real + filler] * 3)
+        texts = [segment["text"] for segment in to_segments(words)]
+        self.assertEqual(texts, ["Esta noche bailamos"])
+
+    def test_segment_ids_stay_contiguous_after_a_line_is_dropped(self):
+        real = hypothesis(["uno", "dos"], start=0.0)
+        filler = hypothesis(["Thank", "you."], start=20.0)
+        more = hypothesis(["tres", "cuatro"], start=40.0)
+        words, _ = consensus_words([real + filler + more] * 3)
+        segments = to_segments(words)
+        self.assertEqual([s["id"] for s in segments], list(range(len(segments))))
+        self.assertEqual([s["text"] for s in segments], ["uno dos", "tres cuatro"])
 
 
 if __name__ == "__main__":

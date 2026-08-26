@@ -142,5 +142,39 @@ class ModelChoiceTests(unittest.TestCase):
         self.assertIsNone(T.pick_model([]))
 
 
+
+class MultilingualGroupingTests(unittest.TestCase):
+    """A one-hour DJ set is not one language; routing is per line."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "webapp"))
+        from server import group_by_language
+        self.group = group_by_language
+
+    def test_lines_are_grouped_by_the_language_they_were_sung_in(self):
+        groups = self.group(["ja", "ja", "en", "ja", "en"], None)
+        self.assertEqual(groups["ja"], [0, 1, 3])
+        self.assertEqual(groups["en"], [2, 4])
+
+    def test_a_line_with_no_language_falls_back_to_the_track_language(self):
+        groups = self.group([None, "ja", None], "en")
+        self.assertEqual(groups["en"], [0, 2])
+        self.assertEqual(groups["ja"], [1])
+
+    def test_grouping_covers_every_line_exactly_once(self):
+        languages = ["ja", "en", None, "ru", "en", "ja"]
+        groups = self.group(languages, "en")
+        covered = sorted(i for indices in groups.values() for i in indices)
+        self.assertEqual(covered, list(range(len(languages))))
+
+    def test_each_group_gets_the_route_its_own_language_needs(self):
+        # This is the bug that produced English text for a Japanese track:
+        # one global route cannot serve a mix.
+        groups = self.group(["ja", "en"], None)
+        routes = {code: T.plan_route(code, "es") for code in groups}
+        self.assertEqual(routes["ja"], [("ja", "en"), ("en", "es")])
+        self.assertEqual(routes["en"], [("en", "es")])
+
+
 if __name__ == "__main__":
     unittest.main()

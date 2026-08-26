@@ -120,6 +120,12 @@ separar voz → medir la separación → VAD → ventanas → N pasadas en paral
 6. **Bucles.** Si *todas* las pasadas se enganchan en la misma repetición, el
    voto no puede verlo: coinciden, pero coinciden en algo falso. Un guardia
    aparte recorta las repeticiones descontroladas y deja las de verdad.
+7. **Muletillas de subtítulo.** Whisper aprendió de vídeo subtitulado y suelta
+   «ご視聴ありがとうございました» o «Thank you.» sobre la música. Todas las
+   pasadas las inventan igual, así que el voto tampoco las ve. Se descartan por
+   lista, y **solo cuando ocupan la línea entera**: «Thank you for the love you
+   gave me» es letra y se queda. En un mix de una hora esto fueron 75 de 507
+   líneas.
 
 Solo entonces se traduce. Traducir texto que todavía puede cambiar es trabajo
 tirado, y una traducción hecha sobre texto inventado se ve perfectamente

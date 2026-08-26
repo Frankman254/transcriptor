@@ -45,9 +45,16 @@ tiempos esperados — está en [`webapp/README.md`](webapp/README.md#modo-ultra)
 Cuando la letra ya está confirmada, y no antes, el modo ultra la traduce con un
 modelo local vía [Ollama](https://ollama.com):
 
-- **Detección de idioma por voto** en varios puntos de la canción, así que
-  funciona con ruso, japonés o coreano aunque el tema abra con un sample en
-  otro idioma.
+- **Detección de idioma tramo por tramo.** Un DJ set de una hora no tiene un
+  solo idioma, así que no se detecta uno para el archivo: se detecta en *cada*
+  ventana con voz. Si un idioma cubre más del 85% del canto se fuerza en todo
+  el archivo (es más estable); si no, la mezcla se marca como multilingüe y
+  cada tramo se transcribe en el idioma en que se cantó. Un cambio de idioma
+  que dura una sola ventana se descarta como ruido.
+- **Una ruta de traducción por idioma de origen.** En un mix con canciones en
+  japonés y en inglés, las líneas japonesas van por `ja→en→es` y llevan romaji;
+  las inglesas van por `en→es`. Antes había una sola ruta para todo el archivo,
+  y eso es exactamente lo que hacía que un tema japonés saliera en inglés.
 - **Japonés en romaji**, con la lectura correcta en contexto (君の名は →
   `kimi no na wa`, no `kun no mei ha`).
 - **Pivote por inglés** para escrituras no latinas: ruso → inglés → español.

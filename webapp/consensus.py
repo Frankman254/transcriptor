@@ -22,6 +22,7 @@ import re
 import statistics
 import unicodedata
 from bisect import bisect_left
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from textjoin import join_tokens, space_prefixes
@@ -62,6 +63,32 @@ REPEAT_KEEP = 4
 
 _PUNCT = re.compile(r"[^\w\s']", re.UNICODE)
 _STRONG_END = re.compile(r"[.!?…。！？][\"'’”)\]}]*$")
+
+# Whisper learned these from subtitled video and emits them over music and
+# silence.  Voting cannot remove them — every pass hallucinates the same
+# caption, so they are unanimous — and they are never song lyrics.  Matched
+# against a whole line only: "thank you" inside a real verse is left alone.
+_FILLER_PHRASES = frozenset({
+    # ja — subtitle sign-offs, by far the most common on music
+    "ご視聴ありがとうございました", "ご視聴ありがとうございます",
+    "字幕をご視聴頂きましてありがとうございました",
+    "最後までご視聴頂きありがとうございます",
+    "チャンネル登録お願いします", "おやすみなさい",
+    "エンディング", "本編はコチラ",
+    # en
+    "thank you", "thanks for watching", "thank you for watching",
+    "please subscribe", "subscribe to my channel",
+    "thank you very much", "bye",
+    # es / pt
+    "gracias por ver el video", "suscríbete al canal",
+    "obrigado por assistir",
+})
+
+
+def is_filler_line(text: str) -> bool:
+    """Is this whole line one of Whisper's caption reflexes?"""
+    stripped = re.sub(r"[\s.,!?…。、！？]+$", "", text.strip())
+    return unicodedata.normalize("NFKC", stripped).casefold() in _FILLER_PHRASES
 
 
 @dataclass
@@ -492,13 +519,19 @@ def text_stability(before: list[ConsensusWord], after: list[ConsensusWord]) -> f
     return max(0.0, 1.0 - previous[len(b)] / max(len(a), len(b)))
 
 
-def to_segments(words: list[ConsensusWord], *, language: str | None = None
+def to_segments(words: list[ConsensusWord], *,
+                language: str | None = None,
+                language_at: Callable[[float, float], str | None] | None = None,
                 ) -> list[dict]:
     """Group consensus words into Whisper-shaped segments.
 
     The output matches the raw Whisper JSON schema on purpose: SRT/VTT export
     and the Lyrixa bridge then work on consensus output without a single
     special case.
+
+    `language_at` labels each segment with the language actually sung over it.
+    On a DJ set that is not one value, and the translator downstream needs to
+    know which line came from which language to pick its route.
     """
     if not words:
         return []
@@ -514,14 +547,16 @@ def to_segments(words: list[ConsensusWord], *, language: str | None = None
             groups[-1].append(word)
 
     segments: list[dict] = []
-    for index, group in enumerate(groups):
+    for group in groups:
         tokens = [w.text for w in group]
+        if is_filler_line(join_words(tokens)):
+            continue
         # Each token carries the space that precedes it, exactly like Whisper's
         # own `words[]`, so every consumer reconstructs the same line by
         # concatenation and none of them re-guesses the spacing.
         prefixes = space_prefixes(tokens)
         segments.append({
-            "id": index,
+            "id": len(segments),
             "start": round(group[0].start, 3),
             "end": round(group[-1].end, 3),
             "text": join_words(tokens),
@@ -541,4 +576,8 @@ def to_segments(words: list[ConsensusWord], *, language: str | None = None
             "agreement": round(
                 sum(w.agreement for w in group) / len(group), 4),
         })
+        spoken = (language_at(group[0].start, group[-1].end)
+                  if language_at else language)
+        if spoken:
+            segments[-1]["language"] = spoken
     return segments

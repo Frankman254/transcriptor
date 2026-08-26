@@ -35,7 +35,7 @@ from fastapi.responses import (
 import audio_analysis
 import precision
 import translation
-from lyrixa_bridge import build_lyrixa_envelope, clip_lines
+from lyrixa_bridge import build_lyrixa_envelope, clip_languages, clip_lines
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -819,69 +819,115 @@ def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
     return files, result
 
 
-def translate_clip_lines(lines: list[str], *, source: str | None, target: str,
+def group_by_language(languages: list[str | None],
+                      fallback: str | None) -> dict[str | None, list[int]]:
+    """Line indices grouped by the language they were sung in."""
+    groups: dict[str | None, list[int]] = {}
+    for index, code in enumerate(languages):
+        key = translation.normalize_code(code) or translation.normalize_code(fallback)
+        groups.setdefault(key, []).append(index)
+    return groups
+
+
+def translate_clip_lines(lines: list[str], languages: list[str | None], *,
+                         source: str | None, target: str,
                          romanize: bool, emit) -> dict:
     """Romaniza y traduce las líneas ya confirmadas por el consenso.
 
     Se hace al final a propósito: traducir un texto que todavía puede cambiar
     es trabajo tirado, y una traducción hecha sobre texto inventado se ve
     perfectamente correcta, que es la peor forma de estar mal.
+
+    Las líneas se agrupan por el idioma en el que se cantaron, no por el del
+    archivo: en un mix de una hora conviven canciones en japonés y en inglés, y
+    cada grupo necesita su propia ruta (ja→en→es, en→es) y su propio romaji.
     """
     out: dict = {"lines": None, "romaji": None, "backend": None,
-                 "routeLabel": None, "targetLanguage": None, "error": None}
-    source_code = translation.normalize_code(source)
+                 "routeLabel": None, "targetLanguage": None, "error": None,
+                 "routes": []}
+    if not lines:
+        return out
 
-    if romanize and source_code in translation.ROMANIZABLE:
-        emit("status", stage="romanizing",
-             message="Pasando el japonés a romaji línea por línea…")
+    groups = group_by_language(languages, source)
+    errors: list[str] = []
+    routes: list[str] = []
 
-        def romaji_progress(done: int, total: int) -> None:
-            emit("progress", stage="romanizing", progress=done / max(total, 1))
-
-        try:
-            romaji, backend = translation.romanize(lines, progress=romaji_progress)
-            out["romaji"] = romaji
+    # --- Romaji: sólo los tramos que realmente se cantaron en japonés ---
+    romaji_lines: list[str] | None = None
+    if romanize:
+        for code, indices in groups.items():
+            if code not in translation.ROMANIZABLE:
+                continue
+            emit("status", stage="romanizing",
+                 message=(f"Pasando a romaji {len(indices)} líneas en "
+                          f"{translation.language_label(code)}…"))
+            try:
+                converted, backend = translation.romanize(
+                    [lines[i] for i in indices],
+                    progress=lambda done, total: emit(
+                        "progress", stage="romanizing",
+                        progress=done / max(total, 1)),
+                )
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"No se pudo romanizar: {error}")
+                continue
+            if romaji_lines is None:
+                romaji_lines = list(lines)
+            for position, index in enumerate(indices):
+                romaji_lines[index] = converted[position]
             out["romajiBackend"] = backend
-        except Exception as error:  # noqa: BLE001
-            out["error"] = f"No se pudo romanizar: {error}"
+        out["romaji"] = romaji_lines
 
     if not target:
+        out["error"] = "; ".join(errors) or None
         return out
 
-    route = translation.plan_route(source_code, target)
-    if not route:
-        out["targetLanguage"] = None
-        return out
+    # --- Traducción: una ruta por idioma de origen ---
+    translated = list(lines)
+    did_translate = False
+    for code, indices in groups.items():
+        route = translation.plan_route(code, target)
+        if not route:
+            continue                    # ya está en el idioma de destino
+        label = translation.route_label(route)
+        emit("status", stage="translating",
+             message=(f"Traduciendo {len(indices)} líneas ya confirmadas · "
+                      f"{label}…"))
+        try:
+            result = translation.translate(
+                [lines[i] for i in indices], source=code, target=target,
+                progress=lambda p: emit("progress", stage="translating",
+                                        progress=p),
+            )
+        except translation.TranslationUnavailable as error:
+            out["error"] = str(error)
+            return out
+        except Exception as error:  # noqa: BLE001
+            errors.append(f"{label}: {error}")
+            continue
+        for position, index in enumerate(indices):
+            translated[index] = result["lines"][position]
+        routes.append(f"{label} ({len(indices)})")
+        out["backend"] = result["backend"]
+        did_translate = True
 
-    emit("status", stage="translating",
-         message=f"Traduciendo la letra ya confirmada · "
-                 f"{translation.route_label(route)}…")
-    try:
-        translated = translation.translate(
-            lines, source=source_code, target=target,
-            progress=lambda p: emit("progress", stage="translating", progress=p),
-        )
-    except translation.TranslationUnavailable as error:
-        out["error"] = str(error)
+    out["error"] = "; ".join(errors) or None
+    if not did_translate:
         return out
-    except Exception as error:  # noqa: BLE001
-        out["error"] = f"La traducción falló: {error}"
-        return out
-
-    out["lines"] = translated["lines"]
-    out["backend"] = translated["backend"]
-    out["routeLabel"] = translated["routeLabel"]
+    out["lines"] = translated
+    out["routes"] = routes
+    out["routeLabel"] = " · ".join(routes)
     out["targetLanguage"] = translation.normalize_code(target)
     return out
 
 
-def read_clip_lines(json_path: Path) -> list[str]:
-    """Las líneas exactas que serán clips, para traducirlas 1 a 1."""
+def read_clip_lines(json_path: Path) -> tuple[list[str], list[str | None]]:
+    """Las líneas exactas que serán clips, con el idioma en que se cantó cada una."""
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
-        return []
-    return clip_lines(data)
+        return [], []
+    return clip_lines(data), clip_languages(data)
 
 
 def write_lyrics_sheet(outdir: Path, title: str, original: list[str],
@@ -1059,10 +1105,10 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         romaji_lines = None
         translation_language = None
         if mode == "ultra" and files.get("json"):
-            lines = read_clip_lines(outdir / files["json"])
+            lines, line_languages = read_clip_lines(outdir / files["json"])
             language_report = translate_clip_lines(
-                lines, source=detected_language, target=translate_to,
-                romanize=romaji, emit=emit)
+                lines, line_languages, source=detected_language,
+                target=translate_to, romanize=romaji, emit=emit)
             translated_lines = language_report["lines"]
             romaji_lines = language_report["romaji"]
             translation_language = language_report["targetLanguage"]

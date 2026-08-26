@@ -311,7 +311,9 @@ function setMode(m) {
            "con ajustes distintos. Después vota palabra por palabra y repite " +
            "hasta que una pasada más ya no cambie el texto: así se van las " +
            "frases inventadas y aparecen las omitidas. Al final traduce la " +
-           "letra ya confirmada para la 2ª capa de Lyrixa.",
+           "letra ya confirmada para la 2ª capa de Lyrixa. Detecta el idioma " +
+           "tramo por tramo, así que un mix con canciones en japonés y en " +
+           "inglés se transcribe y se traduce bien en las dos partes.",
   };
   const hint = document.getElementById("mode-hint");
   hint.textContent = hints[m] || "";
@@ -504,6 +506,25 @@ function showPrecision(d) {
       `de estabilidad; revisa las líneas en ámbar · `;
   }
   document.getElementById("rounds-note").textContent = verdict + context;
+
+  // Un mix de una hora no tiene un solo idioma: si lo tuviera, forzarlo es más
+  // estable; si no, cada tramo se transcribe en el suyo.
+  const langs = d.languages;
+  if (!langs || !langs.dominant) return;
+  const note = document.createElement("p");
+  note.className = "sub";
+  note.style.cssText = "margin:8px 2px 0;font-size:12px";
+  const parts = Object.entries(langs.seconds || {})
+    .map(([code, secs]) => `${code} ${fmt(secs)}`).join(" · ");
+  note.textContent = langs.multilingual
+    ? `🌍 Mezcla multilingüe: ${parts}. Cada tramo se transcribió en su propio `
+      + `idioma y se traduce con su propia ruta.`
+    : `🌍 Un solo idioma: ${langs.dominant} (${(langs.share * 100).toFixed(0)}% `
+      + `del canto).`;
+  const panel = document.getElementById("rounds-panel");
+  panel.querySelector(".lang-note")?.remove();
+  note.classList.add("lang-note");
+  panel.appendChild(note);
 }
 
 function showTranslation(d) {

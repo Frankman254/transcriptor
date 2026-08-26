@@ -36,8 +36,15 @@ DEFAULT_STABILITY_TARGET = 0.99
 DEFAULT_MIN_PASSES = 3
 DEFAULT_MAX_PASSES = 5
 
-# How many spots on the timeline get sampled when detecting the language.
-LANGUAGE_SAMPLES = 8
+# A one-hour DJ set is not one language.  Detection runs on every window
+# instead of on a handful of samples: one encoder pass per window is cheap next
+# to three full transcription passes, and sampling eight spots over an hour is
+# how a mix that opens in Japanese gets transcribed as English.
+#
+# When a single language covers this much of the speech, it is treated as the
+# language of the whole track — forcing it is more stable than letting an
+# ad-lib window drift. Below it, each window keeps its own.
+DOMINANT_LANGUAGE_SHARE = 0.85
 
 
 @dataclass
@@ -62,6 +69,7 @@ class PrecisionResult:
     rounds: list[dict] = field(default_factory=list)
     windows: int = 0
     speech_seconds: float = 0.0
+    languages: dict | None = None
     dropped: int = 0
     looped: int = 0
     stem: dict | None = None
@@ -85,6 +93,7 @@ class PrecisionResult:
             "loopedWords": self.looped,
             "language": self.language,
             "languageProbability": round(self.language_probability, 4),
+            "languages": self.languages,
             "stem": self.stem,
         }
 
@@ -173,50 +182,150 @@ def _task(name: str, window: aa.Window, total: int,
     }
 
 
-def _detect_language(executor: ProcessPoolExecutor, name: str, total: int,
-                     windows: list[aa.Window], emit) -> tuple[str | None, float]:
-    """Vote the language across the timeline instead of trusting the intro.
+@dataclass
+class LanguageMap:
+    """Which language is sung where.
 
-    A song can open with an English sample over a Japanese track, and Whisper
-    decides the language from the first thirty seconds.  Sampling spread-out
-    windows and summing the confidences fixes exactly that.
+    A single-language track collapses to one span and behaves exactly as
+    before; a multilingual mix keeps one span per window so each part is
+    transcribed — and later translated — in the language it was actually sung
+    in.
     """
-    if not windows:
-        return None, 0.0
-    step = max(1, len(windows) // LANGUAGE_SAMPLES)
-    sampled = windows[::step][:LANGUAGE_SAMPLES]
-    emit("status", stage="detecting_language",
-         message="Detectando el idioma en varios puntos de la canción…")
 
-    futures = [executor.submit(te.detect_language_task, _task(name, window, total))
-               for window in sampled]
-    scores: dict[str, float] = {}
+    dominant: str | None = None
+    share: float = 0.0
+    spans: list[tuple[float, float, str]] = field(default_factory=list)
+    seconds: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def multilingual(self) -> bool:
+        return len({span[2] for span in self.spans}) > 1
+
+    def at(self, start: float, end: float) -> str | None:
+        """The language sung over this window, by the time it covers most of."""
+        if not self.multilingual:
+            return self.dominant
+        overlap: dict[str, float] = {}
+        for span_start, span_end, language in self.spans:
+            shared = min(end, span_end) - max(start, span_start)
+            if shared > 0:
+                overlap[language] = overlap.get(language, 0.0) + shared
+        if not overlap:
+            return self.dominant
+        return max(overlap, key=lambda key: overlap[key])
+
+    def as_dict(self) -> dict:
+        return {
+            "dominant": self.dominant,
+            "share": round(self.share, 4),
+            "multilingual": self.multilingual,
+            "seconds": {k: round(v, 1) for k, v in sorted(
+                self.seconds.items(), key=lambda kv: -kv[1])},
+        }
+
+
+def _smooth(spans: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
+    """Drop single-window flips.
+
+    One window of "oh oh oh" can be detected as anything.  A language that
+    appears for exactly one window between two windows that agree with each
+    other is noise, not a language change.
+    """
+    if len(spans) < 3:
+        return spans
+    out = list(spans)
+    for i in range(1, len(out) - 1):
+        before, current, after = out[i - 1][2], out[i][2], out[i + 1][2]
+        if current != before and before == after:
+            out[i] = (out[i][0], out[i][1], before)
+    return out
+
+
+def _by_region(detected: list[tuple[float, float, str]],
+               regions: list[aa.SpeechRegion]) -> list[tuple[float, float, str]]:
+    """Collapse per-window detections to one language per speech region.
+
+    Every pass cuts the timeline at a different phase, so a window near a
+    language change would get a different answer depending on the pass — and
+    two passes transcribing the same audio in two languages produce text that
+    cannot be voted on at all.  Regions are shared by every pass and windows
+    never cross them, so pinning the language to the region makes the answer
+    independent of where a pass happened to cut.
+
+    It also matches reality: in a DJ set the language changes when the track
+    does, and a track change is a silence, which is a region boundary.
+    """
+    spans: list[tuple[float, float, str]] = []
+    for region in regions:
+        seconds: dict[str, float] = {}
+        for start, end, language in detected:
+            shared = min(region.end, end) - max(region.start, start)
+            if shared > 0:
+                seconds[language] = seconds.get(language, 0.0) + shared
+        if seconds:
+            winner = max(seconds, key=lambda key: seconds[key])
+            spans.append((region.start, region.end, winner))
+    return spans
+
+
+def _detect_language(executor: ProcessPoolExecutor, name: str, total: int,
+                     windows: list[aa.Window], regions: list[aa.SpeechRegion],
+                     emit) -> LanguageMap:
+    """Detect the language of every window, then decide if one rules them all."""
+    if not windows:
+        return LanguageMap()
+    emit("status", stage="detecting_language",
+         message=f"Detectando el idioma en {len(windows)} tramos con voz…")
+
+    futures = {
+        executor.submit(te.detect_language_task, _task(name, window, total)): window
+        for window in windows
+    }
+    detected: list[tuple[float, float, str]] = []
     for future in as_completed(futures):
-        result = future.result()
-        language = result.get("language")
+        window = futures[future]
+        language = future.result().get("language")
         if language:
-            scores[language] = scores.get(language, 0.0) + float(result["probability"])
-    if not scores:
-        return None, 0.0
-    best = max(scores, key=lambda key: scores[key])
-    weight = sum(scores.values())
-    return best, scores[best] / weight if weight else 0.0
+            detected.append((window.start, window.end, language))
+
+    if not detected:
+        return LanguageMap()
+    detected.sort()
+    # Region first, then smoothing: a whole region detected as something odd
+    # between two regions that agree is still noise.
+    spans = _smooth(_by_region(detected, regions))
+
+    seconds: dict[str, float] = {}
+    for start, end, language in spans:
+        seconds[language] = seconds.get(language, 0.0) + (end - start)
+    total_seconds = sum(seconds.values())
+    dominant = max(seconds, key=lambda key: seconds[key])
+    share = seconds[dominant] / total_seconds if total_seconds else 0.0
+
+    if share >= DOMINANT_LANGUAGE_SHARE:
+        # One language for the whole track: collapse the spans so downstream
+        # code takes the simple path.
+        spans = [(spans[0][0], spans[-1][1], dominant)]
+    return LanguageMap(dominant=dominant, share=share, spans=spans,
+                       seconds=seconds)
 
 
 def _run_round(executor: ProcessPoolExecutor, name: str, samples: int,
                regions: list[aa.SpeechRegion], specs: list[te.PassSpec],
-               language: str | None, config: PrecisionConfig,
+               languages: LanguageMap, config: PrecisionConfig,
                emit, done_base: int, total: int) -> tuple[dict[int, list[dict]], int]:
     """Submit every (pass, window) unit of this round and collect the words."""
     tasks = []
     for spec in specs:
+        # Each pass cuts the timeline differently, so a window's language is
+        # looked up by time rather than carried from the detection pass.
         for window in aa.plan_windows(regions, phase=spec.phase):
             tasks.append({
                 **_task(name, window, samples),
                 "spec": vars(spec),
                 "window_index": window.index,
                 "offset": window.start,
-                "language": language,
+                "language": languages.at(window.start, window.end),
                 "initial_prompt": config.initial_prompt,
             })
 
@@ -276,17 +385,31 @@ def run(audio: Path, config: PrecisionConfig, emit,
     ) as executor:
         del pcm  # the shared block is now the only copy of the audio
         # Whisper wants an ISO code; the UI may hand us "Spanish".
-        language = normalize_code(config.language)
-        probability = 1.0 if language else 0.0
-        if not language:
-            language, probability = _detect_language(
-                executor, name, samples, base_windows, emit)
-            if language:
+        forced = normalize_code(config.language)
+        if forced:
+            # An explicit choice is an instruction, not a hint: one span, no
+            # detection, no per-window drift.
+            languages = LanguageMap(
+                dominant=forced, share=1.0,
+                spans=[(0.0, float("inf"), forced)], seconds={forced: speech})
+        else:
+            languages = _detect_language(
+                executor, name, samples, base_windows, regions, emit)
+            if languages.multilingual:
+                mix = " · ".join(
+                    f"{code} {seconds / 60:.0f} min"
+                    for code, seconds in sorted(
+                        languages.seconds.items(), key=lambda kv: -kv[1])[:4])
                 emit("status", stage="detecting_language",
-                     message=f"Idioma detectado: {language} "
-                             f"({probability * 100:.0f}% de acuerdo).")
-        result.language = language
-        result.language_probability = probability
+                     message=(f"Mezcla multilingüe: {mix}. Cada tramo se "
+                              f"transcribe y se traduce en su propio idioma."))
+            elif languages.dominant:
+                emit("status", stage="detecting_language",
+                     message=(f"Idioma detectado: {languages.dominant} "
+                              f"({languages.share * 100:.0f}% del canto)."))
+        result.language = languages.dominant
+        result.language_probability = languages.share
+        result.languages = languages.as_dict()
 
         emit("status", stage="transcribing",
              message=(f"Transcribiendo con {engine} · {workers} procesos × "
@@ -308,7 +431,7 @@ def run(audio: Path, config: PrecisionConfig, emit,
                  message=(f"Pasada {used + 1}–{used + batch} de hasta "
                           f"{max_passes} · {', '.join(s.label for s in specs)}"))
             collected, done = _run_round(
-                executor, name, samples, regions, specs, language, config,
+                executor, name, samples, regions, specs, languages, config,
                 emit, done, total_tasks)
             hypotheses.update(collected)
             used += batch
@@ -332,7 +455,7 @@ def run(audio: Path, config: PrecisionConfig, emit,
     result.passes = used
     result.dropped = stats.dropped
     result.looped = stats.looped
-    result.segments = cs.to_segments(words, language=language)
+    result.segments = cs.to_segments(words, language_at=languages.at)
     for segment in result.segments:
         emit("segment", start=segment["start"], end=segment["end"],
              text=segment["text"], agreement=segment.get("agreement"),

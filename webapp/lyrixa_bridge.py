@@ -114,12 +114,15 @@ def _fallback_clip(segment: dict[str, Any], segment_index: int) -> dict[str, Any
     end = _finite_number(segment.get("end"))
     if end is None or end <= start:
         end = start + MIN_CLIP_DURATION
-    return {
+    clip = {
         "text": text,
         "startTime": _round_time(start),
         "endTime": _round_time(end),
         "sourceId": f"segment-{segment_index}",
     }
+    if segment.get("language"):
+        clip["language"] = segment["language"]
+    return clip
 
 
 def _validated_words(segment: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -308,6 +311,7 @@ def segment_whisper_segment(
     if words is None:
         return [fallback]
 
+    spoken = segment.get("language")
     clips: list[dict[str, Any]] = []
     for chunk in split_words(words):
         clip = {
@@ -328,6 +332,8 @@ def segment_whisper_segment(
         agreements = [w["agreement"] for w in chunk if "agreement" in w]
         if agreements:
             clip["agreement"] = round(sum(agreements) / len(agreements), 4)
+        if spoken:
+            clip["language"] = spoken
         clips.append(clip)
     return clips
 
@@ -429,6 +435,16 @@ def clip_lines(whisper_data: dict[str, Any]) -> list[str]:
     so calling it twice gives the same partition.
     """
     return [clip["text"] for clip
+            in normalize_whisper_segments(whisper_data.get("segments"))]
+
+
+def clip_languages(whisper_data: dict[str, Any]) -> list[str | None]:
+    """The source language of each line, parallel to `clip_lines`.
+
+    A one-hour DJ set moves between languages, so the translator routes each
+    line by the language it was sung in rather than by one value for the file.
+    """
+    return [clip.get("language") for clip
             in normalize_whisper_segments(whisper_data.get("segments"))]
 
 
