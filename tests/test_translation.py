@@ -6,6 +6,7 @@ language quality is the local model's job.
 """
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -128,11 +129,10 @@ class NoBackendTests(unittest.TestCase):
 
 
 class ModelChoiceTests(unittest.TestCase):
-    def test_the_strongest_multilingual_model_present_wins(self):
+    def test_a_modern_mid_size_model_wins_over_a_slow_27b(self):
         installed = ["codellama:7b", "qwen3:8b",
                      "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M"]
-        self.assertEqual(T.pick_model(installed),
-                         "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M")
+        self.assertEqual(T.pick_model(installed), "qwen3:8b")
 
     def test_a_code_model_is_still_better_than_refusing_to_translate(self):
         self.assertEqual(T.pick_model(["some-unknown-model"]),
@@ -140,6 +140,31 @@ class ModelChoiceTests(unittest.TestCase):
 
     def test_no_models_means_no_choice(self):
         self.assertIsNone(T.pick_model([]))
+
+
+class TranslationCacheTests(unittest.TestCase):
+    def test_repeated_chorus_is_translated_once_and_then_loaded_from_disk(self):
+        calls = []
+        original = T._run_lines
+
+        def fake_run(model, system, lines, progress=None):
+            calls.append(list(lines))
+            return [f"ES:{line}" for line in lines]
+
+        with tempfile.TemporaryDirectory() as folder:
+            T._run_lines = fake_run
+            try:
+                first = T._run_cached_lines(
+                    "qwen3:8b", "prompt", ["hello", "hello", "goodbye"],
+                    source="en", target="es", cache_dir=Path(folder))
+                second = T._run_cached_lines(
+                    "qwen3:8b", "prompt", ["hello", "goodbye"],
+                    source="en", target="es", cache_dir=Path(folder))
+            finally:
+                T._run_lines = original
+        self.assertEqual(calls, [["hello", "goodbye"]])
+        self.assertEqual(first, ["ES:hello", "ES:hello", "ES:goodbye"])
+        self.assertEqual(second, ["ES:hello", "ES:goodbye"])
 
 
 

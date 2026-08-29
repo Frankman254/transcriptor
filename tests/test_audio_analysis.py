@@ -86,6 +86,30 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(aa.plan_windows([]), [])
 
 
+class RescuePlanTests(unittest.TestCase):
+    def setUp(self):
+        import precision
+        self.plan = precision._rescue_intervals
+
+    def test_only_low_confidence_lines_and_short_holes_are_reviewed(self):
+        segments = [
+            {"start": 0, "end": 2, "agreement": 1.0, "confidence": 0.9},
+            {"start": 4, "end": 6, "agreement": 0.4, "confidence": 0.5},
+            {"start": 20, "end": 22, "agreement": 1.0, "confidence": 0.9},
+        ]
+        intervals = self.plan(segments, 30, limit=6)
+        self.assertTrue(any(start <= 4 and end >= 6 for start, end in intervals))
+        self.assertTrue(all(end - start <= 29 for start, end in intervals))
+
+    def test_review_budget_is_bounded_on_a_long_mix(self):
+        segments = [
+            {"start": i * 10, "end": i * 10 + 2,
+             "agreement": 0.4, "confidence": 0.4}
+            for i in range(100)
+        ]
+        self.assertLessEqual(len(self.plan(segments, 1000, limit=24)), 24)
+
+
 class SeparationReportTests(unittest.TestCase):
     def test_a_clean_vocal_stem_passes(self):
         pcm = np.concatenate([quiet(2), tone(8), quiet(2), tone(6)])

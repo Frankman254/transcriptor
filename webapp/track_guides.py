@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import ssl
 import statistics
 import time
 import unicodedata
@@ -26,6 +27,10 @@ from typing import Callable
 
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
 USER_AGENT = "TranscriptorLocal/1.0 (local lyrics reference)"
+# Un fallo de red o una búsqueda vacía no es una verdad permanente. Los
+# aciertos se conservan; los negativos se reintentan al día siguiente.
+NEGATIVE_CACHE_TTL = 24 * 60 * 60
+ERROR_CACHE_TTL = 5 * 60
 _TIMED_LINE = re.compile(
     r"^\s*((?:\d{1,2}:){1,2}\d{2}(?:[.,]\d{1,3})?)\s+(.+?)\s*$"
 )
@@ -46,6 +51,7 @@ class Track:
     label: str
     end: float = 0.0
     reference: dict | None = None
+    lookup: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -187,6 +193,45 @@ def best_candidate(track: Track, candidates: list[dict]) -> dict | None:
     }
 
 
+def dedupe_candidates(candidates: list[dict]) -> list[dict]:
+    """Collapse LRCLIB duplicates, preferring an entry with synced lyrics.
+
+    Adapted from the useful part of search-play-lyrics: LRCLIB commonly returns
+    the same upload several times and selection should not count that as
+    independent evidence.
+    """
+    chosen: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for candidate in candidates:
+        key = (_fold(candidate.get("trackName") or candidate.get("name") or ""),
+               _fold(candidate.get("artistName") or ""))
+        if key not in chosen:
+            chosen[key] = candidate
+            order.append(key)
+        elif (not chosen[key].get("syncedLyrics")
+              and candidate.get("syncedLyrics")):
+            chosen[key] = candidate
+    return [chosen[key] for key in order]
+
+
+def _https_context() -> ssl.SSLContext:
+    """Use certifi on Python.org macOS builds whose OpenSSL store is empty."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001
+        return ssl.create_default_context()
+
+
+def _search_candidates(query: str, timeout: float) -> list[dict]:
+    url = LRCLIB_SEARCH + "?" + urllib.parse.urlencode({"q": query})
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(
+        request, timeout=timeout, context=_https_context()) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return dedupe_candidates(payload if isinstance(payload, list) else [])
+
+
 def _cache_path(cache_dir: Path, track: Track) -> Path:
     key = hashlib.sha256(
         f"{_fold(track.artist)}\0{_fold(_search_title(track.title))}".encode()
@@ -201,20 +246,63 @@ def fetch_reference(track: Track, cache_dir: Path, timeout: float = 12.0) -> dic
     if target.is_file():
         try:
             cached = json.loads(target.read_text(encoding="utf-8"))
-            return cached or None
+            # Acepta el formato histórico (dict/null) y el formato actual, que
+            # distingue resultado vacío de error temporal y les pone caducidad.
+            if isinstance(cached, dict) and "reference" in cached:
+                reference = cached.get("reference")
+                fetched_at = float(cached.get("fetchedAt") or 0.0)
+                age = time.time() - fetched_at
+                ttl = ERROR_CACHE_TTL if cached.get("error") else NEGATIVE_CACHE_TTL
+                # La versión afectada por el certificado solo guardaba el
+                # nombre genérico "URLError". Ese valor no sirve para decidir
+                # nada y debe reintentarse inmediatamente.
+                legacy_ssl_failure = cached.get("error") == "URLError"
+                if reference or (age < ttl and not legacy_ssl_failure):
+                    track.lookup = {
+                        "status": "found" if reference else
+                                  "error" if cached.get("error") else "no_match",
+                        "candidates": int(cached.get("candidateCount") or 0),
+                        "error": cached.get("error"),
+                    }
+                    return reference or None
+            elif cached:
+                track.lookup = {"status": "found", "candidates": 1,
+                                "error": None}
+                return cached
+            # Un `null` del formato viejo no dice si fue "sin resultados" o
+            # "sin internet"; se reintenta una vez y queda migrado.
         except Exception:  # noqa: BLE001
             pass
 
-    query = " ".join(part for part in (track.artist, _search_title(track.title)) if part)
-    url = LRCLIB_SEARCH + "?" + urllib.parse.urlencode({"q": query})
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    title = _search_title(track.title)
+    queries = list(dict.fromkeys(filter(None, (
+        " ".join(part for part in (track.artist, title) if part),
+        title,
+    ))))
+    error = None
+    candidates: list[dict] = []
+    reference = None
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            candidates = json.loads(response.read().decode("utf-8"))
-        reference = best_candidate(track, candidates if isinstance(candidates, list) else [])
-    except Exception:  # noqa: BLE001
+        for query in queries:
+            candidates = _search_candidates(query, timeout)
+            reference = best_candidate(track, candidates)
+            if reference:
+                break
+    except Exception as caught:  # noqa: BLE001
         reference = None
-    target.write_text(json.dumps(reference, ensure_ascii=False, indent=2),
+        reason = getattr(caught, "reason", caught)
+        error = f"{type(caught).__name__}: {reason}"
+    track.lookup = {
+        "status": "found" if reference else "error" if error else "no_match",
+        "candidates": len(candidates), "error": error,
+    }
+    target.write_text(json.dumps({
+        "reference": reference,
+        "fetchedAt": time.time(),
+        "error": error,
+        "candidateCount": len(candidates),
+        "queries": queries,
+    }, ensure_ascii=False, indent=2),
                       encoding="utf-8")
     return reference
 
@@ -245,6 +333,8 @@ def build_guide(
             progress(index + 1, len(tracks), track)
     found = sum(1 for track in tracks if track.reference)
     synced = sum(1 for track in tracks if track.reference and track.reference.get("synced"))
+    failed = sum(1 for track in tracks if track.lookup.get("status") == "error")
+    no_match = sum(1 for track in tracks if track.lookup.get("status") == "no_match")
     return {
         "version": 1,
         "section": selected.name,
@@ -256,7 +346,8 @@ def build_guide(
         ],
         "tracks": [asdict(track) for track in tracks],
         "references": {"provider": "LRCLIB", "found": found,
-                       "synced": synced, "total": len(tracks)},
+                       "synced": synced, "total": len(tracks),
+                       "failed": failed, "noMatch": no_match},
     }
 
 
@@ -285,8 +376,11 @@ def prompt_spans(guide: dict | None, max_chars: int = 1400) -> list[dict]:
             if key and key not in seen:
                 seen.add(key)
                 lines.append(line)
-        heading = f"{track.get('artist', '')} — {track.get('title', '')}. ".strip()
-        prompt = heading + " " + " | ".join(lines)
+        # `initial_prompt` es texto que Whisper puede repetir. Artista y título
+        # son metadatos, no letra; si LRCLIB no halló versos no hay prompt.
+        if not lines:
+            continue
+        prompt = " | ".join(lines)
         spans.append({
             "start": float(track.get("start") or 0.0),
             "end": float(track.get("end") or 0.0),
@@ -353,4 +447,3 @@ def refine_segments(segments: list[dict], guide: dict | None) -> list[dict]:
         }
         out.append(item)
     return out
-

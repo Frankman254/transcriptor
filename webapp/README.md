@@ -9,9 +9,9 @@ Tiene cuatro modos:
 - **🎤 Letra de canción** — aísla la voz con BS-RoFormer o Demucs y la
   transcribe. Mucho mejor que transcribir la canción directa.
 - **🎯 Letra ultra precisa** — el modo avanzado: separa, detecta dónde hay
-  canto, transcribe varias veces con ajustes distintos, vota palabra por
-  palabra y repite hasta converger. Después traduce la letra ya confirmada
-  para la segunda capa de Lyrixa. Ver [Modo ultra](#modo-ultra).
+  canto y vota hasta tres lecturas distintas. Las zonas dudosas pueden
+  revisarse con el audio original. La traducción es optativa y también puede
+  añadirse después desde Trabajos guardados. Ver [Modo ultra](#modo-ultra).
 - **⬇️ Solo audio** — descarga un YouTube en MP3, M4A, Opus, OGG,
   FLAC, ALAC, WAV o en su formato original, sin transcribir.
 
@@ -23,6 +23,8 @@ Tiene cuatro modos:
 - `demucs` (pip, opcional) — perfiles vocales equilibrado/rápido
 - `faster-whisper` (pip) — motor del modo ultra; varias veces más rápido que
   `openai-whisper`, que sigue como respaldo si no está
+- `mlx-whisper` (Apple Silicon) — usa Metal/memoria unificada y es el motor
+  automático preferido en Mac; `run.sh` lo instala una vez
 - `pykakasi` (pip, opcional) — romaji sin conexión cuando no hay Ollama
 - [Ollama](https://ollama.com) (opcional) — traducción y romaji en contexto,
   también local: `ollama pull qwen3.5`
@@ -46,6 +48,22 @@ ni separar otra vez.
 La sección **Trabajos guardados** también permite abrir cualquier carpeta de
 `output/` y volver a procesar las que conservan voz aislada. Los resultados
 anteriores se archivan por iteración sin copiar de nuevo los WAV.
+Al cargar una iteración, el botón principal entra por la ruta de reanudación:
+comprueba rápidamente duración e integridad de `asr-input.wav`, cae a
+`vocals.wav` si hace falta y no ejecuta BS-RoFormer otra vez. También reutiliza
+el informe de calidad guardado para no decodificar de nuevo dos WAV enormes.
+También restaura el modelo, motor y nivel de precisión de esa iteración. En
+Apple Silicon, MLX usa decodificación greedy porque su implementación actual no
+admite beam search; una pasada que falle ya no cuenta como un voto de silencio.
+Si aun así el alineador retuviera menos del 8% de la lectura principal, la app
+conserva esa lectura marcada como dudosa en lugar de borrar miles de palabras.
+
+La interfaz identifica cada modelo por nombre completo, parámetros, descarga,
+calidad y velocidad, y enseña el repositorio/archivo exacto del motor elegido.
+Durante el trabajo aparece **Motor real** para distinguir MLX, faster-whisper
+y la implementación original. La biblioteca informa el espacio de cada trabajo
+y permite eliminarlo permanentemente con confirmación; el servidor rechaza el
+borrado mientras siga ejecutándose.
 
 La primera vez instala `fastapi`, `uvicorn`, `python-multipart` y `mutagen`
 automáticamente.
@@ -101,9 +119,8 @@ son inestables — cambia la temperatura o mueve el corte y se mueven con él.
 La letra real no se mueve. El modo ultra explota justo esa diferencia.
 
 ```
-separar voz → medir la separación → VAD → ventanas → N pasadas en paralelo
-      → alineación y voto por palabra → ¿cambió algo? → sí: otra pasada
-                                                      → no: traducir
+separar voz → medir → VAD → 1 o 3 pasadas → voto → rescate selectivo original
+      → proyecto Lyrixa → traducción opcional ahora o desde el trabajo guardado
 ```
 
 1. **Separación medida.** El perfil *Ultra* pasa BS-RoFormer dos veces y se
@@ -123,9 +140,9 @@ separar voz → medir la separación → VAD → ventanas → N pasadas en paral
    alinee con el del minuto uno — y cada posición vota. Una palabra que oyó
    una sola pasada pierde contra el silencio que oyeron las demás; una que
    oyeron todas sobrevive aunque la escriban distinto.
-5. **Convergencia.** Tras cada ronda se compara el texto con el de la ronda
-   anterior. Cuando una pasada más cambia menos del 1%, para: lo que queda de
-   desacuerdo está en el audio, no en el decodificador.
+5. **Presupuesto acotado.** Rápido hace una lectura; Equilibrado y Máximo útil
+   hacen tres. No se repite un mix completo cinco u ocho veces intentando
+   alcanzar una convergencia imposible sobre un stem contaminado.
 6. **Bucles.** Si *todas* las pasadas se enganchan en la misma repetición, el
    voto no puede verlo: coinciden, pero coinciden en algo falso. Un guardia
    aparte recorta las repeticiones descontroladas y deja las de verdad.
@@ -148,9 +165,17 @@ duración del mix. Si está activa la búsqueda pública, se consulta LRCLIB y e
 resultado queda cacheado en `output/.lyrics-cache`; los metadatos del mix se
 guardan en `track-guide.json`.
 
+La búsqueda usa el almacén de certificados de `certifi` (necesario en algunas
+instalaciones de Python para macOS), prueba `artista + título` y después solo el
+título, elimina resultados duplicados y prefiere la copia que trae LRC
+sincronizado. Los fallos de conexión se reintentan a los cinco minutos y se
+muestran separados de una canción que realmente no tuvo coincidencias; una
+guía vieja que solo contenía fallos también se reconstruye automáticamente.
+
 La referencia participa de dos maneras conservadoras:
 
-1. cada ventana recibe como prompt solo la canción de su intervalo;
+1. cada ventana recibe versos reales únicamente cuando LRCLIB encontró letra;
+   artista/título jamás se usan como prompt;
 2. al final se recupera la ortografía/puntuación exacta únicamente para líneas
    con coincidencia fuerte. Una letra distinta a la versión remix se ignora.
 
@@ -170,6 +195,9 @@ La referencia participa de dos maneras conservadoras:
   vuelve mal, se reintenta y luego se traduce línea por línea. Si aun así falla
   una, se conserva el original. Una línea sin traducir se ve; una capa
   desplazada, no.
+- **Optativa y diferida**: el valor inicial es *Sin traducción*. Desde Trabajos
+  guardados se puede añadir/cambiar la capa sin repetir Whisper. Coros y líneas
+  ya traducidas se reutilizan desde `output/.translation-cache`.
 
 ### Salidas
 
@@ -190,12 +218,10 @@ marcadas en ámbar: son las que conviene escuchar antes de darlas por buenas.
 
 ### Cuánto tarda
 
-El modo ultra hace N veces el trabajo de una transcripción normal, pero solo
-sobre las partes con canto. En una mezcla donde se canta la mitad del tiempo,
-cinco pasadas cuestan aproximadamente 2,5 transcripciones completas. Para
-audios de una a tres horas, `turbo` con el nivel *Equilibrado* es el punto
-sensato; `large-v3` con *Máximo* es para cuando la letra importa más que la
-tarde.
+El modo Equilibrado hace tres lecturas solo sobre las partes con canto. El
+rescate revisa como máximo 24 zonas desde el audio original; si el modelo
+principal es Turbo usa `large-v3` únicamente allí. Para una revisión inicial,
+Rápido hace una sola lectura. La traducción no suma tiempo salvo que la elijas.
 
 ## Modelos
 | Modelo | Calidad | Velocidad (CPU) |

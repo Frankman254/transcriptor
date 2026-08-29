@@ -1,8 +1,8 @@
 """Uniform transcription surface over the two local Whisper runtimes.
 
 `faster-whisper` (CTranslate2) is preferred when its weights are available: it
-is several times faster than the reference implementation, which is what makes
-running five passes over a three-hour mix realistic instead of theoretical.
+is several times faster than the reference implementation. On Apple Silicon,
+MLX is preferred so large models do not remain limited to CTranslate2's CPU.
 `openai-whisper` is the guaranteed fallback and uses the weights already in
 ``~/.cache/whisper``.
 
@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import math
 import os
+import platform
+from functools import lru_cache
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,15 @@ _FASTER_MODEL_NAMES = {
     "medium": "medium",
     "large-v3": "large-v3",
     "turbo": "large-v3-turbo",
+}
+
+_MLX_MODEL_NAMES = {
+    "tiny": "mlx-community/whisper-tiny-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "turbo": "mlx-community/whisper-turbo",
 }
 
 
@@ -124,6 +135,34 @@ def faster_whisper_available() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def mlx_whisper_available() -> bool:
+    """MLX only accelerates Apple Silicon; importing it elsewhere is useless."""
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return False
+    try:
+        import mlx_whisper  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def mlx_model_cached(model: str) -> bool:
+    """Whether the exact MLX/Hugging Face artifact is already complete."""
+    repo = _MLX_MODEL_NAMES.get(model)
+    if not repo:
+        return False
+    owner, name = repo.split("/", 1)
+    root = (Path.home() / ".cache" / "huggingface" / "hub" /
+            f"models--{owner}--{name}")
+    snapshots = root / "snapshots"
+    return snapshots.is_dir() and any(
+        path.is_file() and path.stat().st_size > 0
+        for pattern in ("*.safetensors", "weights.npz")
+        for path in snapshots.rglob(pattern)
+    )
+
+
 class _FasterWhisperEngine:
     name = "faster-whisper"
 
@@ -149,7 +188,10 @@ class _FasterWhisperEngine:
             temperature=spec.temperature,
             word_timestamps=True,
             condition_on_previous_text=spec.condition_on_previous_text,
-            initial_prompt=initial_prompt or None,
+            # A reference is vocabulary, not preceding speech. `hotwords`
+            # biases spelling without inviting the decoder to echo whole lines.
+            initial_prompt=None,
+            hotwords=initial_prompt or None,
             # The window planner already removed the silence; a second VAD here
             # would re-cut what we deliberately padded.
             vad_filter=False,
@@ -218,7 +260,9 @@ class _OpenAIWhisperEngine:
             beam_size=spec.beam_size if spec.temperature == 0 else None,
             word_timestamps=True,
             condition_on_previous_text=spec.condition_on_previous_text,
-            initial_prompt=initial_prompt or None,
+            # The reference runtime has no hotword channel. The exact lyric is
+            # applied later only after an acoustic match, never injected here.
+            initial_prompt=None,
             hallucination_silence_threshold=2.0,
             fp16=False,
             verbose=None,
@@ -259,6 +303,81 @@ class _OpenAIWhisperEngine:
             return None, 0.0
         best = max(probs, key=probs.get)
         return best, float(probs[best])
+
+
+class _MlxWhisperEngine:
+    """Apple-Silicon-native Whisper with the same result contract."""
+
+    name = "mlx-whisper"
+
+    def __init__(self, model: str, threads: int) -> None:
+        import mlx_whisper
+
+        self._mlx = mlx_whisper
+        self._model = _MLX_MODEL_NAMES.get(model, _MLX_MODEL_NAMES["large-v3"])
+
+    def _run(self, pcm: np.ndarray, *, language: str | None,
+             initial_prompt: str | None, spec: PassSpec,
+             word_timestamps: bool = True) -> dict:
+        return self._mlx.transcribe(
+            pcm.astype(np.float32, copy=False),
+            path_or_hf_repo=self._model,
+            language=language or None,
+            temperature=spec.temperature,
+            # mlx-whisper aún no implementa BeamSearchDecoder. Enviarle
+            # beam_size (incluso con temperature=0) lanza NotImplementedError;
+            # la capa superior lo interpretaba como una hipótesis vacía y dos
+            # pasadas fallidas terminaban votando por borrar toda la letra.
+            # Greedy a temperatura 0 es la ruta compatible y determinista.
+            beam_size=None,
+            word_timestamps=word_timestamps,
+            condition_on_previous_text=spec.condition_on_previous_text,
+            initial_prompt=initial_prompt or None,
+            compression_ratio_threshold=2.4,
+            logprob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            hallucination_silence_threshold=2.0,
+            verbose=False,
+        )
+
+    def transcribe(self, pcm: np.ndarray, spec: PassSpec, *,
+                   language: str | None, initial_prompt: str | None) -> Hypothesis:
+        result = self._run(
+            pcm, language=language, initial_prompt=None, spec=spec)
+        words: list[Word] = []
+        logprobs: list[float] = []
+        no_speech: list[float] = []
+        compression: list[float] = []
+        for segment in result.get("segments") or ():
+            logprobs.append(float(segment.get("avg_logprob", -1.0)))
+            no_speech.append(float(segment.get("no_speech_prob", 0.0)))
+            compression.append(float(segment.get("compression_ratio", 1.0)))
+            for word in segment.get("words") or ():
+                text = str(word.get("word", "")).strip()
+                if not text:
+                    continue
+                start = float(word.get("start", segment.get("start", 0.0)))
+                end = float(word.get("end", start))
+                words.append(Word(
+                    text=text, start=start, end=max(end, start + 1e-3),
+                    probability=float(word.get("probability", 1.0) or 0.0),
+                ))
+        return Hypothesis(
+            words=words, language=result.get("language"),
+            language_probability=1.0 if result.get("language") else 0.0,
+            avg_logprob=_mean(logprobs, -1.0),
+            no_speech_prob=_mean(no_speech, 0.0),
+            compression_ratio=_mean(compression, 1.0),
+        )
+
+    def detect_language(self, pcm: np.ndarray) -> tuple[str | None, float]:
+        result = self._run(
+            pcm, language=None, initial_prompt=None,
+            spec=PassSpec(0, temperature=0.0, beam_size=1),
+            word_timestamps=False,
+        )
+        language = result.get("language")
+        return language, 1.0 if language else 0.0
 
 
 def _mean(values: list[float], fallback: float) -> float:
@@ -308,6 +427,8 @@ def init_worker(model: str, engine: str, threads: int) -> None:
 
 
 def build_engine(model: str, engine: str, threads: int):
+    if engine == "mlx-whisper":
+        return _MlxWhisperEngine(model, threads)
     if engine == "faster-whisper":
         return _FasterWhisperEngine(model, threads)
     return _OpenAIWhisperEngine(model, threads)

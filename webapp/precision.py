@@ -45,7 +45,8 @@ DEFAULT_MAX_PASSES = 5
 # When a single language covers this much of the speech, it is treated as the
 # language of the whole track — forcing it is more stable than letting an
 # ad-lib window drift. Below it, each window keeps its own.
-DOMINANT_LANGUAGE_SHARE = 0.85
+DOMINANT_LANGUAGE_SHARE = 0.97
+MIN_LANGUAGE_PROBABILITY = 0.60
 
 
 @dataclass
@@ -55,6 +56,7 @@ class PrecisionConfig:
     min_passes: int = DEFAULT_MIN_PASSES
     max_passes: int = DEFAULT_MAX_PASSES
     stability_target: float = DEFAULT_STABILITY_TARGET
+    engine_preference: str = "auto"
     workers: int | None = None
     initial_prompt: str | None = None
     prompt_spans: list[dict] = field(default_factory=list)
@@ -77,6 +79,9 @@ class PrecisionResult:
     looped: int = 0
     stem: dict | None = None
     reference: dict | None = None
+    rescued_windows: int = 0
+    rescue_model: str | None = None
+    consensus_fallback: bool = False
 
     @property
     def text(self) -> str:
@@ -100,6 +105,9 @@ class PrecisionResult:
             "languages": self.languages,
             "stem": self.stem,
             "reference": self.reference,
+            "rescuedWindows": self.rescued_windows,
+            "rescueModel": self.rescue_model,
+            "consensusFallback": self.consensus_fallback,
         }
 
 
@@ -114,6 +122,10 @@ def plan_resources(engine: str, workers: int | None = None) -> tuple[int, int]:
     workers fighting over ten cores.  Total threads stay at the core count.
     """
     cores = os.cpu_count() or 4
+    # MLX comparte la GPU y memoria unificada. Varias copias del modelo pelean
+    # por el mismo dispositivo y suelen ser más lentas que una cola única.
+    if engine == "mlx-whisper":
+        return 1, cores
     if workers is None:
         # int8 weights are small enough for three copies of large-v3; the
         # float32 reference implementation only fits two comfortably.
@@ -123,7 +135,7 @@ def plan_resources(engine: str, workers: int | None = None) -> tuple[int, int]:
     return workers, max(1, cores // workers)
 
 
-def choose_engine(model: str, emit=None) -> str:
+def choose_engine(model: str, emit=None, preferred: str = "auto") -> str:
     """Prefer the fast runtime, but never fail the job over it.
 
     The CTranslate2 weights are a different artifact from the ``.pt`` files in
@@ -131,6 +143,19 @@ def choose_engine(model: str, emit=None) -> str:
     that is not possible (no network, no disk), the reference implementation is
     already on this machine and produces the same schema.
     """
+    preferred = preferred if preferred in {
+        "auto", "mlx-whisper", "faster-whisper", "openai-whisper"
+    } else "auto"
+    if preferred in {"auto", "mlx-whisper"} and te.mlx_whisper_available():
+        if emit:
+            emit("status", stage="loading_model",
+                 message=f"Preparando '{model}' con MLX en Apple Silicon…")
+        return "mlx-whisper"
+    if preferred == "mlx-whisper" and emit:
+        emit("status", stage="loading_model",
+             message="MLX no está disponible; usaré faster-whisper como respaldo.")
+    if preferred == "openai-whisper":
+        return "openai-whisper"
     if not te.faster_whisper_available():
         return "openai-whisper"
     if te.faster_model_cached(model):
@@ -289,8 +314,10 @@ def _detect_language(executor: ProcessPoolExecutor, name: str, total: int,
     detected: list[tuple[float, float, str]] = []
     for future in as_completed(futures):
         window = futures[future]
-        language = future.result().get("language")
-        if language:
+        answer = future.result()
+        language = answer.get("language")
+        probability = float(answer.get("probability") or 0.0)
+        if language and probability >= MIN_LANGUAGE_PROBABILITY:
             detected.append((window.start, window.end, language))
 
     if not detected:
@@ -318,7 +345,8 @@ def _detect_language(executor: ProcessPoolExecutor, name: str, total: int,
 def _run_round(executor: ProcessPoolExecutor, name: str, samples: int,
                regions: list[aa.SpeechRegion], specs: list[te.PassSpec],
                languages: LanguageMap, config: PrecisionConfig,
-               emit, done_base: int, total: int) -> tuple[dict[int, list[dict]], int]:
+               emit, done_base: int, total: int,
+               ) -> tuple[dict[int, list[dict]], int, dict[int, list[str]]]:
     """Submit every (pass, window) unit of this round and collect the words."""
     tasks = []
     for spec in specs:
@@ -337,17 +365,20 @@ def _run_round(executor: ProcessPoolExecutor, name: str, samples: int,
             })
 
     collected: dict[int, list[dict]] = {spec.index: [] for spec in specs}
+    failures: dict[int, list[str]] = {spec.index: [] for spec in specs}
     done = done_base
     futures = [executor.submit(te.transcribe_task, task) for task in tasks]
     for future in as_completed(futures):
         result = future.result()
         collected[result["pass_index"]].extend(result["words"])
+        if result.get("error"):
+            failures[result["pass_index"]].append(result["error"])
         done += 1
         emit("progress", stage="transcribing", progress=min(done / max(total, 1), 1.0))
 
     for words in collected.values():
         words.sort(key=lambda word: (word["start"], word["end"]))
-    return collected, done
+    return collected, done, failures
 
 
 def _prompt_at(spans: list[dict], start: float, end: float) -> str | None:
@@ -386,7 +417,7 @@ def run(audio: Path, config: PrecisionConfig, emit,
                   f"{speech / 60:.1f} min de canto sobre "
                   f"{pcm.size / aa.SAMPLE_RATE / 60:.1f} min de audio."))
 
-    engine = choose_engine(config.model, emit)
+    engine = choose_engine(config.model, emit, config.engine_preference)
     workers, threads = plan_resources(engine)
     max_passes = max(config.min_passes, config.max_passes)
     # Upper bound for the progress bar: the convergence loop usually stops
@@ -436,7 +467,8 @@ def run(audio: Path, config: PrecisionConfig, emit,
 
         emit("status", stage="transcribing",
              message=(f"Transcribiendo con {engine} · {workers} procesos × "
-                      f"{threads} hilos · hasta {max_passes} pasadas."))
+                      f"{threads} hilos · hasta {max_passes} pasadas."),
+             engine=engine)
 
         hypotheses: dict[int, list[dict]] = {}
         previous: list[cs.ConsensusWord] | None = None
@@ -453,9 +485,21 @@ def run(audio: Path, config: PrecisionConfig, emit,
             emit("status", stage="transcribing",
                  message=(f"Pasada {used + 1}–{used + batch} de hasta "
                           f"{max_passes} · {', '.join(s.label for s in specs)}"))
-            collected, done = _run_round(
+            collected, done, failures = _run_round(
                 executor, name, samples, regions, specs, languages, config,
                 emit, done, total_tasks)
+            for spec in specs:
+                # Una canción puede producir una ventana vacía; una pasada
+                # completa vacía *con errores* es un motor roto, no evidencia
+                # acústica de silencio. Nunca debe participar en la votación.
+                expected = len(aa.plan_windows(regions, phase=spec.phase))
+                if (not collected[spec.index]
+                        and len(failures[spec.index]) >= expected):
+                    first = failures[spec.index][0]
+                    raise RuntimeError(
+                        f"La pasada {spec.index + 1} falló en todas sus ventanas: "
+                        f"{first}"
+                    )
             hypotheses.update(collected)
             used += batch
 
@@ -463,9 +507,27 @@ def run(audio: Path, config: PrecisionConfig, emit,
                 [hypotheses[i] for i in sorted(hypotheses)],
                 region_bounds=[(r.start, r.end) for r in regions],
             )
+            primary = hypotheses.get(0) or max(
+                hypotheses.values(), key=len, default=[])
+            retention = len(words) / len(primary) if primary else 1.0
+            fallback = bool(primary and retention < 0.08)
+            if fallback:
+                # Última barrera: un desacuerdo temporal catastrófico nunca
+                # puede convertir miles de palabras oídas en una pista
+                # supuestamente instrumental. Conserva la pasada determinista
+                # y marca sus líneas como dudosas para revisión.
+                words = cs.single_pass_words(primary, passes=used)
+                result.consensus_fallback = True
+                emit("status", stage="transcribing",
+                     message=("El consenso retuvo menos del 8% de la pasada "
+                              "principal; conservaré esa lectura en vez de "
+                              "borrar toda la letra."))
             report = cs.summarize(words, stats, used, previous)
-            result.rounds.append(report.as_dict())
-            emit("consensus", **report.as_dict())
+            report_data = report.as_dict()
+            report_data.update({"fallback": fallback,
+                                "retention": round(retention, 4)})
+            result.rounds.append(report_data)
+            emit("consensus", **report_data)
             previous = words
 
             if report.stability is not None and report.stability >= config.stability_target:
@@ -487,4 +549,137 @@ def run(audio: Path, config: PrecisionConfig, emit,
              referenceScore=segment.get("referenceScore"),
              track=segment.get("track"),
              progress=1.0)
+    return result
+
+
+def _rescue_intervals(segments: list[dict], duration: float,
+                      limit: int = 24) -> list[tuple[float, float]]:
+    """Lowest-confidence lyrics plus short holes where a shout may be missing."""
+    suspects = sorted(
+        (segment for segment in segments
+         if float(segment.get("agreement", 1.0)) < 0.70
+         or float(segment.get("confidence", 1.0)) < 0.48),
+        key=lambda segment: (
+            float(segment.get("agreement", 1.0))
+            * float(segment.get("confidence", 1.0))),
+    )[:max(1, limit * 2 // 3)]
+    intervals = [
+        (max(0.0, float(item["start"]) - 1.2),
+         min(duration, float(item["end"]) + 1.2))
+        for item in suspects
+    ]
+    # Stem separators often erase a brief spoken count-in completely. Inspect
+    # short holes between neighboring lyrics as well; the acoustic gate below
+    # refuses weak candidates from the full mix.
+    gaps: list[tuple[float, float]] = []
+    for left, right in zip(segments, segments[1:]):
+        gap = float(right["start"]) - float(left["end"])
+        if 1.0 <= gap <= 8.0:
+            gaps.append((max(0.0, float(left["end"]) - 0.8),
+                         min(duration, float(right["start"]) + 0.8)))
+    # Reserve a third of the budget for fully erased count-ins and distribute
+    # it across the mix instead of spending it all on the first songs.
+    gap_budget = min(len(gaps), max(1, limit - len(intervals)))
+    if gap_budget == 1 and gaps:
+        intervals.append(gaps[len(gaps) // 2])
+    elif gap_budget > 1:
+        intervals.extend(gaps[round(i * (len(gaps) - 1) / (gap_budget - 1))]
+                         for i in range(gap_budget))
+    intervals.sort()
+    merged: list[list[float]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1] + 0.5 and end - merged[-1][0] <= 29:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, min(end, start + 29.0)])
+    return [(start, end) for start, end in merged[:limit] if end - start > 0.2]
+
+
+def rescue_from_original(original: Path, result: PrecisionResult,
+                         config: PrecisionConfig, emit,
+                         max_windows: int = 24) -> PrecisionResult:
+    """Recheck only dubious stem regions against the untouched mix.
+
+    A replacement needs materially stronger acoustic evidence. This lets a
+    count-in erased by the separator return without globally feeding music to
+    Whisper or paying for another full pass.
+    """
+    if not result.segments or not original.is_file():
+        return result
+    duration = max(float(segment["end"]) for segment in result.segments)
+    intervals = _rescue_intervals(result.segments, duration, max_windows)
+    if not intervals:
+        return result
+    rescue_model = "large-v3" if config.model == "turbo" else config.model
+    emit("status", stage="rescuing",
+         message=(f"Revisando {len(intervals)} zonas dudosas en el audio original "
+                  f"con {rescue_model}…"))
+    pcm = aa.decode_pcm(original)
+    engine_name = choose_engine(
+        rescue_model, emit, config.engine_preference)
+    _workers, threads = plan_resources(engine_name, workers=1)
+    engine = te.build_engine(rescue_model, engine_name, threads)
+    segments = list(result.segments)
+    accepted = 0
+    for index, (start, end) in enumerate(intervals):
+        first = max(0, int(start * aa.SAMPLE_RATE))
+        last = min(pcm.size, int(end * aa.SAMPLE_RATE))
+        language = next(
+            (segment.get("language") for segment in segments
+             if float(segment["start"]) < end and float(segment["end"]) > start),
+            result.language,
+        )
+        hypothesis = engine.transcribe(
+            np.ascontiguousarray(pcm[first:last]), te.pass_specs(1)[0],
+            language=language, initial_prompt=None)
+        emit("progress", stage="rescuing",
+             progress=(index + 1) / max(len(intervals), 1))
+        if (not hypothesis.words or hypothesis.no_speech_prob >= 0.55
+                or hypothesis.compression_ratio >= 2.4
+                or hypothesis.avg_logprob < -1.0):
+            continue
+        current = [segment for segment in segments
+                   if float(segment["start"]) < end
+                   and float(segment["end"]) > start]
+        current_score = (
+            sum(float(segment.get("confidence", 0.0))
+                * float(segment.get("agreement", 0.0)) for segment in current)
+            / max(len(current), 1)
+        )
+        mean_probability = sum(word.probability for word in hypothesis.words) / len(
+            hypothesis.words)
+        log_score = max(0.0, min(1.0, hypothesis.avg_logprob + 1.0))
+        rescue_score = 0.8 * mean_probability + 0.2 * log_score
+        old_words = sum(len(segment.get("words") or ()) for segment in current)
+        if (rescue_score < max(0.58, current_score + 0.10)
+                or len(hypothesis.words) > max(12, old_words * 2 + 8)):
+            continue
+        raw = [
+            {"text": word.text, "start": word.start + start,
+             "end": word.end + start, "probability": word.probability}
+            for word in hypothesis.words
+        ]
+        voted, _stats = cs.consensus_words([raw])
+        replacements = cs.to_segments(voted, language=language)
+        if not replacements:
+            continue
+        for segment in replacements:
+            segment["rescuedFromOriginal"] = True
+            segment["rescueModel"] = rescue_model
+            segment["rescueScore"] = round(rescue_score, 4)
+        segments = [segment for segment in segments
+                    if not (float(segment["start"]) < end
+                            and float(segment["end"]) > start)]
+        segments.extend(replacements)
+        segments.sort(key=lambda segment: (float(segment["start"]),
+                                            float(segment["end"])))
+        accepted += 1
+    del pcm, engine
+    for index, segment in enumerate(segments):
+        segment["id"] = index
+    result.segments = segments
+    result.rescued_windows = accepted
+    result.rescue_model = rescue_model
+    emit("rescue", reviewed=len(intervals), accepted=accepted,
+         model=rescue_model, engine=engine_name)
     return result

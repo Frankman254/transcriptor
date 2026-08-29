@@ -12,6 +12,7 @@ from consensus import (  # noqa: E402
     consensus_words,
     is_filler_line,
     summarize,
+    single_pass_words,
     text_stability,
     to_segments,
 )
@@ -88,6 +89,12 @@ class VotingTests(unittest.TestCase):
         words, stats = consensus_words([])
         self.assertEqual(words, [])
         self.assertEqual(stats.removed, 0)
+
+    def test_catastrophic_alignment_can_preserve_the_primary_pass(self):
+        primary = hypothesis(LINE)
+        recovered = single_pass_words(primary, passes=3)
+        self.assertEqual([word.text for word in recovered], LINE)
+        self.assertTrue(all(word.agreement == 1 / 3 for word in recovered))
 
     def test_clips_never_overlap_even_when_pass_timings_disagree(self):
         a = hypothesis(LINE, step=0.5)

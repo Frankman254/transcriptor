@@ -60,7 +60,9 @@ class JobRecoveryTests(unittest.TestCase):
 
     def test_resume_registers_the_same_job_without_starting_separation(self):
         job_id, _ = self.make_interrupted_job()
-        with mock.patch.object(server.threading, "Thread") as thread:
+        with mock.patch.object(server.threading, "Thread") as thread, \
+             mock.patch.object(server, "reusable_checkpoint",
+                               return_value=(Path("asr-input.wav"), "asr")):
             response = asyncio.run(server.resume_job(
                 job_id, model="small", language="", precision_level="fast",
                 translate_to="", romaji="1", tracklist_text="",
@@ -71,6 +73,47 @@ class JobRecoveryTests(unittest.TestCase):
         self.assertFalse(server.JOBS[job_id]["done"])
         self.assertIsInstance(server.JOBS[job_id]["cond"], threading.Condition)
         thread.return_value.start.assert_called_once()
+
+    def test_checkpoint_prefers_complete_asr_and_falls_back_to_vocals(self):
+        _, outdir = self.make_interrupted_job()
+        asr = outdir / "asr-input.wav"
+        vocals = outdir / "roformer" / "vocals.wav"
+        asr.write_bytes(b"0" * 100)
+        vocals.write_bytes(b"0" * 100)
+        assets = {"duration": 100.0, "asr": asr, "vocals": vocals}
+        with mock.patch.object(server, "ffprobe_duration",
+                               side_effect=lambda path: 80.0 if path == asr else 100.0):
+            checkpoint, kind = server.reusable_checkpoint(assets)
+        self.assertEqual(checkpoint, vocals)
+        self.assertEqual(kind, "vocals")
+
+    def test_invalid_checkpoint_is_rejected_before_archiving_outputs(self):
+        job_id, outdir = self.make_interrupted_job()
+        transcript = outdir / "Mix recuperable.json"
+        transcript.write_text("{}", encoding="utf-8")
+        with mock.patch.object(server, "reusable_checkpoint",
+                               return_value=(None, None)):
+            response = asyncio.run(server.resume_job(job_id))
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(transcript.is_file())
+        self.assertFalse((outdir / "iterations").exists())
+
+    def test_delete_removes_only_the_requested_inactive_job(self):
+        job_id, outdir = self.make_interrupted_job()
+        other_id, other = self.make_interrupted_job("b1c2d3e4f5a6")
+        response = server.delete_saved_job(job_id)
+        self.assertEqual(response, {"deleted": True, "job_id": job_id})
+        self.assertFalse(outdir.exists())
+        self.assertTrue(other.exists())
+
+    def test_delete_refuses_a_running_job(self):
+        job_id, outdir = self.make_interrupted_job()
+        server.JOBS[job_id] = {
+            "events": [], "cond": threading.Condition(), "done": False,
+        }
+        response = server.delete_saved_job(job_id)
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(outdir.exists())
 
     def test_missing_job_state_is_a_404(self):
         response = server.job_state("000000000000")
@@ -90,6 +133,9 @@ class JobRecoveryTests(unittest.TestCase):
 
     def test_iterating_archives_small_outputs_but_keeps_large_audio(self):
         job_id, outdir = self.make_interrupted_job()
+        server.update_manifest(job_id, status="completed",
+                               settings={"model": "turbo",
+                                         "asrEngine": "mlx-whisper"})
         transcript = outdir / "Mix recuperable.json"
         transcript.write_text("{}", encoding="utf-8")
         iteration = server._archive_outputs(outdir)
@@ -97,6 +143,9 @@ class JobRecoveryTests(unittest.TestCase):
         self.assertFalse(transcript.exists())
         self.assertTrue((outdir / "iterations" / "iteration-01" /
                          transcript.name).is_file())
+        frozen = json.loads((outdir / "iterations" / "iteration-01" /
+                             "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(frozen["settings"]["model"], "turbo")
         self.assertTrue((outdir / "asr-input.wav").is_file())
         self.assertTrue((outdir / "Mix recuperable.mp3").is_file())
 

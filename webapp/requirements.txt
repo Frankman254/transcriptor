@@ -1,13 +1,17 @@
 fastapi
+certifi
 uvicorn[standard]
 python-multipart
 mutagen
 # VAD, medición de la separación y troceado del audio para el modo ultra.
 numpy
 # Motor del modo ultra: mismo modelo, varias veces más rápido, que es lo que
-# hace viable correr cinco pasadas sobre una mezcla de tres horas. Si falta,
+# hace viable votar varias lecturas sobre una mezcla de tres horas. Si falta,
 # el modo ultra cae a openai-whisper sin perder ninguna función.
 faster-whisper
+# En Apple Silicon, MLX usa la GPU/memoria unificada. En otras plataformas el
+# marcador evita instalar una dependencia que no puede funcionar.
+mlx-whisper; sys_platform == "darwin" and platform_machine == "arm64"
 # Romaji sin conexión. Es un diccionario sin análisis morfológico, así que solo
 # se usa cuando no hay un modelo local que resuelva la lectura en contexto.
 pykakasi

@@ -14,7 +14,7 @@ con su tiempo `inicio → fin` conforme se genera (vía SSE).
 |------|----------|
 | 🎧 **Transcribir** | Texto con timestamps de un link de YouTube o un archivo. |
 | 🎤 **Letra de canción** | Aísla la voz con BS-RoFormer o Demucs y luego la transcribe. |
-| 🎯 **Letra ultra precisa** | Consenso de varias transcripciones + traducción. Ver abajo. |
+| 🎯 **Letra ultra precisa** | 1 o 3 lecturas, voto y rescate selectivo; traducción opcional. |
 | ⬇️ **Solo audio** | Descarga audio de YouTube en MP3, M4A, Opus, OGG, FLAC, ALAC, WAV u original. |
 
 ## Trabajos guardados e iteraciones
@@ -22,8 +22,22 @@ con su tiempo `inicio → fin` conforme se genera (vía SSE).
 La pantalla **Trabajos guardados** descubre automáticamente las carpetas de
 `webapp/output/`. Desde ahí puedes volver a abrir descargas y reproductores o
 reprocesar un modo ultra reutilizando `asr-input.wav`/`vocals.wav`. Cada nueva
-iteración archiva los JSON, subtítulos y textos anteriores bajo
+iteración archiva los JSON, subtítulos, textos y el manifiesto exacto bajo
 `iterations/iteration-NN`; el audio y los stems grandes no se duplican.
+El botón cambia a **Reanalizar usando la voz guardada**: valida con `ffprobe`
+que el checkpoint tenga la duración completa y nunca vuelve a ejecutar el
+separador. Si `asr-input.wav` está incompleto, prueba el stem vocal; si ambos
+fallan, conserva la salida anterior y se detiene.
+
+Cada fila muestra modelo, motor efectivo, tiempo de ejecución y espacio usado.
+**Eliminar** borra permanentemente únicamente el trabajo elegido —audio,
+stems, resultados e iteraciones—, pide confirmación y se bloquea si todavía
+está corriendo.
+
+El selector muestra parámetros, descarga aproximada, velocidad y calidad, no
+solo `small` o `medium`. Debajo aparece el artefacto exacto que se ejecutará,
+por ejemplo `mlx-community/whisper-turbo` o
+`Systran/faster-whisper-large-v3-turbo`, y si ya está descargado.
 
 ## Modo ultra: por qué deja de inventar letra
 
@@ -32,12 +46,12 @@ veces se come una al borde de una ventana. Las dos fallas son **inestables**:
 cambia la temperatura de decodificación o mueve el corte de ventana y se mueven
 con ellas. La letra real no se mueve.
 
-El modo ultra transcribe el mismo audio varias veces con ajustes deliberadamente
+El modo ultra transcribe el audio una o tres veces con ajustes deliberadamente
 distintos, alinea las hipótesis palabra por palabra y deja que cada posición
 vote. Una palabra que oyó una sola pasada pierde contra el silencio que oyeron
-las demás; una que oyeron todas sobrevive aunque la escriban distinto. Después
-vuelve a votar con una pasada más, y para cuando el texto deja de cambiar —
-ahí, el desacuerdo que queda está en el audio, no en el decodificador.
+las demás; una que oyeron todas sobrevive aunque la escriban distinto. Las
+zonas dudosas se pueden revisar desde la mezcla original; con Turbo ese rescate
+usa `large-v3` sin volver a procesar todo el mix.
 
 Antes de transcribir mide la separación (nivel, cobertura de canto y fuga
 instrumental) y usa detección de actividad vocal para transcribir **solo donde
@@ -55,10 +69,12 @@ En modo ultra puedes pegar o cargar un `.txt` con una línea por canción:
 
 Si la lista contiene secciones como `Original Tracklist:` y
 `Nightcore Tracklist:`, la app elige la que encaja con la duración real. De
-forma opcional consulta LRCLIB y guarda `track-guide.json`: cada ventana de
-Whisper recibe únicamente el título y vocabulario de la canción que suena en
-ese tramo. Una línea pública solo reemplaza la ortografía de Whisper cuando la
+forma opcional consulta LRCLIB y guarda `track-guide.json`: una ventana solo
+recibe versos cuando realmente se encontró letra; artista y título nunca son
+un prompt de Whisper. Una línea pública solo reemplaza la ortografía cuando la
 coincidencia ya es alta, porque un remix puede cortar o reordenar la letra.
+La app distingue una canción sin coincidencias de un fallo de red, reintenta
+estos últimos y prefiere referencias que incluyan timestamps sincronizados.
 
 El desglose completo — perfil de separación de doble pasada, ventanas
 desfasadas, alineación con Needleman–Wunsch, guardia de bucles de repetición y
@@ -66,12 +82,13 @@ tiempos esperados — está en [`webapp/README.md`](webapp/README.md#modo-ultra)
 
 ## Traducción e idiomas (local)
 
-Cuando la letra ya está confirmada, y no antes, el modo ultra la traduce con un
-modelo local vía [Ollama](https://ollama.com):
+La traducción empieza en **Sin traducción**. Si la eliges, o la añades después
+desde Trabajos guardados, usa un modelo local vía [Ollama](https://ollama.com)
+sin repetir la separación ni Whisper:
 
 - **Detección de idioma tramo por tramo.** Un DJ set de una hora no tiene un
   solo idioma, así que no se detecta uno para el archivo: se detecta en *cada*
-  ventana con voz. Si un idioma cubre más del 85% del canto se fuerza en todo
+  ventana con voz. Solo si un idioma cubre más del 97% del canto se fuerza
   el archivo (es más estable); si no, la mezcla se marca como multilingüe y
   cada tramo se transcribe en el idioma en que se cantó. Un cambio de idioma
   que dura una sola ventana se descarta como ruido.
@@ -166,8 +183,10 @@ descarga ni la separación vocal.
 Para el modo ultra:
 
 - `faster-whisper` — varias veces más rápido, que es lo que hace viable correr
-  cinco pasadas sobre una mezcla de tres horas. Sin él, el modo ultra sigue
+  varias lecturas sobre una mezcla de tres horas. Sin él, el modo ultra sigue
   funcionando con `openai-whisper`, solo que más lento.
+- `mlx-whisper` — motor preferido automáticamente en Apple Silicon; usa Metal
+  y se instala al arrancar por primera vez.
 - [Ollama](https://ollama.com) con un modelo multilingüe, para la traducción y
   el romaji: `ollama pull qwen3.5`. Sin él la transcripción funciona igual;
   solo se pierde la segunda capa.

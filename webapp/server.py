@@ -19,9 +19,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import whisper  # solo para conocer las URLs de los modelos
@@ -49,10 +51,54 @@ ROFORMER_MODEL_DIR = BASE_DIR / ".separator-models"
 ROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 OUTPUT_DIR.mkdir(exist_ok=True)
 LYRICS_CACHE_DIR = OUTPUT_DIR / ".lyrics-cache"
+TRANSLATION_CACHE_DIR = OUTPUT_DIR / ".translation-cache"
 MANIFEST_NAME = "job.json"
 
 # Modelos que ofrecemos en la interfaz (nombre -> etiqueta amigable).
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "turbo"]
+MODEL_DETAILS = {
+    "tiny": {
+        "label": "Tiny", "parameters": "39 M", "download": "≈75 MB",
+        "quality": "Básica", "speed": "Muy rápido",
+        "hint": "Para pruebas cortas. Pierde palabras con música o voces débiles.",
+    },
+    "base": {
+        "label": "Base", "parameters": "74 M", "download": "≈145 MB",
+        "quality": "Básica+", "speed": "Muy rápido",
+        "hint": "Algo mejor que Tiny; todavía limitado para canciones y mixes.",
+    },
+    "small": {
+        "label": "Small", "parameters": "244 M", "download": "≈460 MB",
+        "quality": "Media", "speed": "Rápido",
+        "hint": "Buen borrador rápido, pero puede confundir canto y efectos.",
+    },
+    "medium": {
+        "label": "Medium", "parameters": "769 M", "download": "≈1.5 GB",
+        "quality": "Alta", "speed": "Intermedio",
+        "hint": "Buen equilibrio general entre precisión, memoria y tiempo.",
+    },
+    "large-v3": {
+        "label": "Large v3", "parameters": "1,550 M", "download": "≈3 GB",
+        "quality": "Máxima", "speed": "Lento",
+        "hint": "La mayor precisión, especialmente en idiomas y audio difícil.",
+    },
+    "turbo": {
+        "label": "Large v3 Turbo", "parameters": "809 M", "download": "≈1.6 GB",
+        "quality": "Muy alta", "speed": "Rápido",
+        "hint": "Recomendado para mixes largos: deriva de Large v3 y transcribe mucho más rápido.",
+    },
+}
+MODEL_ARTIFACTS = {
+    name: {
+        "openai-whisper": f"OpenAI Whisper/{name}.pt",
+        "faster-whisper": "Systran/faster-whisper-" + (
+            "large-v3-turbo" if name == "turbo" else name),
+        "mlx-whisper": "mlx-community/whisper-" + (
+            "turbo" if name == "turbo" else f"{name}-mlx"),
+    }
+    for name in MODELS
+}
+ASR_ENGINES = {"auto", "mlx-whisper", "faster-whisper", "openai-whisper"}
 
 # Formatos de audio ofrecidos al descargar.
 #   value      -> lo que se le pasa a `yt-dlp --audio-format` ("best" = no recodificar)
@@ -144,27 +190,27 @@ LANGUAGES = [
 # Idiomas de destino para la capa 2 de Lyrixa (la traducción).
 TARGET_LANGUAGES = ["es", "en", "pt", "fr", "it", "de", "ja", "ko", "zh", "ru"]
 
-# Cuántas pasadas de consenso corre el modo ultra. El bucle para solo cuando
-# una pasada más ya no cambia el texto, así que el máximo es un techo, no una
-# promesa: casi siempre converge antes.
+# Presupuesto de reconocimiento del modo ultra. Los perfiles públicos están
+# acotados a una o tres pasadas; el rescate posterior trabaja solo en ventanas
+# dudosas, no vuelve a recorrer el mix completo.
 PRECISION_LEVELS = {
     "balanced": {
-        "label": "Equilibrado · hasta 5 pasadas",
-        "hint": ("Tres pasadas para votar y hasta dos más si el texto todavía "
-                 "cambia. Es el punto dulce para la mayoría de canciones."),
-        "min_passes": 3, "max_passes": 5, "stability": 0.99,
-    },
-    "fast": {
-        "label": "Rápido · 3 pasadas",
-        "hint": ("El mínimo para que haya mayoría. Ya elimina casi todo el "
-                 "texto inventado y es lo más rápido del modo ultra."),
+        "label": "Equilibrado · 3 pasadas",
+        "hint": ("Tres lecturas decorrelacionadas y una votación. Evita repetir "
+                 "todo el mix cinco veces cuando el stem no puede converger."),
         "min_passes": 3, "max_passes": 3, "stability": 0.0,
     },
+    "fast": {
+        "label": "Rápido · 1 pasada",
+        "hint": ("Una lectura fuerte, sin votación. Ideal para revisar un mix "
+                 "antes de invertir tiempo en las zonas difíciles."),
+        "min_passes": 1, "max_passes": 1, "stability": 0.0,
+    },
     "maximum": {
-        "label": "Máximo · hasta 8 pasadas",
-        "hint": ("Para letras difíciles: voces tapadas, coros o mezclas de "
-                 "tres horas. Exige más acuerdo antes de darse por satisfecho."),
-        "min_passes": 4, "max_passes": 8, "stability": 0.995,
+        "label": "Máximo útil · 3 pasadas + rescate",
+        "hint": ("Tres votos y revisión selectiva desde el audio original. No "
+                 "añade pasadas globales que ya demostraron no converger."),
+        "min_passes": 3, "max_passes": 3, "stability": 0.0,
     },
 }
 
@@ -256,6 +302,49 @@ def ffprobe_duration(path: Path) -> float:
         return 0.0
 
 
+def reusable_checkpoint(assets: dict) -> tuple[Path | None, str | None]:
+    """Pick a complete saved ASR/stem file without decoding the whole mix.
+
+    A WAV may exist while it is still being written or after an interrupted
+    separator left only its header.  ffprobe is effectively instant and lets
+    resume prefer the conditioned ASR file, fall back to the vocal stem, and
+    refuse a truncated checkpoint instead of silently producing worse text.
+    """
+    expected = float(assets.get("duration") or 0.0)
+    for kind in ("asr", "vocals"):
+        path = assets.get(kind)
+        if not path or not path.is_file() or path.stat().st_size <= 44:
+            continue
+        measured = ffprobe_duration(path)
+        if measured <= 0:
+            continue
+        tolerance = max(5.0, expected * 0.01)
+        if expected > 0 and abs(measured - expected) > tolerance:
+            continue
+        return path, kind
+    return None, None
+
+
+def stored_stem_report(outdir: Path) -> audio_analysis.StemReport | None:
+    """Restore separation QC so an iteration needn't decode two huge WAVs."""
+    manifest = read_manifest(outdir)
+    data = manifest.get("stem")
+    if not isinstance(data, dict):
+        data = (manifest.get("precision") or {}).get("stem")
+    if not isinstance(data, dict):
+        return None
+    return audio_analysis.StemReport(
+        vocal_dbfs=float(data.get("vocalDbfs", -120.0)),
+        peak_dbfs=float(data.get("peakDbfs", -120.0)),
+        speech_coverage=float(data.get("speechCoverage", 0.0)),
+        speech_seconds=float(data.get("speechSeconds", 0.0)),
+        bleed_ratio=float(data.get("bleedRatio", 0.0)),
+        clipping=float(data.get("clipping", 0.0)),
+        verdict=str(data.get("verdict") or "unknown"),
+        notes=list(data.get("notes") or []),
+    )
+
+
 def recovery_assets(job_id: str) -> dict | None:
     """Descubre checkpoints útiles de un job cuyo servidor se reinició.
 
@@ -327,6 +416,47 @@ def update_manifest(job_id: str, **changes) -> dict:
     return manifest
 
 
+def _start_job_timing(job: dict) -> None:
+    now = time.monotonic()
+    job["_timing"] = {
+        "started": now, "stageStarted": now,
+        "stage": "starting", "durations": {}, "finished": False,
+    }
+
+
+def _mark_job_stage(job: dict, stage: str | None) -> None:
+    timing = job.get("_timing")
+    if not timing or timing.get("finished") or not stage or stage == timing["stage"]:
+        return
+    now = time.monotonic()
+    elapsed = now - timing["stageStarted"]
+    durations = timing["durations"]
+    durations[timing["stage"]] = durations.get(timing["stage"], 0.0) + elapsed
+    timing["stage"] = stage
+    timing["stageStarted"] = now
+
+
+def _finish_job_timing(job: dict) -> dict:
+    timing = job.get("_timing") or {}
+    if not timing:
+        return {}
+    if not timing.get("finished"):
+        now = time.monotonic()
+        stage = timing.get("stage", "unknown")
+        durations = timing.setdefault("durations", {})
+        durations[stage] = durations.get(stage, 0.0) + (
+            now - timing.get("stageStarted", now))
+        timing["elapsed"] = now - timing.get("started", now)
+        timing["finished"] = True
+    return {
+        "elapsedSeconds": round(float(timing.get("elapsed", 0.0)), 2),
+        "stages": {
+            key: round(value, 2)
+            for key, value in timing.get("durations", {}).items()
+        },
+    }
+
+
 def load_track_guide(outdir: Path) -> dict | None:
     try:
         data = json.loads((outdir / "track-guide.json").read_text(encoding="utf-8"))
@@ -346,9 +476,22 @@ def prepare_track_guide(outdir: Path, text: str, duration: float,
         incoming = tracklist_path.read_text(encoding="utf-8")
         existing = load_track_guide(outdir)
         if existing:
-            emit("reference", stage="loaded", **existing.get("references", {}),
-                 section=existing.get("section"))
-            return existing
+            references = existing.get("references", {})
+            # Las versiones anteriores guardaban cualquier error HTTPS como
+            # una referencia vacía. Rehacer esas guías una vez permite que la
+            # corrección del almacén de certificados también repare trabajos
+            # ya existentes, sin pedir al usuario que borre la caché.
+            old_empty = (
+                fetch_lyrics
+                and int(references.get("found") or 0) == 0
+                and "failed" not in references
+            )
+            retry_failures = fetch_lyrics and int(references.get("failed") or 0) > 0
+            if not old_empty and not retry_failures:
+                emit("reference", stage="loaded", **references,
+                     section=existing.get("section"),
+                     tracks=existing.get("tracks", []))
+                return existing
     if not incoming:
         return None
 
@@ -383,6 +526,12 @@ def _archive_outputs(outdir: Path) -> int:
     manifest = read_manifest(outdir)
     iteration = int(manifest.get("iteration") or 0) + 1
     archive = outdir / "iterations" / f"iteration-{iteration:02d}"
+    # El manifiesto raíz cambia en cada iteración. Congelar una copia junto a
+    # sus resultados permite saber después qué modelo, motor y opciones los
+    # produjeron.
+    archive.mkdir(parents=True, exist_ok=True)
+    if (outdir / MANIFEST_NAME).is_file():
+        shutil.copy2(outdir / MANIFEST_NAME, archive / "run.json")
     candidates: list[Path] = []
     for path in outdir.iterdir():
         if not path.is_file() or path.name in {
@@ -397,7 +546,6 @@ def _archive_outputs(outdir: Path) -> int:
                 or path.suffix.lower() == ".txt"):
             candidates.append(path)
     if candidates:
-        archive.mkdir(parents=True, exist_ok=True)
         for path in candidates:
             shutil.move(str(path), str(archive / path.name))
     update_manifest(outdir.name, iteration=iteration)
@@ -471,6 +619,15 @@ def saved_job(job_id: str) -> dict | None:
         status = manifest.get("status") or "saved"
     guide = load_track_guide(outdir)
     modified = datetime.fromtimestamp(outdir.stat().st_mtime, timezone.utc).isoformat()
+    disk_bytes = 0
+    for path in outdir.rglob("*"):
+        try:
+            if path.is_file():
+                disk_bytes += path.stat().st_size
+        except OSError:
+            # Un trabajo activo puede mover un archivo mientras se refresca la
+            # biblioteca. El tamaño es informativo, no debe romper el listado.
+            continue
     return {
         "id": job_id,
         "title": manifest.get("title") or assets["title"],
@@ -486,6 +643,10 @@ def saved_job(job_id: str) -> dict | None:
         "reference": (guide or {}).get("references"),
         "section": (guide or {}).get("section"),
         "error": manifest.get("error"),
+        "settings": manifest.get("settings") or {},
+        "timing": manifest.get("timing") or {},
+        "precision": manifest.get("precision") or {},
+        "diskBytes": disk_bytes,
     }
 
 
@@ -684,6 +845,29 @@ def demucs_available() -> bool:
 def roformer_available() -> bool:
     """¿Está instalado el separador moderno en su entorno aislado?"""
     return ROFORMER_CLI.is_file() and os.access(ROFORMER_CLI, os.X_OK)
+
+
+@lru_cache(maxsize=1)
+def separator_acceleration() -> dict:
+    """Expose what audio-separator actually configured, not what we expect."""
+    if not roformer_available():
+        return {"mode": "unavailable", "accelerated": False}
+    try:
+        proc = subprocess.run(
+            [str(ROFORMER_CLI), "--env_info"], capture_output=True, text=True,
+            timeout=12,
+        )
+        report = f"{proc.stdout}\n{proc.stderr}"
+    except Exception as error:  # noqa: BLE001
+        return {"mode": "unknown", "accelerated": False,
+                "detail": str(error)}
+    if "CoreMLExecutionProvider" in report:
+        return {"mode": "CoreML", "accelerated": True}
+    if "CUDAExecutionProvider" in report:
+        return {"mode": "CUDA", "accelerated": True}
+    if "No hardware acceleration" in report:
+        return {"mode": "CPU", "accelerated": False}
+    return {"mode": "unknown", "accelerated": False}
 
 
 def separation_profile_available(profile_name: str) -> bool:
@@ -1036,7 +1220,9 @@ def write_whisper_outputs(result: dict, outdir: Path, stem: str) -> dict:
 
 def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
                        duration: float, emit, out_stem: str,
-                       level: str, stem_report, guide: dict | None = None
+                       level: str, stem_report, guide: dict | None = None,
+                       asr_engine: str = "auto",
+                       rescue_audio: Path | None = None,
                        ) -> tuple[dict, precision.PrecisionResult]:
     """Transcribe por consenso de varias pasadas y escribe las mismas salidas."""
     spec = PRECISION_LEVELS.get(level, PRECISION_LEVELS["balanced"])
@@ -1044,6 +1230,7 @@ def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
         model=model, language=language or None,
         min_passes=spec["min_passes"], max_passes=spec["max_passes"],
         stability_target=spec["stability"],
+        engine_preference=asr_engine,
         prompt_spans=track_guides.prompt_spans(guide),
         segment_refiner=(
             (lambda segments: track_guides.refine_segments(segments, guide))
@@ -1051,10 +1238,24 @@ def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
         ),
     )
     result = precision.run(audio, config, emit, stem_report)
+    if rescue_audio is not None:
+        try:
+            result = precision.rescue_from_original(
+                rescue_audio, result, config, emit)
+            if config.segment_refiner:
+                result.segments = config.segment_refiner(result.segments)
+        except Exception as error:  # noqa: BLE001
+            emit("rescue", reviewed=0, accepted=0, error=str(error))
     if not result.segments:
+        if result.windows:
+            raise RuntimeError(
+                "Whisper no devolvió palabras utilizables aunque el detector "
+                f"encontró {result.windows} ventanas con voz. Esto indica un "
+                "fallo del motor o de la votación, no una pista instrumental."
+            )
         raise RuntimeError(
-            "No se encontró voz cantada en el audio. Revisa la pista de voz "
-            "aislada: puede que la canción sea instrumental."
+            "No se detectaron regiones de voz en el audio guardado. Revisa la "
+            "pista aislada antes de volver a procesar."
         )
 
     if guide:
@@ -1153,6 +1354,7 @@ def translate_clip_lines(lines: list[str], languages: list[str | None], *,
         try:
             result = translation.translate(
                 [lines[i] for i in indices], source=code, target=target,
+                cache_dir=TRANSLATION_CACHE_DIR,
                 progress=lambda p: emit("progress", stage="translating",
                                         progress=p),
             )
@@ -1254,11 +1456,15 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
              audio_format: str = "best", audio_quality: str = "192K",
              separation_quality: str = "precise",
              precision_level: str = "balanced", translate_to: str = "",
-             romaji: bool = True, tracklist_text: str = "",
-             fetch_lyrics: bool = True) -> None:
+             romaji: bool = False, tracklist_text: str = "",
+             fetch_lyrics: bool = True, asr_engine: str = "auto",
+             rescue_original: bool = True) -> None:
     job = JOBS[job_id]
+    _start_job_timing(job)
 
     def emit(event: str, **data):
+        if event == "status":
+            _mark_job_stage(job, data.get("stage"))
         # Guardamos cada evento en un buffer (permite reconexión) y avisamos.
         with job["cond"]:
             job["events"].append({"event": event, "data": data})
@@ -1269,7 +1475,8 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
 
     outdir = OUTPUT_DIR / job_id
     outdir.mkdir(parents=True, exist_ok=True)
-    update_manifest(job_id, status="running", error=None)
+    update_manifest(job_id, status="running", error=None,
+                    startedAt=_now(), finishedAt=None)
     try:
         # Modo "solo audio": descargar en el formato pedido y terminar, sin Whisper.
         if mode == "audio_only":
@@ -1278,7 +1485,8 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
             emit("meta", title=title, duration=duration, device=device_name())
             files = {"audio": audio.name}
             update_manifest(job_id, status="completed", title=title,
-                            duration=duration, files=files)
+                            duration=duration, files=files,
+                            finishedAt=_now(), timing=_finish_job_timing(job))
             emit("done", title=title, files=files,
                  job_id=job_id)
             return
@@ -1339,6 +1547,9 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
                 "instrumental": str(instrumental.resolve()),
             }
             emit("stem", stage="final", pass_number=0, **stem_report.as_dict())
+            # Persistir el control de calidad permite validar/reutilizar estas
+            # pistas en una iteración sin volver a decodificar archivos enormes.
+            update_manifest(job_id, stem=stem_report.as_dict())
             # Los WAV se sirven desde la carpeta del separador elegido, sin
             # copiarlos ni recomprimirlos. En mixes largos pueden pesar >600 MB.
             stem_files = {
@@ -1362,7 +1573,8 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
             files, result = run_precision_mode(
                 audio, model, language, outdir, duration, emit,
                 out_stem=title, level=precision_level, stem_report=stem_report,
-                guide=guide)
+                guide=guide, asr_engine=asr_engine,
+                rescue_audio=original_audio if rescue_original else None)
             precision_report = result.as_report()
             detected_language = result.language or language
             emit("precision", **precision_report)
@@ -1410,10 +1622,13 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
             files["guide"] = "track-guide.json"
         files.update(stem_files)
         update_manifest(job_id, status="completed", title=title,
-                        duration=duration, files=files, error=None)
+                        duration=duration, files=files, error=None,
+                        finishedAt=_now(), timing=_finish_job_timing(job),
+                        precision=precision_report)
         emit("done", title=title, files=files, job_id=job_id)
     except Exception as e:  # noqa: BLE001
-        update_manifest(job_id, status="error", error=str(e))
+        update_manifest(job_id, status="error", error=str(e),
+                        finishedAt=_now(), timing=_finish_job_timing(job))
         emit("error", message=str(e))
     finally:
         if caffeinate is not None:
@@ -1426,18 +1641,23 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
 def resume_precision_pipeline(
     job_id: str, model: str, language: str, precision_level: str,
     translate_to: str, romaji: bool, tracklist_text: str = "",
-    fetch_lyrics: bool = True,
+    fetch_lyrics: bool = True, asr_engine: str = "auto",
+    rescue_original: bool = True,
 ) -> None:
     """Continúa un modo ultra desde los WAV que sobrevivieron al reinicio."""
     job = JOBS[job_id]
+    _start_job_timing(job)
 
     def emit(event: str, **data):
+        if event == "status":
+            _mark_job_stage(job, data.get("stage"))
         with job["cond"]:
             job["events"].append({"event": event, "data": data})
             job["cond"].notify_all()
 
     caffeinate = start_caffeinate()
-    update_manifest(job_id, status="running", error=None)
+    update_manifest(job_id, status="running", error=None,
+                    startedAt=_now(), finishedAt=None)
     try:
         assets = recovery_assets(job_id)
         if not assets or not assets["checkpoint"]:
@@ -1449,10 +1669,18 @@ def resume_precision_pipeline(
         original: Path | None = assets["original"]
         vocals: Path | None = assets["vocals"]
         instrumental: Path | None = assets["instrumental"]
-        audio: Path = assets["checkpoint"]
+        audio, checkpoint_kind = reusable_checkpoint(assets)
+        if audio is None:
+            raise RuntimeError(
+                "Los audios guardados están incompletos o dañados; no es seguro "
+                "retomar la transcripción desde ellos."
+            )
 
         emit("status", stage="recovering",
-             message="Retomando desde el audio ya separado; no repetiré BS-RoFormer…")
+             message=("Checkpoint validado: "
+                      + ("usaré asr-input.wav" if checkpoint_kind == "asr"
+                         else "usaré la voz aislada")
+                      + "; no repetiré BS-RoFormer…"))
         emit("meta", title=title, duration=duration,
              model=model, device=device_name())
 
@@ -1462,10 +1690,13 @@ def resume_precision_pipeline(
         stem_files: dict = {}
         stem_report = None
         if vocals:
-            if assets["asr"] is None:
+            if checkpoint_kind != "asr":
                 audio = audio_analysis.condition_for_asr(
                     vocals, outdir / "asr-input.wav")
-            stem_report = measure_stems(vocals, instrumental, duration)
+            stem_report = stored_stem_report(outdir)
+            if stem_report is None:
+                stem_report = measure_stems(vocals, instrumental, duration)
+                update_manifest(job_id, stem=stem_report.as_dict())
             emit("stem", stage="recovered", pass_number=0,
                  **stem_report.as_dict())
             job["stem_paths"] = {"vocals": str(vocals.resolve())}
@@ -1483,7 +1714,8 @@ def resume_precision_pipeline(
         files, result = run_precision_mode(
             audio, model, language, outdir, duration, emit,
             out_stem=title, level=precision_level, stem_report=stem_report,
-            guide=guide)
+            guide=guide, asr_engine=asr_engine,
+            rescue_audio=original if rescue_original else None)
         precision_report = result.as_report()
         detected_language = result.language or language
         emit("precision", **precision_report)
@@ -1526,14 +1758,89 @@ def resume_precision_pipeline(
             files["guide"] = "track-guide.json"
         files.update(stem_files)
         update_manifest(job_id, status="completed", title=title,
-                        duration=duration, files=files, error=None)
+                        duration=duration, files=files, error=None,
+                        finishedAt=_now(), timing=_finish_job_timing(job),
+                        precision=precision_report)
         emit("done", title=title, files=files, job_id=job_id)
     except Exception as error:  # noqa: BLE001
-        update_manifest(job_id, status="error", error=str(error))
+        update_manifest(job_id, status="error", error=str(error),
+                        finishedAt=_now(), timing=_finish_job_timing(job))
         emit("error", message=str(error))
     finally:
         if caffeinate is not None:
             caffeinate.terminate()
+        with job["cond"]:
+            job["done"] = True
+            job["cond"].notify_all()
+
+
+def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
+    """Add or replace language layers without rerunning separation or ASR."""
+    job = JOBS[job_id]
+    _start_job_timing(job)
+
+    def emit(event: str, **data):
+        if event == "status":
+            _mark_job_stage(job, data.get("stage"))
+        with job["cond"]:
+            job["events"].append({"event": event, "data": data})
+            job["cond"].notify_all()
+
+    update_manifest(job_id, status="running", error=None,
+                    startedAt=_now(), finishedAt=None)
+    try:
+        assets = recovery_assets(job_id)
+        if not assets:
+            raise RuntimeError("El trabajo guardado ya no existe.")
+        outdir: Path = assets["outdir"]
+        manifest = read_manifest(outdir)
+        files = _discover_result_files(job_id, outdir, assets)
+        json_name = files.get("json")
+        if not isinstance(json_name, str):
+            raise RuntimeError("Este trabajo no conserva el JSON cronometrado.")
+        lines, languages = read_clip_lines(outdir / json_name)
+        precision_report = manifest.get("precision") or {}
+        settings = dict(manifest.get("settings") or {})
+        source_language = (
+            precision_report.get("language") or settings.get("language") or ""
+        )
+        emit("status", stage="translating",
+             message="Añadiendo capas al resultado guardado; no repetiré Whisper…")
+        report = translate_clip_lines(
+            lines, languages, source=source_language, target=target,
+            romanize=romanize, emit=emit)
+        emit("translation", routeLabel=report["routeLabel"],
+             backend=report["backend"],
+             romajiBackend=report.get("romajiBackend"),
+             targetLanguage=report["targetLanguage"], error=report["error"])
+        lyrics = write_lyrics_sheet(
+            outdir, manifest.get("title") or assets["title"], lines,
+            report["romaji"], report["lines"])
+        if lyrics:
+            files["lyrics"] = lyrics
+        lyrixa = build_lyrixa_bundle(
+            outdir, json_name, manifest.get("title") or assets["title"],
+            float(manifest.get("duration") or assets["duration"] or 0),
+            audio_file_name=(assets["original"].name if assets.get("original")
+                             else None),
+            model=settings.get("model"), language=source_language,
+            translations=report["lines"],
+            translation_language=report["targetLanguage"],
+            romaji=report["romaji"], precision_report=precision_report or None,
+        )
+        if lyrixa:
+            files["lyrixa"] = lyrixa
+        settings.update({"translateTo": target, "romaji": romanize})
+        update_manifest(
+            job_id, status="completed", files=files, settings=settings,
+            error=None, finishedAt=_now(), timing=_finish_job_timing(job))
+        emit("done", title=manifest.get("title") or assets["title"],
+             files=files, job_id=job_id)
+    except Exception as error:  # noqa: BLE001
+        update_manifest(job_id, status="error", error=str(error),
+                        finishedAt=_now(), timing=_finish_job_timing(job))
+        emit("error", message=str(error))
+    finally:
         with job["cond"]:
             job["done"] = True
             job["cond"].notify_all()
@@ -1549,14 +1856,31 @@ def index():
 
 @app.get("/api/info")
 def info():
+    auto_engine = (
+        "mlx-whisper" if precision.te.mlx_whisper_available()
+        else "faster-whisper" if precision.te.faster_whisper_available()
+        else "openai-whisper"
+    )
     return JSONResponse({
         "device": device_name(),
-        # Los dos motores guardan pesos distintos: los .pt de openai-whisper y
-        # la conversión CTranslate2 que usa el modo ultra. Un modelo puede
-        # estar en caché para uno y no para el otro.
-        "models": [{"name": m, "cached": model_is_cached(m),
-                    "ultra_cached": precision.te.faster_model_cached(m)}
-                   for m in MODELS],
+        # Cada motor guarda un artefacto distinto: .pt original, conversión
+        # CTranslate2 o pesos MLX. La UI muestra exactamente cuál utilizará.
+        "models": [
+            {
+                "name": name, **MODEL_DETAILS[name],
+                "artifacts": MODEL_ARTIFACTS[name],
+                "cached": model_is_cached(name),
+                "faster_cached": precision.te.faster_model_cached(name),
+                "mlx_cached": precision.te.mlx_model_cached(name),
+                "ultra_cached": (
+                    precision.te.mlx_model_cached(name)
+                    if auto_engine == "mlx-whisper"
+                    else precision.te.faster_model_cached(name)
+                ),
+            }
+            for name in MODELS
+        ],
+        "auto_engine": auto_engine,
         "languages": [{"value": v, "label": l} for v, l in LANGUAGES],
         "audio_formats": AUDIO_FORMATS,
         "audio_qualities": AUDIO_QUALITIES,
@@ -1576,7 +1900,23 @@ def info():
         ],
         "demucs": demucs_available(),
         "roformer": roformer_available(),
+        "separator_acceleration": separator_acceleration(),
         "faster_whisper": precision.te.faster_whisper_available(),
+        "mlx_whisper": precision.te.mlx_whisper_available(),
+        "asr_engines": [
+            {"value": "auto", "label": "Auto · mejor para esta Mac",
+             "available": True,
+             "hint": f"Elegirá {auto_engine} automáticamente."},
+            {"value": "mlx-whisper", "label": "MLX · Apple Silicon",
+             "available": precision.te.mlx_whisper_available(),
+             "hint": "GPU Metal y memoria unificada. Es la ruta más rápida en esta Mac."},
+            {"value": "faster-whisper", "label": "faster-whisper · CPU",
+             "available": precision.te.faster_whisper_available(),
+             "hint": "CTranslate2 cuantizado: eficiente en CPU y con sus propios pesos."},
+            {"value": "openai-whisper", "label": "Whisper original · CPU",
+             "available": True,
+             "hint": "Implementación original de OpenAI; compatible, pero normalmente más lenta."},
+        ],
         "translator": {
             "available": translation.translation_available(),
             "model": translation.pick_model(),
@@ -1607,6 +1947,25 @@ def saved_job_detail(job_id: str):
         tracklist.read_text(encoding="utf-8") if tracklist.is_file() else ""
     )
     return record
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_saved_job(job_id: str):
+    """Permanently delete one exact, inactive output directory."""
+    if not _JOB_ID_RE.fullmatch(job_id):
+        return JSONResponse({"error": "ID de trabajo inválido."}, status_code=400)
+    current = JOBS.get(job_id)
+    if current is not None and not current["done"]:
+        return JSONResponse(
+            {"error": "El trabajo sigue en curso. Espera a que termine o detén el servidor."},
+            status_code=409,
+        )
+    outdir = (OUTPUT_DIR / job_id).resolve()
+    if not outdir.is_dir() or OUTPUT_DIR.resolve() not in outdir.parents:
+        return JSONResponse({"error": "El trabajo ya no existe."}, status_code=404)
+    shutil.rmtree(outdir)
+    JOBS.pop(job_id, None)
+    return {"deleted": True, "job_id": job_id}
 
 
 @app.post("/api/tracklists/preview")
@@ -1651,8 +2010,10 @@ async def create_job(
     audio_quality: str = Form("192K"),
     separation_quality: str = Form("precise"),
     precision_level: str = Form("balanced"),
+    asr_engine: str = Form("auto"),
+    rescue_original: str = Form("1"),
     translate_to: str = Form(""),
-    romaji: str = Form("1"),
+    romaji: str = Form("0"),
     tracklist_text: str = Form(""),
     fetch_lyrics: str = Form("1"),
     file: UploadFile | None = File(None),
@@ -1666,6 +2027,8 @@ async def create_job(
         separation_quality = "precise"
     if precision_level not in PRECISION_LEVELS:
         precision_level = "balanced"
+    if asr_engine not in ASR_ENGINES:
+        asr_engine = "auto"
     translate_to = translation.normalize_code(translate_to) or ""
     if translate_to and translate_to not in TARGET_LANGUAGES:
         return JSONResponse(
@@ -1697,7 +2060,9 @@ async def create_job(
         settings={
             "model": model, "language": language,
             "separationQuality": separation_quality,
-            "precisionLevel": precision_level, "translateTo": translate_to,
+            "precisionLevel": precision_level, "asrEngine": asr_engine,
+            "rescueOriginal": rescue_original not in {"", "0", "false"},
+            "translateTo": translate_to,
             "romaji": romaji not in {"", "0", "false"},
             "hasTracklist": bool(tracklist_text.strip()),
             "fetchLyrics": fetch_lyrics not in {"", "0", "false"},
@@ -1714,7 +2079,8 @@ async def create_job(
         args=(job_id, source_type, url, upload_path, model, language, mode,
               audio_format, audio_quality, separation_quality, precision_level,
               translate_to, romaji not in {"", "0", "false"},
-              tracklist_text, fetch_lyrics not in {"", "0", "false"}),
+              tracklist_text, fetch_lyrics not in {"", "0", "false"},
+              asr_engine, rescue_original not in {"", "0", "false"}),
         daemon=True,
     ).start()
     return {"job_id": job_id}
@@ -1752,8 +2118,10 @@ async def resume_job(
     model: str = Form("small"),
     language: str = Form(""),
     precision_level: str = Form("balanced"),
+    asr_engine: str = Form("auto"),
+    rescue_original: str = Form("1"),
     translate_to: str = Form(""),
-    romaji: str = Form("1"),
+    romaji: str = Form("0"),
     tracklist_text: str = Form(""),
     fetch_lyrics: str = Form("1"),
 ):
@@ -1767,10 +2135,19 @@ async def resume_job(
             {"error": "No quedó un audio intermedio recuperable."},
             status_code=404,
         )
+    checkpoint, _checkpoint_kind = reusable_checkpoint(assets)
+    if checkpoint is None:
+        return JSONResponse(
+            {"error": "La voz aislada o asr-input.wav quedó incompleto. "
+                      "No archivé la salida anterior ni reinicié BS-RoFormer."},
+            status_code=409,
+        )
     if model not in MODELS:
         model = "small"
     if precision_level not in PRECISION_LEVELS:
         precision_level = "balanced"
+    if asr_engine not in ASR_ENGINES:
+        asr_engine = "auto"
     translate_to = translation.normalize_code(translate_to) or ""
     if translate_to and translate_to not in TARGET_LANGUAGES:
         return JSONResponse(
@@ -1794,7 +2171,9 @@ async def resume_job(
         job_id, status="queued", iteration=iteration,
         settings={
             "model": model, "language": language,
-            "precisionLevel": precision_level, "translateTo": translate_to,
+            "precisionLevel": precision_level, "asrEngine": asr_engine,
+            "rescueOriginal": rescue_original not in {"", "0", "false"},
+            "translateTo": translate_to,
             "romaji": romaji not in {"", "0", "false"},
             "hasTracklist": (assets["outdir"] / "tracklist.txt").is_file(),
             "fetchLyrics": fetch_lyrics not in {"", "0", "false"},
@@ -1808,10 +2187,50 @@ async def resume_job(
         target=resume_precision_pipeline,
         args=(job_id, model, language, precision_level, translate_to,
               romaji not in {"", "0", "false"}, tracklist_text,
-              fetch_lyrics not in {"", "0", "false"}),
+              fetch_lyrics not in {"", "0", "false"}, asr_engine,
+              rescue_original not in {"", "0", "false"}),
         daemon=True,
     ).start()
     return {"job_id": job_id, "resumed": True}
+
+
+@app.post("/api/jobs/{job_id}/translate")
+async def translate_saved_job(
+    job_id: str,
+    translate_to: str = Form(""),
+    romaji: str = Form("0"),
+):
+    current = JOBS.get(job_id)
+    if current is not None and not current["done"]:
+        return JSONResponse({"error": "El trabajo ya está corriendo."},
+                            status_code=409)
+    record = saved_job(job_id)
+    if not record or not record.get("files", {}).get("json"):
+        return JSONResponse(
+            {"error": "No hay un JSON cronometrado que reutilizar."},
+            status_code=404,
+        )
+    target = translation.normalize_code(translate_to) or ""
+    wants_romaji = romaji not in {"", "0", "false"}
+    if target and target not in TARGET_LANGUAGES:
+        return JSONResponse(
+            {"error": f"Idioma de traducción desconocido: {target}"},
+            status_code=400,
+        )
+    if not target and not wants_romaji:
+        return JSONResponse(
+            {"error": "Elige un idioma o activa romaji."}, status_code=400)
+    if target and not translation.translation_available():
+        return JSONResponse(
+            {"error": "No hay traductor local disponible."}, status_code=409)
+    JOBS[job_id] = {
+        "events": [], "cond": threading.Condition(), "done": False,
+    }
+    threading.Thread(
+        target=translate_saved_pipeline,
+        args=(job_id, target, wants_romaji), daemon=True,
+    ).start()
+    return {"job_id": job_id, "translating": True}
 
 
 @app.get("/api/jobs/{job_id}/events")

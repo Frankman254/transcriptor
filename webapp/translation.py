@@ -18,10 +18,12 @@ Two rules shape the whole module:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 OLLAMA_HOST = "http://127.0.0.1:11434"
 OLLAMA_TIMEOUT = 600
@@ -35,7 +37,7 @@ MODEL_PREFERENCE = (
 
 # Lines per request.  Small enough that a model reliably keeps the numbering,
 # large enough that a 600-line lyric is ~40 requests instead of 600.
-BATCH_SIZE = 14
+BATCH_SIZE = 32
 
 LANGUAGE_NAMES = {
     "es": "Spanish", "en": "English", "pt": "Portuguese", "fr": "French",
@@ -113,17 +115,36 @@ def available_models() -> list[str]:
 
 
 def pick_model(models: list[str] | None = None) -> str | None:
-    """Choose the best locally-installed model for language work."""
+    """Choose a capable, responsive local model for short lyric lines.
+
+    A 27B model is not automatically the best choice here: most of the wall
+    clock is autoregressive decoding, while the task is tightly constrained.
+    Prefer a modern 4B–14B multilingual model and keep a larger one as fallback.
+    """
     models = available_models() if models is None else models
     if not models:
         return None
-    lowered = [(name, name.lower()) for name in models]
-    for prefix in MODEL_PREFERENCE:
-        for name, lower in lowered:
-            # Match "qwen3.5:9b" and "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M".
-            if prefix in lower:
-                return name
-    return models[0]
+
+    def score(name: str) -> tuple[int, int, float, str]:
+        lower = name.lower()
+        family = next(
+            (index for index, prefix in enumerate(MODEL_PREFERENCE)
+             if prefix in lower),
+            len(MODEL_PREFERENCE),
+        )
+        match = re.search(r"(?:^|[-_:])([0-9]+(?:\.[0-9]+)?)b(?:[-_:]|$)", lower)
+        size = float(match.group(1)) if match else 0.0
+        if 4 <= size <= 14:
+            size_class = 0
+        elif 0 < size < 20:
+            size_class = 1
+        elif size == 0:
+            size_class = 2
+        else:
+            size_class = 3
+        return size_class, family, abs(size - 8.0) if size else 99.0, lower
+
+    return min(models, key=score)
 
 
 def translation_available() -> bool:
@@ -141,6 +162,7 @@ def _chat(model: str, system: str, user: str, *, temperature: float = 0.0) -> st
         # Reasoning models otherwise spend the whole budget thinking about a
         # four-word lyric line.
         "think": False,
+        "keep_alive": "30m",
         "options": {"temperature": temperature, "num_ctx": 8192},
     })
     content = (data.get("message") or {}).get("content", "")
@@ -249,6 +271,55 @@ def _run_lines(model: str, system: str, lines: list[str],
     return results
 
 
+def _translation_cache_path(cache_dir: Path, *, model: str, source: str,
+                            target: str, text: str) -> Path:
+    key = hashlib.sha256(
+        f"v1\0{model}\0{source}\0{target}\0{text}".encode("utf-8")
+    ).hexdigest()
+    return cache_dir / f"{key}.json"
+
+
+def _run_cached_lines(model: str, system: str, lines: list[str], *,
+                      source: str, target: str, cache_dir: Path | None,
+                      progress=None) -> list[str]:
+    """Translate each distinct lyric once and reuse persistent chorus hits."""
+    if not cache_dir:
+        return _run_lines(model, system, lines, progress)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    unique = list(dict.fromkeys(lines))
+    values: dict[str, str] = {}
+    missing: list[str] = []
+    for line in unique:
+        path = _translation_cache_path(
+            cache_dir, model=model, source=source, target=target, text=line)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8")).get("text")
+        except Exception:  # noqa: BLE001
+            value = None
+        if isinstance(value, str) and value:
+            values[line] = value
+        else:
+            missing.append(line)
+
+    def missing_progress(done: int, total: int) -> None:
+        if progress:
+            progress(len(unique) - len(missing) + done, len(unique))
+
+    produced = (_run_lines(model, system, missing, missing_progress)
+                if missing else [])
+    for original, translated in zip(missing, produced):
+        values[original] = translated
+        path = _translation_cache_path(
+            cache_dir, model=model, source=source, target=target, text=original)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"text": translated}, ensure_ascii=False),
+                             encoding="utf-8")
+        temporary.replace(path)
+    if progress and not missing:
+        progress(len(unique), len(unique))
+    return [values.get(line, line) for line in lines]
+
+
 # --------------------------------------------------------------------------- #
 # Rutas
 # --------------------------------------------------------------------------- #
@@ -335,7 +406,8 @@ def romanize_offline(lines: list[str]) -> list[str] | None:
 
 
 def translate(lines: list[str], *, source: str | None, target: str,
-              model: str | None = None, progress=None) -> dict:
+              model: str | None = None, progress=None,
+              cache_dir: Path | None = None) -> dict:
     """Translate lyric lines, pivoting through English when the script demands.
 
     Returns the translated lines plus the metadata the UI and the Lyrixa
@@ -365,7 +437,9 @@ def translate(lines: list[str], *, source: str | None, target: str,
             if progress:
                 progress((_i + done / max(total, 1)) / hops)
 
-        current = _run_lines(model, system, current, hop_progress)
+        current = _run_cached_lines(
+            model, system, current, source=hop_source, target=hop_target,
+            cache_dir=cache_dir, progress=hop_progress)
 
     return {
         "lines": current,

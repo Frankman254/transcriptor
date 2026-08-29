@@ -474,6 +474,32 @@ def consensus_words(passes: list[list[dict]], *,
     return _repair_monotonicity(resolved), stats
 
 
+def single_pass_words(words: list[dict], passes: int = 1
+                      ) -> list[ConsensusWord]:
+    """Preserve the deterministic pass when multi-pass alignment collapses.
+
+    The low agreement is intentional: the UI will flag these lines for human
+    review, but usable uncertain text is safer than falsely claiming the
+    entire vocal mix is instrumental.
+    """
+    total = max(1, passes)
+    recovered = [
+        ConsensusWord(
+            text=str(word.get("text") or "").strip(),
+            start=float(word.get("start") or 0.0),
+            end=max(float(word.get("end") or 0.0),
+                    float(word.get("start") or 0.0) + 0.02),
+            votes=1, passes=total,
+            confidence=float(word.get("probability", 1.0)),
+            agreement=1.0 / total,
+            variants=[normalize_token(str(word.get("text") or ""))],
+        )
+        for word in words if str(word.get("text") or "").strip()
+    ]
+    recovered, _removed = collapse_repetition_loops(recovered)
+    return _repair_monotonicity(recovered)
+
+
 def summarize(words: list[ConsensusWord], stats: ConsensusStats,
               passes: int, previous: list[ConsensusWord] | None) -> RoundReport:
     if not words:

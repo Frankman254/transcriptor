@@ -1,6 +1,10 @@
 import sys
+import json
+import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +52,47 @@ class TrackGuideTests(unittest.TestCase):
         ]
         self.assertEqual(guides.best_candidate(track, candidates)["id"], 2)
 
+    def test_duplicate_candidates_prefer_the_synced_copy(self):
+        candidates = [
+            {"id": 1, "trackName": "Dear Jessie", "artistName": "Rollergirl",
+             "plainLyrics": "lyrics", "syncedLyrics": None},
+            {"id": 2, "trackName": "Dear Jessie", "artistName": "Rollergirl",
+             "plainLyrics": "lyrics", "syncedLyrics": "[00:01.00] lyrics"},
+            {"id": 3, "trackName": "Another", "artistName": "Artist"},
+        ]
+        unique = guides.dedupe_candidates(candidates)
+        self.assertEqual([candidate["id"] for candidate in unique], [2, 3])
+
+    def test_network_error_is_reported_instead_of_no_match(self):
+        track = guides.Track(0, "Artist", "Song", "Artist - Song")
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                guides, "_search_candidates", side_effect=OSError("offline")
+            ):
+                self.assertIsNone(
+                    guides.fetch_reference(track, Path(directory)))
+        self.assertEqual(track.lookup["status"], "error")
+        self.assertIn("offline", track.lookup["error"])
+
+    def test_legacy_url_error_cache_is_retried_immediately(self):
+        track = guides.Track(0, "Artist", "Song", "Artist - Song")
+        candidate = {
+            "id": 9, "trackName": "Song", "artistName": "Artist",
+            "plainLyrics": "real lyrics", "syncedLyrics": "[00:01.00] real lyrics",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            guides._cache_path(cache_dir, track).write_text(json.dumps({
+                "reference": None, "fetchedAt": time.time(),
+                "error": "URLError", "candidateCount": 0,
+            }), encoding="utf-8")
+            with mock.patch.object(
+                guides, "_search_candidates", return_value=[candidate]
+            ) as search:
+                reference = guides.fetch_reference(track, cache_dir)
+        search.assert_called_once()
+        self.assertEqual(reference["id"], 9)
+
     def test_prompt_is_limited_to_the_song_at_that_time(self):
         guide = {"tracks": [
             {"start": 0, "end": 60, "artist": "A", "title": "One",
@@ -58,6 +103,13 @@ class TrackGuideTests(unittest.TestCase):
         spans = guides.prompt_spans(guide)
         self.assertIn("alpha beta", guides.prompt_at(spans, 10, 20))
         self.assertIn("gamma delta", guides.prompt_at(spans, 70, 80))
+
+    def test_track_metadata_without_real_lyrics_never_becomes_a_prompt(self):
+        guide = {"tracks": [{
+            "start": 0, "end": 60, "artist": "T-Pau",
+            "title": "China in Your Hand", "reference": None,
+        }]}
+        self.assertEqual(guides.prompt_spans(guide), [])
 
     def test_only_a_strong_match_gets_exact_reference_spelling(self):
         guide = {"tracks": [{
