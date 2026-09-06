@@ -115,6 +115,12 @@ desequilibrados. Por eso no sale una línea con veinte palabras y la siguiente
 con dos. Si los timestamps por palabra faltan o están incompletos, se conserva
 el segmento original completo como fallback.
 
+La salida general de la transcripción también corta las frases después de coma,
+punto, interrogación o exclamación. Las comas muy cortas se mantienen juntas
+para no producir una línea por palabra; cuando Whisper omite la puntuación se
+aplican límites de 8 segundos, 14 palabras y 84 caracteres. El mismo reparto se
+usa en pantalla, texto, JSON, SRT y VTT.
+
 Con traducción activa, el proyecto llega a Lyrixa con **dos capas de texto**:
 
 | Capa | `role` | Contenido |

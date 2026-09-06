@@ -181,6 +181,32 @@ class SegmentTests(unittest.TestCase):
         self.assertEqual(segments[0]["text"], "uno dos")
         self.assertEqual(segments[1]["text"], "tres cuatro")
 
+    def test_a_comma_splits_two_substantial_clauses(self):
+        tokens = ["In", "your", "heart,", "trying", "to", "find", "you."]
+        pass_words = hypothesis(tokens, step=0.5)
+        words, _ = consensus_words([pass_words] * 3)
+        segments = to_segments(words)
+        self.assertEqual([segment["text"] for segment in segments], [
+            "In your heart,", "trying to find you.",
+        ])
+
+    def test_repeated_single_words_with_commas_do_not_become_one_word_lines(self):
+        pass_words = hypothesis(["Then,", "then,", "then,", "then,"])
+        words, _ = consensus_words([pass_words] * 3)
+        segments = to_segments(words)
+        self.assertEqual([segment["text"] for segment in segments], [
+            "Then, then, then,", "then,",
+        ])
+
+    def test_unpunctuated_text_still_has_readable_hard_limits(self):
+        pass_words = hypothesis([f"word{index}" for index in range(35)])
+        words, _ = consensus_words([pass_words] * 3)
+        segments = to_segments(words)
+        self.assertGreater(len(segments), 1)
+        self.assertTrue(all(len(segment["words"]) <= 14 for segment in segments))
+        self.assertTrue(all(segment["end"] - segment["start"] <= 8.0
+                            for segment in segments))
+
 
 class ConvergenceTests(unittest.TestCase):
     def test_identical_results_are_perfectly_stable(self):

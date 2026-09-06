@@ -50,7 +50,14 @@ SIMILAR_RATIO = 0.74
 
 # Re-segmentation: where the consensus word stream becomes lines again.
 SEGMENT_PAUSE = 0.8
-SEGMENT_MAX_SECONDS = 14.0
+# Subtitle-sized lines are easier to read and edit than Whisper's original
+# paragraphs.  Punctuation is preferred, while these hard ceilings still work
+# when the model returns an unpunctuated stream.
+SEGMENT_MAX_SECONDS = 8.0
+SEGMENT_MAX_WORDS = 14
+SEGMENT_MAX_CHARS = 84
+SEGMENT_MIN_CLAUSE_WORDS = 3
+SEGMENT_MIN_CLAUSE_SECONDS = 1.25
 
 # Repetition-loop guard.  Whisper sometimes latches onto a phrase and repeats it
 # until the window ends; when every pass latches the same way, voting cannot see
@@ -63,6 +70,7 @@ REPEAT_KEEP = 4
 
 _PUNCT = re.compile(r"[^\w\s']", re.UNICODE)
 _STRONG_END = re.compile(r"[.!?…。！？][\"'’”)\]}]*$")
+_CLAUSE_END = re.compile(r"[,;:，、；：][\"'’”)\]}]*$")
 
 # Whisper learned these from subtitled video and emits them over music and
 # silence.  Voting cannot remove them — every pass hallucinates the same
@@ -564,13 +572,29 @@ def to_segments(words: list[ConsensusWord], *,
 
     groups: list[list[ConsensusWord]] = [[words[0]]]
     for previous, word in zip(words, words[1:]):
+        current = groups[-1]
         gap = word.start - previous.end
-        span = word.end - groups[-1][0].start
-        if (gap >= SEGMENT_PAUSE or span >= SEGMENT_MAX_SECONDS
-                or _STRONG_END.search(previous.text)):
+        span_with_word = word.end - current[0].start
+        clause_span = previous.end - current[0].start
+        punctuation_break = bool(_STRONG_END.search(previous.text))
+        # A comma ends a line once there is a useful clause on its left.  The
+        # small minimum avoids turning lyrics such as "Then, then, then," into
+        # one subtitle per word.
+        punctuation_break = punctuation_break or (
+            bool(_CLAUSE_END.search(previous.text))
+            and (len(current) >= SEGMENT_MIN_CLAUSE_WORDS
+                 or clause_span >= SEGMENT_MIN_CLAUSE_SECONDS)
+        )
+        too_long = (
+            span_with_word > SEGMENT_MAX_SECONDS
+            or len(current) >= SEGMENT_MAX_WORDS
+            or len(join_words([w.text for w in current] + [word.text]))
+            > SEGMENT_MAX_CHARS
+        )
+        if gap >= SEGMENT_PAUSE or punctuation_break or too_long:
             groups.append([word])
         else:
-            groups[-1].append(word)
+            current.append(word)
 
     segments: list[dict] = []
     for group in groups:
