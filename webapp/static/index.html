@@ -67,6 +67,7 @@
                  font: inherit; font-size: 13px; cursor: pointer; }
   .downloads a:hover, .downloads button:hover { border-color: var(--accent); }
   .downloads button.primary { background: var(--accent); border-color: var(--accent); }
+  .downloads a.open-in-lyrixa { border-color: var(--accent); font-weight: 600; }
   .downloads a b { display: block; font-size: 11px; color: var(--muted);
                    font-weight: 400; max-width: 220px; overflow: hidden;
                    text-overflow: ellipsis; white-space: nowrap; }
@@ -656,7 +657,7 @@ async function openSavedJob(jobId) {
   showActualEngine(job.precision?.engine || job.settings?.asrEngine);
   setStage(`${JOB_STATUS[job.status] || job.status} · iteración ${job.iteration + 1}`, false);
   setProgress(job.status === "completed" ? 1 : 0);
-  showFiles(job.id, job.files || {});
+  showFiles(job.id, job.files || {}, job.links);
   if (job.reference) showReference({...job.reference, section: job.section, stage: "loaded"});
   live.scrollIntoView({behavior: "smooth", block: "start"});
 }
@@ -1090,10 +1091,24 @@ function finishJob() {
   document.getElementById("recovery-actions").classList.add("hidden");
 }
 
-function showFiles(jobId, files) {
+function showFiles(jobId, files, links) {
   const dl = document.getElementById("downloads");
   dl.classList.remove("hidden");
   dl.innerHTML = "<span class='badge'>Archivos:</span>";
+  // El backend arma este enlace porque es el único que sabe dónde vive
+  // Lyrixa y bajo qué dirección se ve a sí mismo. Componerlo aquí obligaría
+  // a la interfaz a conocer puertos, que es justo lo que `config` evita.
+  if (links && links.openInLyrixa && files.lyrixa) {
+    const open = document.createElement("a");
+    open.href = links.openInLyrixa;
+    open.target = "_blank";
+    open.rel = "noopener";
+    open.className = "open-in-lyrixa";
+    open.textContent = "🎛️ Abrir en Lyrixa";
+    open.title = "Abre Lyrixa con este trabajo cargado: proyecto y audio, sin "
+               + "descargar nada. Necesita Lyrixa corriendo.";
+    dl.appendChild(open);
+  }
   for (const [kind, icon, label] of FILE_KINDS) {
     const descriptor = files[kind];
     if (!descriptor) continue;
@@ -1271,7 +1286,7 @@ function listen(jobId) {
     setStage("✅ Listo — " + (d.title || ""), false);
     setProgress(1);
     document.getElementById("clock").textContent = "";
-    showFiles(d.job_id, d.files);
+    showFiles(d.job_id, d.files, d.links);
     loadSavedJobs();
     es.close();
     finishJob();

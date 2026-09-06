@@ -549,12 +549,18 @@ def translation_clips(clips: list[dict[str, Any]], translations: list[str],
 def build_layers(*, source_language: str | None, translation_language: str | None,
                  translation_name: str | None = None,
                  romanized: bool = False) -> list[dict[str, Any]]:
-    """The three Lyrixa channels, with the roles this bridge assigns them.
+    """Las tres capas de Lyrixa, con el papel que les asigna este puente.
 
-    `role` and `language` are additive fields: Lyrixa passes unknown layer keys
-    straight through to the lyrics bundle, so LiveWallpaper can tell the
-    translation channel apart from a backing-vocal one without guessing from
-    the layer name.
+    Siempre son tres, incluso cuando el trabajo no tiene traducción.  Un canal
+    vacío al que arrastrar clips es más útil que un canal ausente, y sobre todo
+    mantiene el `order` estable (0/1/2) en todas las exportaciones: una escena
+    de LiveWallpaper montada sobre la capa 2 no se desplaza porque el siguiente
+    trabajo no llevara traducción.
+
+    `role` y `language` son campos aditivos: Lyrixa deja pasar las claves de
+    capa que no conoce hasta el bundle de letras, así que LiveWallpaper puede
+    distinguir el canal de traducción de uno de coros sin adivinarlo por el
+    nombre.
     """
     layers: list[dict[str, Any]] = [{
         "id": MAIN_LAYER_ID,
@@ -576,12 +582,16 @@ def build_layers(*, source_language: str | None, translation_language: str | Non
         "styleDefaults": {"fontSize": "2.8rem", "fontWeight": "800",
                           "textColor": "#ffffff"},
     }]
-    if translation_language:
-        layers.append({
+    layers.append({
             "id": TRANSLATION_LAYER_ID,
-            "name": translation_name or f"Traducción · {translation_language}",
+            "name": (translation_name
+                     or (f"Traducción · {translation_language}"
+                         if translation_language else "Voz secundaria")),
             "layerType": "backing",
-            "role": "translation",
+            # Sin traducción el canal existe igual, pero no miente sobre lo
+            # que lleva: `translation` activa en Lyrixa la detección de líneas
+            # derivadas desfasadas, y un canal vacío no deriva de nada.
+            "role": "translation" if translation_language else "backing",
             "language": translation_language,
             "color": "#8a5cf6",
             "visible": True,
@@ -597,7 +607,7 @@ def build_layers(*, source_language: str | None, translation_language: str | Non
             "styleDefaults": {"fontSize": "1.6rem", "fontWeight": "600",
                               "textColor": "rgba(206, 220, 255, 0.9)",
                               "opacity": 0.9},
-        })
+    })
     layers.append({
         "id": FX_LAYER_ID,
         "name": "FX / Adlibs",
@@ -607,6 +617,11 @@ def build_layers(*, source_language: str | None, translation_language: str | Non
         "visible": True,
         "locked": False,
         "order": len(layers),
+        # `suppressClipText` es lo que convierte esta capa en un canal de
+        # comandos: su texto no se dibuja, así que un clip que diga
+        # "glitch 0.8" es una orden para el renderer y no una línea de letra.
+        # Ver docs/contrato-capa-fx.md.  Transcriptor no escribe estos clips:
+        # los autora la persona en Lyrixa y los lee LiveWallpaper.
         "renderSettings": {"positionPreset": "top-right", "textAlign": "right",
                            "zIndex": 30, "suppressClipText": True},
     })

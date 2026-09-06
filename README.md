@@ -127,8 +127,26 @@ El permiso de CORS es solo para `localhost`. El servidor escucha en loopback,
 de modo que el único riesgo real sería una página remota usando el navegador
 del usuario como puente — y ese es justo el caso que se niega.
 
-El contrato completo, con lo que falta implementar del lado de Lyrixa, está en
-[`docs/contrato-lyrixa.md`](docs/contrato-lyrixa.md).
+### Abrir en Lyrixa
+
+Cuando un trabajo tiene proyecto, la fila de descargas muestra un botón
+**🎛️ Abrir en Lyrixa** que abre el editor con el trabajo ya cargado: proyecto
+y audio, sin descargar ni importar nada a mano.
+
+El enlace lo arma el backend, porque es el único que sabe bajo qué dirección se
+ve a sí mismo:
+
+```
+http://127.0.0.1:5173/?job=<id>&transcriptor=http%3A%2F%2F127.0.0.1%3A8000
+```
+
+Los dos parámetros son los que lee `bridgeConfig.ts` en Lyrixa. El segundo es
+lo que hace que funcione con el puerto real: sin él Lyrixa cae en su valor por
+defecto y el enlace solo sirve mientras corra su proxy de desarrollo.
+
+El contrato completo está en
+[`docs/contrato-lyrixa.md`](docs/contrato-lyrixa.md), y el lenguaje de la capa
+de efectos en [`docs/contrato-capa-fx.md`](docs/contrato-capa-fx.md).
 
 ## Puente hacia Lyrixa
 
@@ -238,6 +256,17 @@ formato lo permite, también incluyen título, artista, álbum, fecha y portada
 incrustada. WAV no admite portada.
 
 Más detalles en [`webapp/README.md`](webapp/README.md).
+
+## Arquitectura
+
+El backend está separado en capas cuyas dependencias apuntan siempre hacia
+abajo: el servidor conoce el motor, y el motor no conoce el servidor. Eso es lo
+que permite llamar al pipeline desde una CLI, una prueba o una futura shell de
+escritorio sin levantar FastAPI.
+
+El mapa de módulos y las reglas están en
+[`docs/arquitectura.md`](docs/arquitectura.md). No son una convención escrita:
+`tests/test_module_boundaries.py` las comprueba.
 
 ## Tests
 

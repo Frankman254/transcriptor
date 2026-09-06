@@ -76,8 +76,20 @@ Lo que emite hoy el puente:
 | `id` | `layerType` | `role` | `language` | Ancla |
 |------|-------------|--------|------------|-------|
 | `layer-main` | `lyrics` | `primary` | idioma cantado | `bottom` |
-| `layer-backing` | `backing` | `translation` | idioma destino | `top` |
+| `layer-backing` | `backing` | `translation` / `backing` | idioma destino | `top` |
 | `layer-fx` | `fx` | `fx` | — | `top-right` |
+
+**Las tres salen siempre**, aunque el trabajo no lleve traducción: en ese caso
+la capa 1 va vacía y marcada `backing` en vez de `translation` (un canal vacío
+no es traducción de nada). El motivo es que el `order` tiene que significar lo
+mismo en todas las exportaciones — si la capa 1 desapareciera, la de FX pasaría
+de `order: 2` a `order: 1` y una escena de LiveWallpaper montada sobre «la capa
+2» se rompería según el trabajo que se abriese.
+
+La capa 2 no lleva letra: lleva comandos para el renderer, y su
+`suppressClipText: true` es lo que la convierte en un canal de órdenes. El
+Transcriptor la emite vacía y no la interpreta nunca.
+Ver [contrato-capa-fx.md](contrato-capa-fx.md).
 
 Dos capas de texto **nunca** comparten ancla: los dos renderizadores colocan
 los clips de una capa de forma absoluta según su preset, así que dos capas con
@@ -123,13 +135,27 @@ llegó, así que `localhost` y `127.0.0.1` no se convierten en dos orígenes.
     "events": "/api/jobs/068e7448eb91/events",
     "lyrixa": "/api/jobs/068e7448eb91/lyrixa",
     "audio": "/api/jobs/068e7448eb91/audio",
-    "openInLyrixa": "http://127.0.0.1:5173/?job=068e7448eb91&api=http%3A%2F%2F127.0.0.1%3A8000"
+    "openInLyrixa": "http://127.0.0.1:5173/?job=068e7448eb91&transcriptor=http%3A%2F%2F127.0.0.1%3A8000"
   }
 }
 ```
 
 Una clave ausente significa que ese recurso no existe todavía en el trabajo, no
 que la ruta esté rota.
+
+Las rutas son **relativas** a propósito: Lyrixa habla con el backend a través
+de un prefijo del mismo origen (`/transcriptor`, que su proxy de Vite
+redirige), y una URL absoluta le obligaría a pedir permiso CORS sin
+necesidad. La única absoluta es `openInLyrixa`, que por definición apunta a
+otra aplicación.
+
+Los nombres de los dos parámetros no son elección del Transcriptor: son los
+que lee `resolveBridgeEndpoints` y `readRequestedJobId` en
+`src/core/bridge/bridgeConfig.ts`. Viven en `config.LYRIXA_JOB_PARAM` y
+`config.LYRIXA_API_PARAM`, y hay una prueba que los fija. Mandar
+`transcriptor=` es lo que hace que el enlace funcione con el puerto real: sin
+ese parámetro Lyrixa cae en su valor por defecto y el enlace solo sirve
+mientras corra el proxy de desarrollo.
 
 ### `POST /api/translate`
 
@@ -189,22 +215,44 @@ Ningún puerto ni URL está escrito dentro de un handler. Todo vive en
 `bridgeSchemaVersion`, `layerRoles`, `translationLanguages` y `romanizable`,
 para que un cliente no tenga que adivinar nada.
 
-## 7. Lo que falta implementar en Lyrixa
+## 7. Estado del otro lado
 
-Nada de esto bloquea al Transcriptor; son las piezas del otro lado.
+Lyrixa ya tiene su mitad del puente (sin commitear a fecha de hoy):
 
-1. **Leer `?job=…&api=…` al arrancar.** Con esos dos parámetros, Lyrixa puede
-   pedir `GET {api}/api/jobs/{job}/lyrixa` e importar el proyecto, y
-   `GET {api}/api/jobs/{job}/audio` como pista maestra —sin que nadie busque
-   archivos a mano. Es todo lo que hace falta para que el botón
-   *Open in Lyrixa* funcione; el enlace ya se publica.
-2. **Un botón «Traducir esta línea»** que llame a `POST {api}/api/translate` en
-   vez de hablar con Ollama por su cuenta.
-3. **Conservar `sourceId` al re-cortar un clip.** Si el usuario parte una línea
+| Pieza | Dónde | Qué hace |
+|---|---|---|
+| `TranscriptorClient` | `src/core/bridge/transcriptorClient.ts` | `isAvailable()`, `getJob`, `getProject`, `getAudio`, `postJson`. |
+| `resolveBridgeEndpoints` | `src/core/bridge/bridgeConfig.ts` | Resuelve la dirección: URL → localStorage → env → proxy. |
+| `useTranscriptorJob` | `src/features/bridge/useTranscriptorJob.ts` | El flujo completo de *Open in Lyrixa*. |
+| `reconcileClipLineIdentity` | `src/core/timeline/lineIdentity.ts` | Repara el `sourceId` roto de los proyectos v2. |
+| `translationService` | `src/core/translation/translationService.ts` | Pide traducciones aquí en vez de a Ollama. |
+
+Los campos que lee de `GET /api/jobs/{id}` son `id`, `title`, `duration`,
+`status`, `files.audio`, `files.lyrixa` y `settings.language`. Están todos, y
+hay una prueba de contrato que los cubre.
+
+Un detalle: `settings.language` es el nombre que usa Whisper (`"Japanese"`),
+no un código ISO. Sirve para mostrarlo, no para comparar con `layer.language`,
+que sí es un código.
+
+Lo que sigue pendiente allí:
+
+1. **Conservar `sourceId` al re-cortar un clip.** Si el usuario parte una línea
    en dos, las dos mitades necesitan identidades nuevas y su traducción tiene
    que seguirlas; heredar el mismo `sourceId` reintroduce el duplicado.
-4. **Mostrar `role`/`language` en el inspector de capas**, para que se vea que
+2. **Mostrar `role`/`language` en el inspector de capas**, para que se vea que
    una capa es traducción y no coros.
+3. **La capa FX**: autoría y validación del lenguaje de comandos
+   ([contrato-capa-fx.md](contrato-capa-fx.md)).
+
+### El puente es de un solo sentido
+
+Lyrixa nunca escribe en `output/`. Todo lo que hace son `GET` más un
+`POST /api/translate` que no toca el disco. Por eso el `.lyrixa.json` que
+genera el Transcriptor es una **semilla, no un documento compartido**: volver a
+traducir un trabajo lo regenera entero, y cualquier ajuste hecho en Lyrixa vive
+en el proyecto de Lyrixa, no aquí. No hay pérdida de datos, pero tampoco hay
+ida y vuelta.
 
 ## 8. Lo que no se debe romper
 

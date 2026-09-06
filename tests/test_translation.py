@@ -176,9 +176,7 @@ class MultilingualGroupingTests(unittest.TestCase):
     """A one-hour DJ set is not one language; routing is per line."""
 
     def setUp(self):
-        sys.path.insert(0, str(ROOT / "webapp"))
-        from server import group_by_language
-        self.group = group_by_language
+        self.group = T.group_by_language
 
     def test_lines_are_grouped_by_the_language_they_were_sung_in(self):
         groups = self.group(["ja", "ja", "en", "ja", "en"], None)

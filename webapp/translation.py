@@ -25,6 +25,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import paths
+
 OLLAMA_HOST = "http://127.0.0.1:11434"
 OLLAMA_TIMEOUT = 600
 
@@ -472,3 +474,121 @@ def translate(lines: list[str], *, source: str | None, target: str,
         "backend": "ollama",
         "model": model,
     }
+
+
+# Dónde queda la traducción de cada línea para no volver a pedirla.  Lo
+# declara este módulo y no cada llamante: el pipeline y el endpoint tienen que
+# compartir caché, y que lo decidiera cada uno por su cuenta es justo cómo se
+# acaba traduciendo dos veces lo mismo.
+DEFAULT_CACHE_DIR = paths.TRANSLATION_CACHE_DIR
+
+
+# --------------------------------------------------------------------------- #
+# Mezclas multilingües
+#
+# Un mix de una hora no tiene *un* idioma: tiene tramos en japonés, en inglés
+# y en español, y cada tramo necesita su propia ruta y su propio romaji.  Esto
+# vive aquí y no en `server` porque es política de traducción — qué agrupar,
+# qué romanizar, qué ruta tomar — y el pipeline no es su único cliente.
+# --------------------------------------------------------------------------- #
+def group_by_language(languages: list[str | None],
+                      fallback: str | None) -> dict[str | None, list[int]]:
+    """Line indices grouped by the language they were sung in."""
+    groups: dict[str | None, list[int]] = {}
+    for index, code in enumerate(languages):
+        key = normalize_code(code) or normalize_code(fallback)
+        groups.setdefault(key, []).append(index)
+    return groups
+
+
+def translate_clip_lines(lines: list[str], languages: list[str | None], *,
+                         source: str | None, target: str,
+                         romanize: bool, emit) -> dict:
+    """Romaniza y traduce las líneas ya confirmadas por el consenso.
+
+    Se hace al final a propósito: traducir un texto que todavía puede cambiar
+    es trabajo tirado, y una traducción hecha sobre texto inventado se ve
+    perfectamente correcta, que es la peor forma de estar mal.
+
+    Las líneas se agrupan por el idioma en el que se cantaron, no por el del
+    archivo: en un mix de una hora conviven canciones en japonés y en inglés, y
+    cada grupo necesita su propia ruta (ja→en→es, en→es) y su propio romaji.
+    """
+    out: dict = {"lines": None, "romaji": None, "backend": None,
+                 "routeLabel": None, "targetLanguage": None, "error": None,
+                 "routes": []}
+    if not lines:
+        return out
+
+    groups = group_by_language(languages, source)
+    errors: list[str] = []
+    routes: list[str] = []
+
+    # --- Romaji: sólo los tramos que realmente se cantaron en japonés ---
+    romaji_lines: list[str] | None = None
+    if romanize:
+        for code, indices in groups.items():
+            if code not in ROMANIZABLE:
+                continue
+            emit("status", stage="romanizing",
+                 message=(f"Pasando a romaji {len(indices)} líneas en "
+                          f"{language_label(code)}…"))
+            try:
+                converted, backend = romanize(
+                    [lines[i] for i in indices],
+                    progress=lambda done, total: emit(
+                        "progress", stage="romanizing",
+                        progress=done / max(total, 1)),
+                )
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"No se pudo romanizar: {error}")
+                continue
+            if romaji_lines is None:
+                romaji_lines = list(lines)
+            for position, index in enumerate(indices):
+                romaji_lines[index] = converted[position]
+            out["romajiBackend"] = backend
+        out["romaji"] = romaji_lines
+
+    if not target:
+        out["error"] = "; ".join(errors) or None
+        return out
+
+    # --- Traducción: una ruta por idioma de origen ---
+    translated = list(lines)
+    did_translate = False
+    for code, indices in groups.items():
+        route = plan_route(code, target)
+        if not route:
+            continue                    # ya está en el idioma de destino
+        label = route_label(route)
+        emit("status", stage="translating",
+             message=(f"Traduciendo {len(indices)} líneas ya confirmadas · "
+                      f"{label}…"))
+        try:
+            result = translate(
+                [lines[i] for i in indices], source=code, target=target,
+                cache_dir=DEFAULT_CACHE_DIR,
+                progress=lambda p: emit("progress", stage="translating",
+                                        progress=p),
+            )
+        except TranslationUnavailable as error:
+            out["error"] = str(error)
+            return out
+        except Exception as error:  # noqa: BLE001
+            errors.append(f"{label}: {error}")
+            continue
+        for position, index in enumerate(indices):
+            translated[index] = result["lines"][position]
+        routes.append(f"{label} ({len(indices)})")
+        out["backend"] = result["backend"]
+        did_translate = True
+
+    out["error"] = "; ".join(errors) or None
+    if not did_translate:
+        return out
+    out["lines"] = translated
+    out["routes"] = routes
+    out["routeLabel"] = " · ".join(routes)
+    out["targetLanguage"] = normalize_code(target)
+    return out

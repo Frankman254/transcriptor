@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "webapp"))
 
 import config  # noqa: E402
+import jobstore  # noqa: E402
+import media  # noqa: E402
 import paths  # noqa: E402
 import server  # noqa: E402
 import translation  # noqa: E402
@@ -36,7 +38,7 @@ class ApiTestCase(unittest.TestCase):
         self._patches = [
             mock.patch.object(paths, "OUTPUT_DIR", self.tmp),
             # ffprobe is a subprocess and the fixtures are not real audio.
-            mock.patch.object(server, "ffprobe_duration", lambda path: 180.0),
+            mock.patch.object(media, "ffprobe_duration", lambda path: 180.0),
         ]
         for patch in self._patches:
             patch.start()

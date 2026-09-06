@@ -17,13 +17,9 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import uuid
-from collections import deque
-from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 
 import whisper  # solo para conocer las URLs de los modelos
@@ -35,12 +31,13 @@ from fastapi.responses import (
     JSONResponse,
     StreamingResponse,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 import audio_analysis
-import catalogs
 import config
+import jobstore
 import lyrixa_bridge
+import media
 import paths
 import precision
 import track_guides
@@ -80,6 +77,12 @@ app.add_middleware(
 
 # job_id -> dict(queue, done, ...)
 JOBS: dict[str, dict] = {}
+
+
+def job_is_running(job_id: str) -> bool:
+    """Si hay un pipeline vivo para este trabajo en *este* proceso."""
+    live = JOBS.get(job_id)
+    return bool(live and not live["done"])
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _SOURCE_SUFFIXES = {
     ".mp3", ".m4a", ".opus", ".ogg", ".flac", ".wav",
@@ -152,131 +155,6 @@ def ensure_model(model: str, emit) -> None:
         )
 
 
-def ffprobe_duration(path: Path) -> float:
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        return float(out)
-    except Exception:
-        return 0.0
-
-
-def reusable_checkpoint(assets: dict) -> tuple[Path | None, str | None]:
-    """Pick a complete saved ASR/stem file without decoding the whole mix.
-
-    A WAV may exist while it is still being written or after an interrupted
-    separator left only its header.  ffprobe is effectively instant and lets
-    resume prefer the conditioned ASR file, fall back to the vocal stem, and
-    refuse a truncated checkpoint instead of silently producing worse text.
-    """
-    expected = float(assets.get("duration") or 0.0)
-    for kind in ("asr", "vocals"):
-        path = assets.get(kind)
-        if not path or not path.is_file() or path.stat().st_size <= 44:
-            continue
-        measured = ffprobe_duration(path)
-        if measured <= 0:
-            continue
-        tolerance = max(5.0, expected * 0.01)
-        if expected > 0 and abs(measured - expected) > tolerance:
-            continue
-        return path, kind
-    return None, None
-
-
-def stored_stem_report(outdir: Path) -> audio_analysis.StemReport | None:
-    """Restore separation QC so an iteration needn't decode two huge WAVs."""
-    manifest = read_manifest(outdir)
-    data = manifest.get("stem")
-    if not isinstance(data, dict):
-        data = (manifest.get("precision") or {}).get("stem")
-    if not isinstance(data, dict):
-        return None
-    return audio_analysis.StemReport(
-        vocal_dbfs=float(data.get("vocalDbfs", -120.0)),
-        peak_dbfs=float(data.get("peakDbfs", -120.0)),
-        speech_coverage=float(data.get("speechCoverage", 0.0)),
-        speech_seconds=float(data.get("speechSeconds", 0.0)),
-        bleed_ratio=float(data.get("bleedRatio", 0.0)),
-        clipping=float(data.get("clipping", 0.0)),
-        verdict=str(data.get("verdict") or "unknown"),
-        notes=list(data.get("notes") or []),
-    )
-
-
-def recovery_assets(job_id: str) -> dict | None:
-    """Descubre checkpoints útiles de un job cuyo servidor se reinició.
-
-    Los procesos no sobreviven al cierre de la sesión de macOS, pero los WAV sí.
-    Si existe ``asr-input.wav`` podemos retomar justo antes del consenso, que es
-    la etapa cara posterior a la separación.
-    """
-    if not _JOB_ID_RE.fullmatch(job_id):
-        return None
-    outdir = (paths.OUTPUT_DIR / job_id).resolve()
-    if not outdir.is_dir() or paths.OUTPUT_DIR.resolve() not in outdir.parents:
-        return None
-
-    asr = outdir / "asr-input.wav"
-    vocals = next((p for p in outdir.rglob("vocals.wav") if p.is_file()), None)
-    instrumental = next(
-        (p for name in ("instrumental.wav", "no_vocals.wav")
-         for p in outdir.rglob(name) if p.is_file()),
-        None,
-    )
-    sources = [
-        p for p in outdir.iterdir()
-        if p.is_file() and p.suffix.lower() in _SOURCE_SUFFIXES
-        and p.name != "asr-input.wav"
-    ]
-    original = max(sources, key=lambda p: p.stat().st_mtime) if sources else None
-    checkpoint = asr if asr.is_file() else vocals
-    title = original.stem if original else "transcripcion recuperada"
-    duration_source = original or checkpoint
-    duration = ffprobe_duration(duration_source) if duration_source else 0.0
-    return {
-        "outdir": outdir,
-        "asr": asr if asr.is_file() else None,
-        "vocals": vocals,
-        "instrumental": instrumental,
-        "original": original,
-        "checkpoint": checkpoint,
-        "title": title,
-        "duration": duration,
-    }
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def read_manifest(outdir: Path) -> dict:
-    try:
-        data = json.loads((outdir / paths.MANIFEST_NAME).read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def update_manifest(job_id: str, **changes) -> dict:
-    """Persist the small part of a job that must survive a server restart."""
-    outdir = paths.OUTPUT_DIR / job_id
-    outdir.mkdir(parents=True, exist_ok=True)
-    manifest = read_manifest(outdir)
-    manifest.update(changes)
-    manifest.setdefault("id", job_id)
-    manifest.setdefault("createdAt", _now())
-    manifest["updatedAt"] = _now()
-    target = outdir / paths.MANIFEST_NAME
-    temporary = outdir / f".{paths.MANIFEST_NAME}.tmp"
-    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
-                         encoding="utf-8")
-    temporary.replace(target)
-    return manifest
-
 
 def _start_job_timing(job: dict) -> None:
     now = time.monotonic()
@@ -319,237 +197,6 @@ def _finish_job_timing(job: dict) -> dict:
     }
 
 
-def load_track_guide(outdir: Path) -> dict | None:
-    try:
-        data = json.loads((outdir / "track-guide.json").read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def prepare_track_guide(outdir: Path, text: str, duration: float,
-                        fetch_lyrics: bool, emit) -> dict | None:
-    """Build once, cache on disk, and reuse on every later iteration."""
-    tracklist_path = outdir / "tracklist.txt"
-    incoming = (text or "").strip()
-    if incoming:
-        tracklist_path.write_text(incoming + "\n", encoding="utf-8")
-    elif tracklist_path.is_file():
-        incoming = tracklist_path.read_text(encoding="utf-8")
-        existing = load_track_guide(outdir)
-        if existing:
-            references = existing.get("references", {})
-            # Las versiones anteriores guardaban cualquier error HTTPS como
-            # una referencia vacía. Rehacer esas guías una vez permite que la
-            # corrección del almacén de certificados también repare trabajos
-            # ya existentes, sin pedir al usuario que borre la caché.
-            old_empty = (
-                fetch_lyrics
-                and int(references.get("found") or 0) == 0
-                and "failed" not in references
-            )
-            retry_failures = fetch_lyrics and int(references.get("failed") or 0) > 0
-            if not old_empty and not retry_failures:
-                emit("reference", stage="loaded", **references,
-                     section=existing.get("section"),
-                     tracks=existing.get("tracks", []))
-                return existing
-    if not incoming:
-        return None
-
-    emit("status", stage="references",
-         message="Leyendo el tracklist y preparando una guía por canción…")
-
-    def progress(done: int, total: int, track: track_guides.Track) -> None:
-        emit("progress", stage="references", progress=done / max(total, 1))
-        if fetch_lyrics:
-            emit("status", stage="references",
-                 message=(f"Buscando letras de referencia {done}/{total} · "
-                          f"{track.artist} — {track.title}"))
-
-    guide = track_guides.build_guide(
-        incoming, duration, fetch_lyrics=fetch_lyrics,
-        cache_dir=paths.LYRICS_CACHE_DIR, progress=progress,
-    )
-    if not guide:
-        raise RuntimeError(
-            "No pude leer el tracklist. Usa una línea por canción: "
-            "00:00 Artista - Título"
-        )
-    (outdir / "track-guide.json").write_text(
-        json.dumps(guide, ensure_ascii=False, indent=2), encoding="utf-8")
-    emit("reference", stage="prepared", **guide["references"],
-         section=guide["section"], tracks=guide["tracks"])
-    return guide
-
-
-def _archive_outputs(outdir: Path) -> int:
-    """Keep small prior transcripts when the user iterates the same stems."""
-    manifest = read_manifest(outdir)
-    iteration = int(manifest.get("iteration") or 0) + 1
-    archive = outdir / "iterations" / f"iteration-{iteration:02d}"
-    # El manifiesto raíz cambia en cada iteración. Congelar una copia junto a
-    # sus resultados permite saber después qué modelo, motor y opciones los
-    # produjeron.
-    archive.mkdir(parents=True, exist_ok=True)
-    if (outdir / paths.MANIFEST_NAME).is_file():
-        shutil.copy2(outdir / paths.MANIFEST_NAME, archive / "run.json")
-    candidates: list[Path] = []
-    for path in outdir.iterdir():
-        if not path.is_file() or path.name in {
-            paths.MANIFEST_NAME, "track-guide.json", "tracklist.txt", "asr-input.wav",
-        }:
-            continue
-        name = path.name.lower()
-        if (path.suffix.lower() in {".srt", ".vtt", ".tsv"}
-                or name.endswith(".lyrixa.json")
-                or name.endswith(".letra.txt")
-                or (path.suffix.lower() == ".json" and name != paths.MANIFEST_NAME)
-                or path.suffix.lower() == ".txt"):
-            candidates.append(path)
-    if candidates:
-        for path in candidates:
-            shutil.move(str(path), str(archive / path.name))
-    update_manifest(outdir.name, iteration=iteration)
-    return iteration
-
-
-def _discover_result_files(job_id: str, outdir: Path, assets: dict | None) -> dict:
-    manifest_files = read_manifest(outdir).get("files") or {}
-    files: dict = {}
-    for kind, descriptor in manifest_files.items():
-        name = descriptor if isinstance(descriptor, str) else descriptor.get("name", "")
-        if kind in {"vocals", "instrumental"}:
-            continue
-        if name and (outdir / Path(name).name).is_file():
-            files[kind] = Path(name).name
-
-    root_files = [path for path in outdir.iterdir() if path.is_file()]
-    def newest(predicate):
-        matches = [path for path in root_files if predicate(path)]
-        return max(matches, key=lambda path: path.stat().st_mtime).name if matches else None
-
-    guesses = {
-        "lyrixa": newest(lambda p: p.name.endswith(".lyrixa.json")),
-        "lyrics": newest(lambda p: p.name.endswith(".letra.txt")),
-        "srt": newest(lambda p: p.suffix.lower() == ".srt"),
-        "vtt": newest(lambda p: p.suffix.lower() == ".vtt"),
-        "tsv": newest(lambda p: p.suffix.lower() == ".tsv"),
-        "json": newest(lambda p: p.suffix.lower() == ".json" and
-                       p.name not in {paths.MANIFEST_NAME, "track-guide.json"} and
-                       not p.name.endswith(".lyrixa.json")),
-        "txt": newest(lambda p: p.suffix.lower() == ".txt" and
-                      p.name != "tracklist.txt" and
-                      not p.name.endswith(".letra.txt")),
-    }
-    for kind, name in guesses.items():
-        if name:
-            files.setdefault(kind, name)
-    if (outdir / "track-guide.json").is_file():
-        files["guide"] = "track-guide.json"
-    if assets and assets.get("original"):
-        files.setdefault("audio", assets["original"].name)
-    if assets and assets.get("vocals"):
-        files["vocals"] = {
-            "name": "voz aislada.wav",
-            "url": f"/api/jobs/{job_id}/stems/vocals",
-        }
-    if assets and assets.get("instrumental"):
-        files["instrumental"] = {
-            "name": "instrumental.wav",
-            "url": f"/api/jobs/{job_id}/stems/instrumental",
-        }
-    return files
-
-
-def lyrixa_project_path(job_id: str) -> Path | None:
-    """El `.lyrixa.json` más reciente de un trabajo, o None."""
-    if not _JOB_ID_RE.fullmatch(job_id):
-        return None
-    outdir = (paths.OUTPUT_DIR / job_id).resolve()
-    if not outdir.is_dir() or paths.OUTPUT_DIR.resolve() not in outdir.parents:
-        return None
-    matches = [path for path in outdir.iterdir()
-               if path.is_file() and path.name.endswith(".lyrixa.json")]
-    if not matches:
-        return None
-    return max(matches, key=lambda path: path.stat().st_mtime)
-
-
-def job_links(job_id: str, files: dict) -> dict:
-    """Rutas estables de un trabajo, para que nadie tenga que componerlas.
-
-    Un cliente que arme `/download/{id}/{nombre}` depende del nombre del
-    archivo, que sale del título del vídeo y cambia en cada iteración. Estas
-    rutas no cambian. Son relativas a propósito: se resuelven contra la base
-    por la que el cliente llegó, así que `localhost` y `127.0.0.1` siguen
-    siendo el mismo origen para el navegador.
-    """
-    links = {
-        "self": f"/api/jobs/{job_id}",
-        "events": f"/api/jobs/{job_id}/events",
-        # Absoluta: apunta a otra aplicación, no a esta API.
-        "openInLyrixa": config.lyrixa_open_url(job_id),
-    }
-    if files.get("lyrixa"):
-        links["lyrixa"] = f"/api/jobs/{job_id}/lyrixa"
-    if files.get("audio"):
-        links["audio"] = f"/api/jobs/{job_id}/audio"
-    for stem in ("vocals", "instrumental"):
-        if files.get(stem):
-            links[stem] = f"/api/jobs/{job_id}/stems/{stem}"
-    return links
-
-
-def saved_job(job_id: str) -> dict | None:
-    assets = recovery_assets(job_id)
-    if assets is None:
-        return None
-    outdir = assets["outdir"]
-    manifest = read_manifest(outdir)
-    live = JOBS.get(job_id)
-    files = _discover_result_files(job_id, outdir, assets)
-    completed = any(kind in files for kind in ("json", "txt", "lyrixa"))
-    if live and not live["done"]:
-        status = "running"
-    elif completed:
-        status = "completed"
-    elif assets.get("checkpoint"):
-        status = "interrupted"
-    else:
-        status = manifest.get("status") or "saved"
-    guide = load_track_guide(outdir)
-    modified = datetime.fromtimestamp(outdir.stat().st_mtime, timezone.utc).isoformat()
-    disk_bytes = 0
-    for path in outdir.rglob("*"):
-        try:
-            if path.is_file():
-                disk_bytes += path.stat().st_size
-        except OSError:
-            # Un trabajo activo puede mover un archivo mientras se refresca la
-            # biblioteca. El tamaño es informativo, no debe romper el listado.
-            continue
-    return {
-        "id": job_id,
-        "title": manifest.get("title") or assets["title"],
-        "duration": float(manifest.get("duration") or assets["duration"] or 0),
-        "status": status,
-        "recoverable": assets.get("checkpoint") is not None,
-        "checkpoint": "asr" if assets.get("asr") else
-                      "vocals" if assets.get("vocals") else None,
-        "createdAt": manifest.get("createdAt") or modified,
-        "updatedAt": manifest.get("updatedAt") or modified,
-        "iteration": int(manifest.get("iteration") or 0),
-        "files": files,
-        "reference": (guide or {}).get("references"),
-        "section": (guide or {}).get("section"),
-        "error": manifest.get("error"),
-        "settings": manifest.get("settings") or {},
-        "timing": manifest.get("timing") or {},
-        "precision": manifest.get("precision") or {},
-        "diskBytes": disk_bytes,
-        "links": job_links(job_id, files),
-    }
 
 
 # Caracteres que no pueden ir en un nombre de archivo (o que rompen la
@@ -581,459 +228,6 @@ def parse_ts(ts: str) -> float:
     h, m, s = parts
     return h * 3600 + m * 60 + s
 
-
-# Progreso de yt-dlp: lo pedimos en un formato fijo y parseable en vez de
-# tener que leer la barra bonita que imprime por defecto.
-_YT_PROGRESS_TMPL = (
-    "download:@PROG@%(progress.downloaded_bytes)s|"
-    "%(progress.total_bytes,progress.total_bytes_estimate)s|"
-    "%(progress.fragment_index)s|%(progress.fragment_count)s"
-)
-_PROG_RE = re.compile(r"^@PROG@(\S*)\|(\S*)\|(\S*)\|(\S*)$")
-
-# Nombres internos de los postprocesadores de yt-dlp -> qué contarle al usuario.
-_PP_LABELS = {
-    "ExtractAudio": "Convirtiendo el audio…",
-    "ThumbnailsConvertor": "Preparando la carátula…",
-    "EmbedThumbnail": "Incrustando la carátula…",
-    "FFmpegMetadata": "Escribiendo los metadatos…",
-    "Metadata": "Escribiendo los metadatos…",
-}
-
-
-def _pos_float(text: str) -> float | None:
-    """Convierte a float los campos de yt-dlp, que valen 'NA' cuando no se saben."""
-    try:
-        value = float(text)
-    except (TypeError, ValueError):
-        return None
-    return value if value > 0 else None
-
-
-def _yt_dlp_error(tail: str) -> str:
-    """Traduce el error crudo de yt-dlp a algo accionable."""
-    if "403" in tail or "Forbidden" in tail:
-        return ("YouTube rechazó la descarga (HTTP 403). Casi siempre significa "
-                "que yt-dlp se quedó viejo: actualízalo con "
-                "`brew upgrade yt-dlp` (o `pip3 install -U yt-dlp`) y reintenta.")
-    if "Sign in to confirm" in tail or "bot" in tail.lower():
-        return ("YouTube pide verificar que no eres un bot. Prueba a exportar las "
-                "cookies del navegador: `yt-dlp --cookies-from-browser chrome …`")
-    if "Video unavailable" in tail or "Private video" in tail:
-        return "El video no está disponible (privado, borrado o con bloqueo regional)."
-    return f"yt-dlp falló: {tail[-400:]}"
-
-
-def audio_download_args(audio_format: str, quality: str) -> tuple[list[str], dict]:
-    """Argumentos de yt-dlp para el formato pedido + la ficha de ese formato.
-
-    "best" conserva el códec original (no recodifica); cualquier otro valor
-    convierte con ffmpeg. En ambos casos incrustamos metadatos y, si el
-    contenedor lo admite, la carátula del video como portada del álbum.
-    """
-    spec = _FORMATS_BY_VALUE.get(audio_format) or _FORMATS_BY_VALUE["best"]
-
-    # Siempre extraemos el audio. Con "best", ffmpeg solo lo re-empaqueta (copia
-    # el códec tal cual, sin recodificar): el resultado es .opus o .m4a en vez
-    # del .webm crudo, que ni admite carátula ni lo abren muchos reproductores.
-    args: list[str] = ["-x", "--audio-format", spec["value"]]
-    if not spec["lossless"]:
-        args += ["--audio-quality", quality or "192K"]
-
-    args += [
-        "--embed-metadata",
-        # La descripción entera de YouTube dentro del tag ensucia cualquier
-        # reproductor (son miles de caracteres); la vaciamos.
-        "--parse-metadata", ":(?P<meta_description>)",
-        "--parse-metadata", ":(?P<meta_synopsis>)",
-        # Si el video no declara artista/álbum (o sea: no viene de YouTube
-        # Music), caemos al canal para no dejar los campos vacíos.
-        "--parse-metadata", "%(artist,creator,uploader)s:%(meta_artist)s",
-        "--parse-metadata", "%(album,playlist_title,uploader)s:%(meta_album)s",
-    ]
-    if spec["cover"]:
-        args += ["--embed-thumbnail", "--convert-thumbnails", "jpg"]
-    return args, spec
-
-
-def download_audio(url: str, outdir: Path, emit, audio_format: str = "best",
-                   quality: str = "192K",
-                   name_template: str = "%(title)s.%(ext)s",
-                   ) -> tuple[Path, str, float]:
-    """Descarga el audio de un link y emite el avance en vivo.
-
-    Devuelve (ruta, título, duración). El archivo sale con sus metadatos y su
-    carátula ya incrustados.
-    """
-    extra, spec = audio_download_args(audio_format, quality)
-    emit("status", stage="downloading",
-         message=f"Descargando audio ({spec['label']})…")
-    emit("progress", stage="downloading", progress=0.0)
-
-    cmd = [
-        "yt-dlp", "-f", "bestaudio/best", "--no-simulate", "--no-playlist",
-        # --print activa --quiet, que se lleva por delante el progreso;
-        # --progress lo vuelve a encender.
-        "--newline", "--progress",
-        # Descargas largas: reintenta en vez de morir a mitad de camino.
-        "--retries", "10", "--fragment-retries", "10",
-        "--concurrent-fragments", "4",
-        "--progress-template", _YT_PROGRESS_TMPL,
-        "--progress-template", "postprocess:@PP@%(progress.postprocessor)s",
-        "--print", "after_move:@DONE@%(id)s\t%(title)s\t%(duration)s\t%(filepath)s",
-        "-o", str(outdir / name_template),
-    ] + extra + [url]
-
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
-    )
-
-    tail: deque[str] = deque(maxlen=30)   # por si hay que explicar un fallo
-    done_line: str | None = None
-    last_pct = -1
-    last_pp = None
-
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        if line.startswith("@DONE@"):
-            done_line = line[len("@DONE@"):]
-            continue
-        if line.startswith("@PP@"):
-            label = _PP_LABELS.get(line[len("@PP@"):].strip())
-            if label and label != last_pp:
-                last_pp = label
-                emit("status", stage="postprocessing", message=label)
-                emit("progress", stage="postprocessing", progress=None)
-            continue
-        m = _PROG_RE.match(line)
-        if m:
-            got, total, frag_i, frag_n = m.groups()
-            fraction = None
-            if _pos_float(total):
-                fraction = (_pos_float(got) or 0.0) / _pos_float(total)
-            elif _pos_float(frag_n):          # HLS: no hay bytes, pero sí fragmentos
-                fraction = (_pos_float(frag_i) or 0.0) / _pos_float(frag_n)
-            if fraction is not None:
-                pct = int(min(fraction, 1.0) * 100)
-                if pct != last_pct:           # 1 evento por punto porcentual
-                    last_pct = pct
-                    emit("progress", stage="downloading",
-                         progress=min(fraction, 1.0))
-            continue
-        tail.append(line)
-
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(_yt_dlp_error("\n".join(tail)))
-
-    if not done_line:
-        raise RuntimeError("yt-dlp terminó pero no reportó el archivo descargado.")
-    _id, title, dur, filepath = done_line.split("\t")
-    duration = float(dur) if dur and dur != "NA" else 0.0
-    emit("progress", stage="downloading", progress=1.0)
-    return Path(filepath), title, duration
-
-
-def demucs_available() -> bool:
-    """¿Está instalado Demucs (para el modo 'letra de canción')?"""
-    try:
-        import demucs  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
-def roformer_available() -> bool:
-    """¿Está instalado el separador moderno en su entorno aislado?"""
-    return paths.ROFORMER_CLI.is_file() and os.access(paths.ROFORMER_CLI, os.X_OK)
-
-
-@lru_cache(maxsize=1)
-def separator_acceleration() -> dict:
-    """Expose what audio-separator actually configured, not what we expect."""
-    if not roformer_available():
-        return {"mode": "unavailable", "accelerated": False}
-    try:
-        proc = subprocess.run(
-            [str(paths.ROFORMER_CLI), "--env_info"], capture_output=True, text=True,
-            timeout=12,
-        )
-        report = f"{proc.stdout}\n{proc.stderr}"
-    except Exception as error:  # noqa: BLE001
-        return {"mode": "unknown", "accelerated": False,
-                "detail": str(error)}
-    if "CoreMLExecutionProvider" in report:
-        return {"mode": "CoreML", "accelerated": True}
-    if "CUDAExecutionProvider" in report:
-        return {"mode": "CUDA", "accelerated": True}
-    if "No hardware acceleration" in report:
-        return {"mode": "CPU", "accelerated": False}
-    return {"mode": "unknown", "accelerated": False}
-
-
-def separation_profile_available(profile_name: str) -> bool:
-    profile = SEPARATION_PROFILES.get(profile_name)
-    if not profile:
-        return False
-    if profile["engine"] == "roformer":
-        return roformer_available()
-    return demucs_available()
-
-
-# Demucs escribe una barra tqdm en stderr:
-#   " 25%|█████▌      | 5.85/23.4 [00:01<00:03, 5.66seconds/s]"
-# Nos quedamos con la fracción exacta (procesado/total), no con el entero.
-_DEMUCS_RE = re.compile(r"(\d+)%\|.*?\|\s*([\d.]+)/([\d.]+)\s")
-_DEMUCS_BAG_RE = re.compile(r"bag of (\d+) models")
-
-
-def separate_vocals_demucs(
-    audio: Path, outdir: Path, emit, profile_name: str = "quality",
-) -> tuple[Path, Path]:
-    """Aísla voz/música y devuelve ``(vocals.wav, no_vocals.wav)``.
-
-    La primera vez, Demucs descarga sus pesos (~una vez). Separar en CPU es
-    lento (varios minutos por canción); por eso vamos emitiendo el avance.
-
-    Los modelos "bag of N" (como htdemucs_ft) pasan la pista por N modelos y
-    dibujan N barras seguidas, así que las encadenamos en un solo porcentaje
-    global: cada barra completa vale 1/N del total.
-    """
-    profile = SEPARATION_PROFILES.get(profile_name, SEPARATION_PROFILES["quality"])
-    emit("status", stage="separating",
-         message=f"Separando la voz con Demucs — {profile['label']} (puede tardar)…")
-    emit("progress", stage="separating", progress=0.0)
-
-    sep_dir = outdir / "demucs"
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "demucs", "-n", "htdemucs",
-         "--two-stems=vocals", "--shifts", str(profile["shifts"]),
-         "--overlap", str(profile["overlap"]),
-         "-o", str(sep_dir), str(audio)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
-    )
-
-    tail: deque[str] = deque(maxlen=30)
-    n_models = 1        # cuántos modelos contiene el bag
-    n_passes = int(profile["shifts"])  # modelos × shifts
-    finished = 0        # pasadas ya completadas
-    prev_fraction = 0.0
-    last_pct = -1
-
-    # text=True traduce los \r de la barra a \n, así que cada refresco de tqdm
-    # llega aquí como una línea suelta.
-    for line in proc.stdout:
-        line = line.rstrip("\n").strip()
-        if not line:
-            continue
-        bag = _DEMUCS_BAG_RE.search(line)
-        if bag:
-            n_models = max(1, int(bag.group(1)))
-            n_passes = n_models * int(profile["shifts"])
-            tail.append(line)
-            continue
-        m = _DEMUCS_RE.search(line)
-        if not m:
-            tail.append(line)
-            continue
-        done, total = float(m.group(2)), float(m.group(3))
-        fraction = min(done / total, 1.0) if total else 0.0
-        if fraction < prev_fraction - 0.01:   # la barra reinició = nuevo modelo
-            finished = min(finished + 1, n_passes - 1)
-        prev_fraction = fraction
-        overall = (finished + fraction) / n_passes
-        pct = int(overall * 100)
-        if pct != last_pct:
-            last_pct = pct
-            emit("progress", stage="separating", progress=min(overall, 1.0))
-
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(f"Demucs falló: {chr(10).join(tail)[-400:]}")
-
-    matches = list(sep_dir.rglob("vocals.wav"))
-    if not matches:
-        raise RuntimeError("Demucs no produjo la pista de voz.")
-    vocals = matches[0]
-    instrumental = vocals.with_name("no_vocals.wav")
-    if not instrumental.is_file():
-        raise RuntimeError("Demucs no produjo la pista instrumental.")
-    emit("progress", stage="separating", progress=1.0)
-    return vocals, instrumental
-
-
-_ROFORMER_PROGRESS_RE = re.compile(r"(\d{1,3})%\|")
-_ROFORMER_CHUNK_RE = re.compile(r"Processing chunk (\d+)/(\d+)")
-
-
-def separate_vocals_roformer(
-    audio: Path, outdir: Path, emit, tag: str = "roformer",
-) -> tuple[Path, Path]:
-    """Aísla voz con BS-RoFormer usando un entorno Python independiente.
-
-    ``audio-separator`` trae un stack grande de PyTorch/ONNX que puede entrar en
-    conflicto con Whisper y Demucs. Por eso ``setup_separator.sh`` lo instala en
-    ``.separator-venv`` y aquí sólo invocamos su CLI.
-    """
-    if not roformer_available():
-        raise RuntimeError(
-            "BS-RoFormer no está instalado. Ejecuta: cd webapp && "
-            "./setup_separator.sh"
-        )
-
-    model_cached = (paths.ROFORMER_MODEL_DIR / paths.ROFORMER_MODEL).is_file()
-    if model_cached:
-        emit("status", stage="separating",
-             message="Separando la voz con BS-RoFormer (puede tardar)…")
-    else:
-        emit("status", stage="downloading_separator_model",
-             message="Descargando BS-RoFormer (~610 MB, sólo esta vez)…")
-    emit("progress", stage="separating", progress=0.0)
-
-    sep_dir = outdir / tag
-    sep_dir.mkdir(parents=True, exist_ok=True)
-    paths.ROFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(paths.ROFORMER_CLI), str(audio),
-        "--model_filename", paths.ROFORMER_MODEL,
-        "--model_file_dir", str(paths.ROFORMER_MODEL_DIR),
-        "--output_dir", str(sep_dir),
-        "--output_format", "WAV",
-        # Los mixes de una hora pueden ocupar varios GB al convertirse a
-        # float32. Los bloques de 10 min mantienen estable el uso de memoria.
-        "--chunk_duration", "600",
-        "--custom_output_names",
-        json.dumps({"Vocals": "vocals", "Instrumental": "instrumental"}),
-    ]
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
-    )
-
-    tail: deque[str] = deque(maxlen=40)
-    current_chunk = 0
-    total_chunks = 1
-    separating_started = model_cached
-    last_pct = -1
-    for line in proc.stdout:
-        line = line.rstrip("\n").strip()
-        if not line:
-            continue
-        tail.append(line)
-
-        if not separating_started and "MDXC Separator initialisation complete" in line:
-            separating_started = True
-            emit("status", stage="separating",
-                 message="Separando la voz con BS-RoFormer (puede tardar)…")
-            emit("progress", stage="separating", progress=0.0)
-
-        chunk = _ROFORMER_CHUNK_RE.search(line)
-        if chunk:
-            current_chunk = max(0, int(chunk.group(1)) - 1)
-            total_chunks = max(1, int(chunk.group(2)))
-
-        progress = _ROFORMER_PROGRESS_RE.search(line)
-        if not progress:
-            continue
-        fraction = min(int(progress.group(1)) / 100.0, 1.0)
-        if not separating_started:
-            emit("progress", stage="downloading_separator_model",
-                 progress=fraction)
-            continue
-        overall = min((current_chunk + fraction) / total_chunks, 0.99)
-        pct = int(overall * 100)
-        if pct != last_pct:
-            last_pct = pct
-            emit("progress", stage="separating", progress=overall)
-
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"BS-RoFormer falló: {chr(10).join(tail)[-600:]}"
-        )
-
-    vocals = sep_dir / "vocals.wav"
-    instrumental = sep_dir / "instrumental.wav"
-    if not vocals.is_file() or not instrumental.is_file():
-        raise RuntimeError("BS-RoFormer no produjo ambas pistas de audio.")
-    emit("progress", stage="separating", progress=1.0)
-    return vocals, instrumental
-
-
-def measure_stems(vocals: Path, instrumental: Path | None,
-                  duration: float) -> audio_analysis.StemReport:
-    """Mide la voz aislada. Nunca tumba el trabajo: si no se puede medir,
-    devolvemos un informe vacío y seguimos."""
-    try:
-        pcm = audio_analysis.decode_pcm(vocals)
-        other = (audio_analysis.decode_pcm(instrumental)
-                 if instrumental and instrumental.is_file() else None)
-        return audio_analysis.assess_separation(pcm, other, duration)
-    except Exception:  # noqa: BLE001
-        return audio_analysis.StemReport()
-
-
-def _second_pass_is_better(first: audio_analysis.StemReport,
-                           second: audio_analysis.StemReport) -> bool:
-    """¿La segunda pasada limpió sin comerse la voz?
-
-    Volver a pasar el separador sobre su propia salida quita el instrumental
-    que sobrevivió, pero también puede borrar susurros y coros. Solo la
-    aceptamos si además de bajar la fuga conserva casi todo el canto: medir es
-    la única forma de que "más limpio" no signifique "más vacío".
-    """
-    if second.verdict in {"empty", "silent"}:
-        return False
-    if second.speech_coverage < first.speech_coverage * 0.85:
-        return False
-    return second.bleed_ratio < first.bleed_ratio * 0.9
-
-
-def separate_vocals(
-    audio: Path, outdir: Path, emit, profile_name: str = "precise",
-    duration: float = 0.0,
-) -> tuple[Path, Path, audio_analysis.StemReport]:
-    """Aísla la voz y devuelve (voz, instrumental, informe de calidad)."""
-    profile = SEPARATION_PROFILES.get(profile_name, SEPARATION_PROFILES["precise"])
-    if profile["engine"] != "roformer":
-        vocals, instrumental = separate_vocals_demucs(
-            audio, outdir, emit, profile_name)
-        return vocals, instrumental, measure_stems(vocals, instrumental, duration)
-
-    vocals, instrumental = separate_vocals_roformer(audio, outdir, emit)
-    report = measure_stems(vocals, instrumental, duration)
-    emit("stem", stage="separated", pass_number=1, **report.as_dict())
-
-    if profile.get("passes", 1) < 2 or report.verdict in {"empty", "silent"}:
-        return vocals, instrumental, report
-
-    emit("status", stage="separating",
-         message="Segunda pasada de BS-RoFormer para quitar el instrumental "
-                 "que quedó en la voz…")
-    try:
-        refined, residue = separate_vocals_roformer(
-            vocals, outdir, emit, tag="roformer-2")
-    except RuntimeError as error:
-        emit("status", stage="separating",
-             message=f"La segunda pasada falló ({error}); me quedo con la primera.")
-        return vocals, instrumental, report
-
-    refined_report = measure_stems(refined, residue, duration)
-    emit("stem", stage="separated", pass_number=2, **refined_report.as_dict())
-    if _second_pass_is_better(report, refined_report):
-        emit("status", stage="separating",
-             message=(f"Me quedo con la segunda pasada: la fuga instrumental "
-                      f"bajó de {report.bleed_ratio:.3f} a "
-                      f"{refined_report.bleed_ratio:.3f}."))
-        # El instrumental sigue siendo el de la primera pasada: es el
-        # complemento real de la mezcla original.
-        return refined, instrumental, refined_report
-
-    emit("status", stage="separating",
-         message="La segunda pasada no mejoró la medición; me quedo con la primera.")
-    return vocals, instrumental, report
 
 
 def run_whisper(audio: Path, model: str, language: str, outdir: Path,
@@ -1179,107 +373,6 @@ def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
     return files, result
 
 
-def group_by_language(languages: list[str | None],
-                      fallback: str | None) -> dict[str | None, list[int]]:
-    """Line indices grouped by the language they were sung in."""
-    groups: dict[str | None, list[int]] = {}
-    for index, code in enumerate(languages):
-        key = translation.normalize_code(code) or translation.normalize_code(fallback)
-        groups.setdefault(key, []).append(index)
-    return groups
-
-
-def translate_clip_lines(lines: list[str], languages: list[str | None], *,
-                         source: str | None, target: str,
-                         romanize: bool, emit) -> dict:
-    """Romaniza y traduce las líneas ya confirmadas por el consenso.
-
-    Se hace al final a propósito: traducir un texto que todavía puede cambiar
-    es trabajo tirado, y una traducción hecha sobre texto inventado se ve
-    perfectamente correcta, que es la peor forma de estar mal.
-
-    Las líneas se agrupan por el idioma en el que se cantaron, no por el del
-    archivo: en un mix de una hora conviven canciones en japonés y en inglés, y
-    cada grupo necesita su propia ruta (ja→en→es, en→es) y su propio romaji.
-    """
-    out: dict = {"lines": None, "romaji": None, "backend": None,
-                 "routeLabel": None, "targetLanguage": None, "error": None,
-                 "routes": []}
-    if not lines:
-        return out
-
-    groups = group_by_language(languages, source)
-    errors: list[str] = []
-    routes: list[str] = []
-
-    # --- Romaji: sólo los tramos que realmente se cantaron en japonés ---
-    romaji_lines: list[str] | None = None
-    if romanize:
-        for code, indices in groups.items():
-            if code not in translation.ROMANIZABLE:
-                continue
-            emit("status", stage="romanizing",
-                 message=(f"Pasando a romaji {len(indices)} líneas en "
-                          f"{translation.language_label(code)}…"))
-            try:
-                converted, backend = translation.romanize(
-                    [lines[i] for i in indices],
-                    progress=lambda done, total: emit(
-                        "progress", stage="romanizing",
-                        progress=done / max(total, 1)),
-                )
-            except Exception as error:  # noqa: BLE001
-                errors.append(f"No se pudo romanizar: {error}")
-                continue
-            if romaji_lines is None:
-                romaji_lines = list(lines)
-            for position, index in enumerate(indices):
-                romaji_lines[index] = converted[position]
-            out["romajiBackend"] = backend
-        out["romaji"] = romaji_lines
-
-    if not target:
-        out["error"] = "; ".join(errors) or None
-        return out
-
-    # --- Traducción: una ruta por idioma de origen ---
-    translated = list(lines)
-    did_translate = False
-    for code, indices in groups.items():
-        route = translation.plan_route(code, target)
-        if not route:
-            continue                    # ya está en el idioma de destino
-        label = translation.route_label(route)
-        emit("status", stage="translating",
-             message=(f"Traduciendo {len(indices)} líneas ya confirmadas · "
-                      f"{label}…"))
-        try:
-            result = translation.translate(
-                [lines[i] for i in indices], source=code, target=target,
-                cache_dir=paths.TRANSLATION_CACHE_DIR,
-                progress=lambda p: emit("progress", stage="translating",
-                                        progress=p),
-            )
-        except translation.TranslationUnavailable as error:
-            out["error"] = str(error)
-            return out
-        except Exception as error:  # noqa: BLE001
-            errors.append(f"{label}: {error}")
-            continue
-        for position, index in enumerate(indices):
-            translated[index] = result["lines"][position]
-        routes.append(f"{label} ({len(indices)})")
-        out["backend"] = result["backend"]
-        did_translate = True
-
-    out["error"] = "; ".join(errors) or None
-    if not did_translate:
-        return out
-    out["lines"] = translated
-    out["routes"] = routes
-    out["routeLabel"] = " · ".join(routes)
-    out["targetLanguage"] = translation.normalize_code(target)
-    return out
 
 
 def read_clip_lines(json_path: Path) -> tuple[list[str], list[str | None]]:
@@ -1377,24 +470,24 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
 
     outdir = paths.OUTPUT_DIR / job_id
     outdir.mkdir(parents=True, exist_ok=True)
-    update_manifest(job_id, status="running", error=None,
-                    startedAt=_now(), finishedAt=None)
+    jobstore.update_manifest(job_id, status="running", error=None,
+                    startedAt=jobstore.utc_now(), finishedAt=None)
     try:
         # Modo "solo audio": descargar en el formato pedido y terminar, sin Whisper.
         if mode == "audio_only":
-            audio, title, duration = download_audio(
+            audio, title, duration = media.download_audio(
                 url, outdir, emit, audio_format, audio_quality)
             emit("meta", title=title, duration=duration, device=device_name())
             files = {"audio": audio.name}
-            update_manifest(job_id, status="completed", title=title,
+            jobstore.update_manifest(job_id, status="completed", title=title,
                             duration=duration, files=files,
-                            finishedAt=_now(), timing=_finish_job_timing(job))
-            emit("done", title=title, files=files,
-                 job_id=job_id)
+                            finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
+            emit("done", title=title, files=files, job_id=job_id,
+                 links=jobstore.job_links(job_id, files))
             return
 
         separates = mode in {"lyrics", "ultra"}
-        if separates and not separation_profile_available(separation_quality):
+        if separates and not media.separation_profile_available(separation_quality):
             profile = SEPARATION_PROFILES[separation_quality]
             if profile["engine"] == "roformer":
                 raise RuntimeError(
@@ -1419,29 +512,29 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         if source_type == "url":
             # Para letra conviene el audio sin recodificar: mejor separación de voz.
             fmt = "best" if separates else audio_format
-            source_audio, title, duration = download_audio(
+            source_audio, title, duration = media.download_audio(
                 url, outdir, emit, fmt, audio_quality)
             audio = source_audio
         else:
             audio = upload_path
             title = audio.stem          # sin extensión: es el nombre de las salidas
-            duration = ffprobe_duration(audio)
+            duration = media.ffprobe_duration(audio)
         original_audio = audio
 
         emit("meta", title=title, duration=duration,
              model=model, device=device_name())
-        update_manifest(job_id, title=title, duration=duration,
+        jobstore.update_manifest(job_id, title=title, duration=duration,
                         sourceFile=original_audio.name)
 
         guide = None
         if mode == "ultra" and tracklist_text.strip():
-            guide = prepare_track_guide(
+            guide = jobstore.prepare_track_guide(
                 outdir, tracklist_text, duration, fetch_lyrics, emit)
 
         stem_files = {}
         stem_report = None
         if separates:
-            vocals, instrumental, stem_report = separate_vocals(
+            vocals, instrumental, stem_report = media.separate_vocals(
                 audio, outdir, emit, separation_quality, duration)
             audio = vocals
             job["stem_paths"] = {
@@ -1451,7 +544,7 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
             emit("stem", stage="final", pass_number=0, **stem_report.as_dict())
             # Persistir el control de calidad permite validar/reutilizar estas
             # pistas en una iteración sin volver a decodificar archivos enormes.
-            update_manifest(job_id, stem=stem_report.as_dict())
+            jobstore.update_manifest(job_id, stem=stem_report.as_dict())
             # Los WAV se sirven desde la carpeta del separador elegido, sin
             # copiarlos ni recomprimirlos. En mixes largos pueden pesar >600 MB.
             stem_files = {
@@ -1490,7 +583,7 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         translation_language = None
         if mode == "ultra" and files.get("json"):
             lines, line_languages = read_clip_lines(outdir / files["json"])
-            language_report = translate_clip_lines(
+            language_report = translation.translate_clip_lines(
                 lines, line_languages, source=detected_language,
                 target=translate_to, romanize=romaji, emit=emit)
             translated_lines = language_report["lines"]
@@ -1523,14 +616,15 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         if guide:
             files["guide"] = "track-guide.json"
         files.update(stem_files)
-        update_manifest(job_id, status="completed", title=title,
+        jobstore.update_manifest(job_id, status="completed", title=title,
                         duration=duration, files=files, error=None,
-                        finishedAt=_now(), timing=_finish_job_timing(job),
+                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job),
                         precision=precision_report)
-        emit("done", title=title, files=files, job_id=job_id)
+        emit("done", title=title, files=files, job_id=job_id,
+             links=jobstore.job_links(job_id, files))
     except Exception as e:  # noqa: BLE001
-        update_manifest(job_id, status="error", error=str(e),
-                        finishedAt=_now(), timing=_finish_job_timing(job))
+        jobstore.update_manifest(job_id, status="error", error=str(e),
+                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
         emit("error", message=str(e))
     finally:
         if caffeinate is not None:
@@ -1558,10 +652,10 @@ def resume_precision_pipeline(
             job["cond"].notify_all()
 
     caffeinate = start_caffeinate()
-    update_manifest(job_id, status="running", error=None,
-                    startedAt=_now(), finishedAt=None)
+    jobstore.update_manifest(job_id, status="running", error=None,
+                    startedAt=jobstore.utc_now(), finishedAt=None)
     try:
-        assets = recovery_assets(job_id)
+        assets = jobstore.recovery_assets(job_id)
         if not assets or not assets["checkpoint"]:
             raise RuntimeError("No quedó un audio intermedio que se pueda retomar.")
 
@@ -1571,7 +665,7 @@ def resume_precision_pipeline(
         original: Path | None = assets["original"]
         vocals: Path | None = assets["vocals"]
         instrumental: Path | None = assets["instrumental"]
-        audio, checkpoint_kind = reusable_checkpoint(assets)
+        audio, checkpoint_kind = jobstore.reusable_checkpoint(assets)
         if audio is None:
             raise RuntimeError(
                 "Los audios guardados están incompletos o dañados; no es seguro "
@@ -1586,7 +680,7 @@ def resume_precision_pipeline(
         emit("meta", title=title, duration=duration,
              model=model, device=device_name())
 
-        guide = prepare_track_guide(
+        guide = jobstore.prepare_track_guide(
             outdir, tracklist_text, duration, fetch_lyrics, emit)
 
         stem_files: dict = {}
@@ -1595,10 +689,10 @@ def resume_precision_pipeline(
             if checkpoint_kind != "asr":
                 audio = audio_analysis.condition_for_asr(
                     vocals, outdir / "asr-input.wav")
-            stem_report = stored_stem_report(outdir)
+            stem_report = jobstore.stored_stem_report(outdir)
             if stem_report is None:
-                stem_report = measure_stems(vocals, instrumental, duration)
-                update_manifest(job_id, stem=stem_report.as_dict())
+                stem_report = media.measure_stems(vocals, instrumental, duration)
+                jobstore.update_manifest(job_id, stem=stem_report.as_dict())
             emit("stem", stage="recovered", pass_number=0,
                  **stem_report.as_dict())
             job["stem_paths"] = {"vocals": str(vocals.resolve())}
@@ -1627,7 +721,7 @@ def resume_precision_pipeline(
         translation_language = None
         if files.get("json"):
             lines, line_languages = read_clip_lines(outdir / files["json"])
-            language_report = translate_clip_lines(
+            language_report = translation.translate_clip_lines(
                 lines, line_languages, source=detected_language,
                 target=translate_to, romanize=romaji, emit=emit)
             translated_lines = language_report["lines"]
@@ -1659,14 +753,15 @@ def resume_precision_pipeline(
         if guide:
             files["guide"] = "track-guide.json"
         files.update(stem_files)
-        update_manifest(job_id, status="completed", title=title,
+        jobstore.update_manifest(job_id, status="completed", title=title,
                         duration=duration, files=files, error=None,
-                        finishedAt=_now(), timing=_finish_job_timing(job),
+                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job),
                         precision=precision_report)
-        emit("done", title=title, files=files, job_id=job_id)
+        emit("done", title=title, files=files, job_id=job_id,
+             links=jobstore.job_links(job_id, files))
     except Exception as error:  # noqa: BLE001
-        update_manifest(job_id, status="error", error=str(error),
-                        finishedAt=_now(), timing=_finish_job_timing(job))
+        jobstore.update_manifest(job_id, status="error", error=str(error),
+                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
         emit("error", message=str(error))
     finally:
         if caffeinate is not None:
@@ -1688,15 +783,15 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
             job["events"].append({"event": event, "data": data})
             job["cond"].notify_all()
 
-    update_manifest(job_id, status="running", error=None,
-                    startedAt=_now(), finishedAt=None)
+    jobstore.update_manifest(job_id, status="running", error=None,
+                    startedAt=jobstore.utc_now(), finishedAt=None)
     try:
-        assets = recovery_assets(job_id)
+        assets = jobstore.recovery_assets(job_id)
         if not assets:
             raise RuntimeError("El trabajo guardado ya no existe.")
         outdir: Path = assets["outdir"]
-        manifest = read_manifest(outdir)
-        files = _discover_result_files(job_id, outdir, assets)
+        manifest = jobstore.read_manifest(outdir)
+        files = jobstore._discover_result_files(job_id, outdir, assets)
         json_name = files.get("json")
         if not isinstance(json_name, str):
             raise RuntimeError("Este trabajo no conserva el JSON cronometrado.")
@@ -1708,7 +803,7 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
         )
         emit("status", stage="translating",
              message="Añadiendo capas al resultado guardado; no repetiré Whisper…")
-        report = translate_clip_lines(
+        report = translation.translate_clip_lines(
             lines, languages, source=source_language, target=target,
             romanize=romanize, emit=emit)
         emit("translation", routeLabel=report["routeLabel"],
@@ -1733,14 +828,15 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
         if lyrixa:
             files["lyrixa"] = lyrixa
         settings.update({"translateTo": target, "romaji": romanize})
-        update_manifest(
+        jobstore.update_manifest(
             job_id, status="completed", files=files, settings=settings,
-            error=None, finishedAt=_now(), timing=_finish_job_timing(job))
+            error=None, finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
         emit("done", title=manifest.get("title") or assets["title"],
-             files=files, job_id=job_id)
+             files=files, job_id=job_id,
+             links=jobstore.job_links(job_id, files))
     except Exception as error:  # noqa: BLE001
-        update_manifest(job_id, status="error", error=str(error),
-                        finishedAt=_now(), timing=_finish_job_timing(job))
+        jobstore.update_manifest(job_id, status="error", error=str(error),
+                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
         emit("error", message=str(error))
     finally:
         with job["cond"]:
@@ -1819,7 +915,7 @@ def info():
         "audio_qualities": AUDIO_QUALITIES,
         "separation_profiles": [
             {"value": value, "label": spec["label"], "hint": spec["hint"],
-             "available": separation_profile_available(value)}
+             "available": media.separation_profile_available(value)}
             for value, spec in SEPARATION_PROFILES.items()
         ],
         "precision_levels": [
@@ -1831,9 +927,9 @@ def info():
             {"value": code, "label": translation.language_label(code)}
             for code in TARGET_LANGUAGES
         ],
-        "demucs": demucs_available(),
-        "roformer": roformer_available(),
-        "separator_acceleration": separator_acceleration(),
+        "demucs": media.demucs_available(),
+        "roformer": media.roformer_available(),
+        "media.separator_acceleration": media.separator_acceleration(),
         "faster_whisper": precision.te.faster_whisper_available(),
         "mlx_whisper": precision.te.mlx_whisper_available(),
         "asr_engines": [
@@ -1871,7 +967,7 @@ def list_saved_jobs():
     for outdir in paths.OUTPUT_DIR.iterdir():
         if not outdir.is_dir() or not _JOB_ID_RE.fullmatch(outdir.name):
             continue
-        record = saved_job(outdir.name)
+        record = jobstore.saved_job(outdir.name, running=job_is_running(outdir.name))
         if record:
             jobs.append(record)
     jobs.sort(key=lambda item: item["updatedAt"], reverse=True)
@@ -1880,7 +976,7 @@ def list_saved_jobs():
 
 @app.get("/api/jobs/{job_id}")
 def saved_job_detail(job_id: str):
-    record = saved_job(job_id)
+    record = jobstore.saved_job(job_id, running=job_is_running(job_id))
     if record is None:
         return JSONResponse({"error": "job no existe"}, status_code=404)
     tracklist = paths.OUTPUT_DIR / job_id / "tracklist.txt"
@@ -1996,7 +1092,7 @@ async def create_job(
     if tracklist_text.strip():
         (outdir / "tracklist.txt").write_text(
             tracklist_text.strip() + "\n", encoding="utf-8")
-    update_manifest(
+    jobstore.update_manifest(
         job_id, status="queued", mode=mode, iteration=0,
         settings={
             "model": model, "language": language,
@@ -2035,7 +1131,7 @@ def job_state(job_id: str):
         return {"status": "known", "active": not job["done"],
                 "recoverable": False}
 
-    assets = recovery_assets(job_id)
+    assets = jobstore.recovery_assets(job_id)
     if assets is None:
         return JSONResponse({"error": "job no existe"}, status_code=404)
     saved = [
@@ -2070,13 +1166,13 @@ async def resume_job(
     if current is not None and not current["done"]:
         return JSONResponse({"error": "El trabajo ya está corriendo."},
                             status_code=409)
-    assets = recovery_assets(job_id)
+    assets = jobstore.recovery_assets(job_id)
     if assets is None or assets["checkpoint"] is None:
         return JSONResponse(
             {"error": "No quedó un audio intermedio recuperable."},
             status_code=404,
         )
-    checkpoint, _checkpoint_kind = reusable_checkpoint(assets)
+    checkpoint, _checkpoint_kind = jobstore.reusable_checkpoint(assets)
     if checkpoint is None:
         return JSONResponse(
             {"error": "La voz aislada o asr-input.wav quedó incompleto. "
@@ -2101,14 +1197,14 @@ async def resume_job(
     if len(tracklist_text.encode("utf-8")) > 2_000_000:
         return JSONResponse({"error": "El tracklist supera 2 MB."}, status_code=400)
 
-    iteration = _archive_outputs(assets["outdir"])
+    iteration = jobstore._archive_outputs(assets["outdir"])
     if tracklist_text.strip():
         (assets["outdir"] / "tracklist.txt").write_text(
             tracklist_text.strip() + "\n", encoding="utf-8")
         # A new guide must be rebuilt; the previous one belongs to another
         # version/section of the pasted list.
         (assets["outdir"] / "track-guide.json").unlink(missing_ok=True)
-    update_manifest(
+    jobstore.update_manifest(
         job_id, status="queued", iteration=iteration,
         settings={
             "model": model, "language": language,
@@ -2145,7 +1241,7 @@ async def translate_saved_job(
     if current is not None and not current["done"]:
         return JSONResponse({"error": "El trabajo ya está corriendo."},
                             status_code=409)
-    record = saved_job(job_id)
+    record = jobstore.saved_job(job_id, running=job_is_running(job_id))
     if not record or not record.get("files", {}).get("json"):
         return JSONResponse(
             {"error": "No hay un JSON cronometrado que reutilizar."},
@@ -2236,7 +1332,7 @@ def lyrixa_project(job_id: str, download: bool = False):
     de tres horas el envelope pesa varios megas y volver a construirlo no
     añadiría nada.
     """
-    path = lyrixa_project_path(job_id)
+    path = jobstore.lyrixa_project_path(job_id)
     if path is None:
         return JSONResponse(
             {"error": "Este trabajo todavía no tiene proyecto de Lyrixa."},
@@ -2255,7 +1351,7 @@ def job_audio(job_id: str, download: bool = False):
     `FileResponse` responde a `Range`, así que un `<audio>` puede buscar dentro
     de una mezcla de tres horas sin descargarla entera.
     """
-    assets = recovery_assets(job_id)
+    assets = jobstore.recovery_assets(job_id)
     original = (assets or {}).get("original")
     if original is None:
         return JSONResponse({"error": "No hay audio original guardado."},
@@ -2319,7 +1415,7 @@ def translate_text(request: TranslateRequest):
             try:
                 result = translation.translate(
                     lines, source=source, target=target,
-                    cache_dir=paths.TRANSLATION_CACHE_DIR)
+                    cache_dir=translation.DEFAULT_CACHE_DIR)
             except translation.TranslationUnavailable as error:
                 return JSONResponse({"error": str(error)}, status_code=503)
             except Exception as error:  # noqa: BLE001

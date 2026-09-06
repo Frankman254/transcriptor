@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "webapp"))
 from lyrixa_bridge import (  # noqa: E402
     HARD_MAX_DURATION,
     MAIN_LAYER_ID,
+    FX_LAYER_ID,
     TRANSLATION_LAYER_ID,
     build_lyrixa_envelope,
     clip_lines,
@@ -177,13 +178,35 @@ class TwoLayerEnvelopeTests(unittest.TestCase):
             self.assertEqual(target["startTime"], source["startTime"])
             self.assertEqual(target["endTime"], source["endTime"])
 
-    def test_without_a_translation_there_is_no_translation_layer(self):
+    def test_without_a_translation_the_channel_exists_but_is_empty(self):
+        # Las tres capas salen siempre: un canal vacío se puede rellenar a
+        # mano en Lyrixa, y que estén siempre las tres mantiene el `order`
+        # estable entre trabajos, que es de lo que depende una escena de
+        # LiveWallpaper montada sobre la capa 2.
         project = self.envelope(translations=None,
                                 translation_language=None)["project"]
-        ids = {layer["id"] for layer in project["layers"]}
-        self.assertNotIn(TRANSLATION_LAYER_ID, ids)
+        by_id = {layer["id"]: layer for layer in project["layers"]}
+        self.assertEqual(set(by_id), {MAIN_LAYER_ID, TRANSLATION_LAYER_ID,
+                                      FX_LAYER_ID})
+        self.assertEqual([by_id[i]["order"] for i in
+                          (MAIN_LAYER_ID, TRANSLATION_LAYER_ID, FX_LAYER_ID)],
+                         [0, 1, 2])
+        # Vacío y sin idioma, así que no dice ser una traducción de nada.
+        self.assertEqual(by_id[TRANSLATION_LAYER_ID]["role"], "backing")
+        self.assertIsNone(by_id[TRANSLATION_LAYER_ID]["language"])
         self.assertTrue(all(c["layerId"] == MAIN_LAYER_ID
                             for c in project["clips"]))
+
+    def test_the_fx_channel_is_a_command_track_not_a_lyric_one(self):
+        # Su texto no se dibuja: un clip que diga "glitch 0.8" es una orden
+        # para el renderer.  Ver docs/contrato-capa-fx.md.
+        project = self.envelope()["project"]
+        fx = next(l for l in project["layers"] if l["id"] == FX_LAYER_ID)
+        self.assertEqual(fx["role"], "fx")
+        self.assertTrue(fx["renderSettings"]["suppressClipText"])
+        # Transcriptor nunca autora efectos: no sabe qué debería brillar.
+        self.assertEqual([c for c in project["clips"]
+                          if c["layerId"] == FX_LAYER_ID], [])
 
     def test_romaji_replaces_the_line_but_keeps_the_original_script(self):
         lines = clip_lines({"segments": [LONG]})
