@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Arranca el Transcriptor local en http://127.0.0.1:8000
+# Arranca el motor local del Transcriptor.
+#
+# Host y puerto salen de TRANSCRIPTOR_HOST / TRANSCRIPTOR_PORT para que una
+# shell de escritorio pueda levantarlo en un puerto que elija ella sin editar
+# este archivo. Por defecto, http://127.0.0.1:8000.
 set -e
 cd "$(dirname "$0")"
+
+HOST="${TRANSCRIPTOR_HOST:-127.0.0.1}"
+PORT="${TRANSCRIPTOR_PORT:-8000}"
 
 # Instala dependencias del backend la primera vez.
 python3 -c "import fastapi, uvicorn, multipart, mutagen, numpy, certifi" 2>/dev/null || \
@@ -25,4 +32,5 @@ if [[ ! -x ".separator-venv/bin/audio-separator" ]]; then
   echo "Aviso: instala el modo vocal Preciso una vez con ./setup_separator.sh"
 fi
 
-exec python3 -m uvicorn server:app --host 127.0.0.1 --port 8000
+echo "Transcriptor en http://${HOST}:${PORT}"
+exec python3 -m uvicorn server:app --host "$HOST" --port "$PORT"

@@ -28,193 +28,55 @@ from pathlib import Path
 
 import whisper  # solo para conocer las URLs de los modelos
 from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
     StreamingResponse,
 )
+from pydantic import BaseModel, Field
 
 import audio_analysis
+import catalogs
+import config
+import lyrixa_bridge
+import paths
 import precision
 import track_guides
 import translation
 from lyrixa_bridge import build_lyrixa_envelope, clip_languages, clip_lines
+from catalogs import (
+    ASR_ENGINES,
+    AUDIO_FORMATS,
+    AUDIO_QUALITIES,
+    LANGUAGES,
+    MODEL_ARTIFACTS,
+    MODEL_DETAILS,
+    MODELS,
+    PRECISION_LEVELS,
+    SEPARATION_PROFILES,
+    TARGET_LANGUAGES,
+    _FORMATS_BY_VALUE,
+)
 
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-OUTPUT_DIR = BASE_DIR / "output"
-CACHE_DIR = Path.home() / ".cache" / "whisper"
-ROFORMER_VENV_DIR = BASE_DIR / ".separator-venv"
-ROFORMER_CLI = ROFORMER_VENV_DIR / "bin" / "audio-separator"
-ROFORMER_MODEL_DIR = BASE_DIR / ".separator-models"
-ROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
-OUTPUT_DIR.mkdir(exist_ok=True)
-LYRICS_CACHE_DIR = OUTPUT_DIR / ".lyrics-cache"
-TRANSLATION_CACHE_DIR = OUTPUT_DIR / ".translation-cache"
-MANIFEST_NAME = "job.json"
-
-# Modelos que ofrecemos en la interfaz (nombre -> etiqueta amigable).
-MODELS = ["tiny", "base", "small", "medium", "large-v3", "turbo"]
-MODEL_DETAILS = {
-    "tiny": {
-        "label": "Tiny", "parameters": "39 M", "download": "≈75 MB",
-        "quality": "Básica", "speed": "Muy rápido",
-        "hint": "Para pruebas cortas. Pierde palabras con música o voces débiles.",
-    },
-    "base": {
-        "label": "Base", "parameters": "74 M", "download": "≈145 MB",
-        "quality": "Básica+", "speed": "Muy rápido",
-        "hint": "Algo mejor que Tiny; todavía limitado para canciones y mixes.",
-    },
-    "small": {
-        "label": "Small", "parameters": "244 M", "download": "≈460 MB",
-        "quality": "Media", "speed": "Rápido",
-        "hint": "Buen borrador rápido, pero puede confundir canto y efectos.",
-    },
-    "medium": {
-        "label": "Medium", "parameters": "769 M", "download": "≈1.5 GB",
-        "quality": "Alta", "speed": "Intermedio",
-        "hint": "Buen equilibrio general entre precisión, memoria y tiempo.",
-    },
-    "large-v3": {
-        "label": "Large v3", "parameters": "1,550 M", "download": "≈3 GB",
-        "quality": "Máxima", "speed": "Lento",
-        "hint": "La mayor precisión, especialmente en idiomas y audio difícil.",
-    },
-    "turbo": {
-        "label": "Large v3 Turbo", "parameters": "809 M", "download": "≈1.6 GB",
-        "quality": "Muy alta", "speed": "Rápido",
-        "hint": "Recomendado para mixes largos: deriva de Large v3 y transcribe mucho más rápido.",
-    },
-}
-MODEL_ARTIFACTS = {
-    name: {
-        "openai-whisper": f"OpenAI Whisper/{name}.pt",
-        "faster-whisper": "Systran/faster-whisper-" + (
-            "large-v3-turbo" if name == "turbo" else name),
-        "mlx-whisper": "mlx-community/whisper-" + (
-            "turbo" if name == "turbo" else f"{name}-mlx"),
-    }
-    for name in MODELS
-}
-ASR_ENGINES = {"auto", "mlx-whisper", "faster-whisper", "openai-whisper"}
-
-# Formatos de audio ofrecidos al descargar.
-#   value      -> lo que se le pasa a `yt-dlp --audio-format` ("best" = no recodificar)
-#   lossless   -> no tiene bitrate que elegir
-#   cover      -> el contenedor admite carátula incrustada
-AUDIO_FORMATS = [
-    {"value": "best", "label": "Original (sin recodificar)",
-     "hint": "Tal cual viene de YouTube (opus/m4a). Máxima fidelidad y lo más rápido.",
-     "lossless": True, "cover": True},
-    {"value": "mp3", "label": "MP3",
-     "hint": "El más compatible: suena en cualquier reproductor.",
-     "lossless": False, "cover": True},
-    {"value": "m4a", "label": "M4A (AAC)",
-     "hint": "Mejor calidad que MP3 al mismo peso. Ideal para Apple Music/iPhone.",
-     "lossless": False, "cover": True},
-    {"value": "opus", "label": "Opus",
-     "hint": "El más eficiente: máxima calidad en el menor tamaño.",
-     "lossless": False, "cover": True},
-    {"value": "vorbis", "label": "OGG Vorbis",
-     "hint": "Libre y compatible con Android y reproductores abiertos.",
-     "lossless": False, "cover": True},
-    {"value": "flac", "label": "FLAC",
-     "hint": "Sin pérdida y comprimido. Para archivar o escuchar en alta fidelidad.",
-     "lossless": True, "cover": True},
-    {"value": "alac", "label": "ALAC",
-     "hint": "Sin pérdida de Apple. Para la biblioteca de Música de macOS/iOS.",
-     "lossless": True, "cover": True},
-    {"value": "wav", "label": "WAV",
-     "hint": "Sin comprimir, para editar. Pesa mucho y no admite carátula.",
-     "lossless": True, "cover": False},
-]
-
-# Bitrates para los formatos con pérdida (mp3/m4a/opus/vorbis).
-AUDIO_QUALITIES = ["320K", "256K", "192K", "128K", "96K"]
-
-# Perfiles de aislamiento. BS-RoFormer es la opción de mayor precisión; Demucs
-# queda disponible como alternativa equilibrada o rápida.
-SEPARATION_PROFILES = {
-    "ultra": {
-        "label": "Ultra · BS-RoFormer ×2 (máxima limpieza)",
-        "hint": ("Dos pasadas de BS-RoFormer: la segunda quita el instrumental "
-                 "que sobrevive a la primera. Se queda con la que mide mejor, "
-                 "así que nunca sale peor que Preciso. Tarda el doble."),
-        "engine": "roformer",
-        "passes": 2,
-    },
-    "precise": {
-        "label": "Preciso · BS-RoFormer (recomendado)",
-        "hint": ("Modelo moderno que recupera mejor voces débiles y coros. "
-                 "La primera vez descarga ~610 MB; después queda en caché."),
-        "engine": "roformer",
-        "passes": 1,
-    },
-    "quality": {
-        "label": "Equilibrado · Demucs",
-        "hint": "Demucs con 2 pasadas y mayor solapamiento. Buena calidad, pero puede omitir voces mezcladas como instrumentos.",
-        "engine": "demucs",
-        "shifts": 2,
-        "overlap": 0.5,
-    },
-    "fast": {
-        "label": "Rápido · Demucs",
-        "hint": "Una pasada de Demucs. Más rápido, pero puede dejar voces fantasma o perder palabras.",
-        "engine": "demucs",
-        "shifts": 1,
-        "overlap": 0.25,
-    },
-}
-
-_FORMATS_BY_VALUE = {f["value"]: f for f in AUDIO_FORMATS}
-
-# Idiomas comunes; "" = detección automática. En el modo ultra la detección
-# automática vota entre varios puntos del audio, así que sirve también para
-# ruso, japonés o coreano aunque no estén en esta lista.
-LANGUAGES = [
-    ("", "Auto (detectar)"),
-    ("Spanish", "Español"),
-    ("English", "Inglés"),
-    ("Portuguese", "Portugués"),
-    ("French", "Francés"),
-    ("Italian", "Italiano"),
-    ("German", "Alemán"),
-    ("Japanese", "Japonés"),
-    ("Russian", "Ruso"),
-    ("Korean", "Coreano"),
-    ("Chinese", "Chino"),
-]
-
-# Idiomas de destino para la capa 2 de Lyrixa (la traducción).
-TARGET_LANGUAGES = ["es", "en", "pt", "fr", "it", "de", "ja", "ko", "zh", "ru"]
-
-# Presupuesto de reconocimiento del modo ultra. Los perfiles públicos están
-# acotados a una o tres pasadas; el rescate posterior trabaja solo en ventanas
-# dudosas, no vuelve a recorrer el mix completo.
-PRECISION_LEVELS = {
-    "balanced": {
-        "label": "Equilibrado · 3 pasadas",
-        "hint": ("Tres lecturas decorrelacionadas y una votación. Evita repetir "
-                 "todo el mix cinco veces cuando el stem no puede converger."),
-        "min_passes": 3, "max_passes": 3, "stability": 0.0,
-    },
-    "fast": {
-        "label": "Rápido · 1 pasada",
-        "hint": ("Una lectura fuerte, sin votación. Ideal para revisar un mix "
-                 "antes de invertir tiempo en las zonas difíciles."),
-        "min_passes": 1, "max_passes": 1, "stability": 0.0,
-    },
-    "maximum": {
-        "label": "Máximo útil · 3 pasadas + rescate",
-        "hint": ("Tres votos y revisión selectiva desde el audio original. No "
-                 "añade pasadas globales que ya demostraron no converger."),
-        "min_passes": 3, "max_passes": 3, "stability": 0.0,
-    },
-}
 
 app = FastAPI(title="Transcriptor local")
+
+# Transcriptor es el motor; Lyrixa y el renderer son clientes que corren en
+# sus propios puertos, así que sin CORS no pueden llamarlo desde el navegador.
+# El permiso es solo para localhost (ver `config`): el servidor escucha en
+# loopback, de modo que la única forma de que una página remota llegase aquí
+# sería a través del navegador del usuario, y ese es justo el caso que se
+# niega. Sin credenciales: esta API no usa cookies ni sesiones.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.ALLOWED_ORIGINS,
+    allow_origin_regex=config.ALLOWED_ORIGIN_REGEX,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # job_id -> dict(queue, done, ...)
 JOBS: dict[str, dict] = {}
@@ -262,7 +124,7 @@ def start_caffeinate() -> subprocess.Popen | None:
 def model_cache_path(model: str) -> Path:
     """Ruta donde Whisper guarda el .pt del modelo."""
     url = whisper._MODELS[model]
-    return CACHE_DIR / os.path.basename(url)
+    return paths.CACHE_DIR / os.path.basename(url)
 
 
 def model_is_cached(model: str) -> bool:
@@ -273,7 +135,7 @@ def ensure_model(model: str, emit) -> None:
     """Descarga el modelo con curl si no está en caché (evita el SSL de Python)."""
     if model_is_cached(model):
         return
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    paths.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     url = whisper._MODELS[model]
     target = model_cache_path(model)
     emit("status", stage="downloading_model",
@@ -354,8 +216,8 @@ def recovery_assets(job_id: str) -> dict | None:
     """
     if not _JOB_ID_RE.fullmatch(job_id):
         return None
-    outdir = (OUTPUT_DIR / job_id).resolve()
-    if not outdir.is_dir() or OUTPUT_DIR.resolve() not in outdir.parents:
+    outdir = (paths.OUTPUT_DIR / job_id).resolve()
+    if not outdir.is_dir() or paths.OUTPUT_DIR.resolve() not in outdir.parents:
         return None
 
     asr = outdir / "asr-input.wav"
@@ -393,7 +255,7 @@ def _now() -> str:
 
 def read_manifest(outdir: Path) -> dict:
     try:
-        data = json.loads((outdir / MANIFEST_NAME).read_text(encoding="utf-8"))
+        data = json.loads((outdir / paths.MANIFEST_NAME).read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
@@ -401,15 +263,15 @@ def read_manifest(outdir: Path) -> dict:
 
 def update_manifest(job_id: str, **changes) -> dict:
     """Persist the small part of a job that must survive a server restart."""
-    outdir = OUTPUT_DIR / job_id
+    outdir = paths.OUTPUT_DIR / job_id
     outdir.mkdir(parents=True, exist_ok=True)
     manifest = read_manifest(outdir)
     manifest.update(changes)
     manifest.setdefault("id", job_id)
     manifest.setdefault("createdAt", _now())
     manifest["updatedAt"] = _now()
-    target = outdir / MANIFEST_NAME
-    temporary = outdir / f".{MANIFEST_NAME}.tmp"
+    target = outdir / paths.MANIFEST_NAME
+    temporary = outdir / f".{paths.MANIFEST_NAME}.tmp"
     temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
                          encoding="utf-8")
     temporary.replace(target)
@@ -507,7 +369,7 @@ def prepare_track_guide(outdir: Path, text: str, duration: float,
 
     guide = track_guides.build_guide(
         incoming, duration, fetch_lyrics=fetch_lyrics,
-        cache_dir=LYRICS_CACHE_DIR, progress=progress,
+        cache_dir=paths.LYRICS_CACHE_DIR, progress=progress,
     )
     if not guide:
         raise RuntimeError(
@@ -530,19 +392,19 @@ def _archive_outputs(outdir: Path) -> int:
     # sus resultados permite saber después qué modelo, motor y opciones los
     # produjeron.
     archive.mkdir(parents=True, exist_ok=True)
-    if (outdir / MANIFEST_NAME).is_file():
-        shutil.copy2(outdir / MANIFEST_NAME, archive / "run.json")
+    if (outdir / paths.MANIFEST_NAME).is_file():
+        shutil.copy2(outdir / paths.MANIFEST_NAME, archive / "run.json")
     candidates: list[Path] = []
     for path in outdir.iterdir():
         if not path.is_file() or path.name in {
-            MANIFEST_NAME, "track-guide.json", "tracklist.txt", "asr-input.wav",
+            paths.MANIFEST_NAME, "track-guide.json", "tracklist.txt", "asr-input.wav",
         }:
             continue
         name = path.name.lower()
         if (path.suffix.lower() in {".srt", ".vtt", ".tsv"}
                 or name.endswith(".lyrixa.json")
                 or name.endswith(".letra.txt")
-                or (path.suffix.lower() == ".json" and name != MANIFEST_NAME)
+                or (path.suffix.lower() == ".json" and name != paths.MANIFEST_NAME)
                 or path.suffix.lower() == ".txt"):
             candidates.append(path)
     if candidates:
@@ -574,7 +436,7 @@ def _discover_result_files(job_id: str, outdir: Path, assets: dict | None) -> di
         "vtt": newest(lambda p: p.suffix.lower() == ".vtt"),
         "tsv": newest(lambda p: p.suffix.lower() == ".tsv"),
         "json": newest(lambda p: p.suffix.lower() == ".json" and
-                       p.name not in {MANIFEST_NAME, "track-guide.json"} and
+                       p.name not in {paths.MANIFEST_NAME, "track-guide.json"} and
                        not p.name.endswith(".lyrixa.json")),
         "txt": newest(lambda p: p.suffix.lower() == ".txt" and
                       p.name != "tracklist.txt" and
@@ -598,6 +460,45 @@ def _discover_result_files(job_id: str, outdir: Path, assets: dict | None) -> di
             "url": f"/api/jobs/{job_id}/stems/instrumental",
         }
     return files
+
+
+def lyrixa_project_path(job_id: str) -> Path | None:
+    """El `.lyrixa.json` más reciente de un trabajo, o None."""
+    if not _JOB_ID_RE.fullmatch(job_id):
+        return None
+    outdir = (paths.OUTPUT_DIR / job_id).resolve()
+    if not outdir.is_dir() or paths.OUTPUT_DIR.resolve() not in outdir.parents:
+        return None
+    matches = [path for path in outdir.iterdir()
+               if path.is_file() and path.name.endswith(".lyrixa.json")]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def job_links(job_id: str, files: dict) -> dict:
+    """Rutas estables de un trabajo, para que nadie tenga que componerlas.
+
+    Un cliente que arme `/download/{id}/{nombre}` depende del nombre del
+    archivo, que sale del título del vídeo y cambia en cada iteración. Estas
+    rutas no cambian. Son relativas a propósito: se resuelven contra la base
+    por la que el cliente llegó, así que `localhost` y `127.0.0.1` siguen
+    siendo el mismo origen para el navegador.
+    """
+    links = {
+        "self": f"/api/jobs/{job_id}",
+        "events": f"/api/jobs/{job_id}/events",
+        # Absoluta: apunta a otra aplicación, no a esta API.
+        "openInLyrixa": config.lyrixa_open_url(job_id),
+    }
+    if files.get("lyrixa"):
+        links["lyrixa"] = f"/api/jobs/{job_id}/lyrixa"
+    if files.get("audio"):
+        links["audio"] = f"/api/jobs/{job_id}/audio"
+    for stem in ("vocals", "instrumental"):
+        if files.get(stem):
+            links[stem] = f"/api/jobs/{job_id}/stems/{stem}"
+    return links
 
 
 def saved_job(job_id: str) -> dict | None:
@@ -647,6 +548,7 @@ def saved_job(job_id: str) -> dict | None:
         "timing": manifest.get("timing") or {},
         "precision": manifest.get("precision") or {},
         "diskBytes": disk_bytes,
+        "links": job_links(job_id, files),
     }
 
 
@@ -844,7 +746,7 @@ def demucs_available() -> bool:
 
 def roformer_available() -> bool:
     """¿Está instalado el separador moderno en su entorno aislado?"""
-    return ROFORMER_CLI.is_file() and os.access(ROFORMER_CLI, os.X_OK)
+    return paths.ROFORMER_CLI.is_file() and os.access(paths.ROFORMER_CLI, os.X_OK)
 
 
 @lru_cache(maxsize=1)
@@ -854,7 +756,7 @@ def separator_acceleration() -> dict:
         return {"mode": "unavailable", "accelerated": False}
     try:
         proc = subprocess.run(
-            [str(ROFORMER_CLI), "--env_info"], capture_output=True, text=True,
+            [str(paths.ROFORMER_CLI), "--env_info"], capture_output=True, text=True,
             timeout=12,
         )
         report = f"{proc.stdout}\n{proc.stderr}"
@@ -981,7 +883,7 @@ def separate_vocals_roformer(
             "./setup_separator.sh"
         )
 
-    model_cached = (ROFORMER_MODEL_DIR / ROFORMER_MODEL).is_file()
+    model_cached = (paths.ROFORMER_MODEL_DIR / paths.ROFORMER_MODEL).is_file()
     if model_cached:
         emit("status", stage="separating",
              message="Separando la voz con BS-RoFormer (puede tardar)…")
@@ -992,11 +894,11 @@ def separate_vocals_roformer(
 
     sep_dir = outdir / tag
     sep_dir.mkdir(parents=True, exist_ok=True)
-    ROFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    paths.ROFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [
-        str(ROFORMER_CLI), str(audio),
-        "--model_filename", ROFORMER_MODEL,
-        "--model_file_dir", str(ROFORMER_MODEL_DIR),
+        str(paths.ROFORMER_CLI), str(audio),
+        "--model_filename", paths.ROFORMER_MODEL,
+        "--model_file_dir", str(paths.ROFORMER_MODEL_DIR),
         "--output_dir", str(sep_dir),
         "--output_format", "WAV",
         # Los mixes de una hora pueden ocupar varios GB al convertirse a
@@ -1144,7 +1046,7 @@ def run_whisper(audio: Path, model: str, language: str, outdir: Path,
     """
     cmd = ["whisper", str(audio), "--model", model,
            "--output_format", "all", "--output_dir", str(outdir),
-           "--verbose", "True", "--model_dir", str(CACHE_DIR),
+           "--verbose", "True", "--model_dir", str(paths.CACHE_DIR),
            # Tiempos por palabra: bordes de segmento más precisos (al ms) y
            # habilita words[] en el JSON para el puente con Lyrixa.
            "--word_timestamps", "True",
@@ -1354,7 +1256,7 @@ def translate_clip_lines(lines: list[str], languages: list[str | None], *,
         try:
             result = translation.translate(
                 [lines[i] for i in indices], source=code, target=target,
-                cache_dir=TRANSLATION_CACHE_DIR,
+                cache_dir=paths.TRANSLATION_CACHE_DIR,
                 progress=lambda p: emit("progress", stage="translating",
                                         progress=p),
             )
@@ -1473,7 +1375,7 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
     # Mantiene la Mac despierta durante todo el trabajo.
     caffeinate = start_caffeinate()
 
-    outdir = OUTPUT_DIR / job_id
+    outdir = paths.OUTPUT_DIR / job_id
     outdir.mkdir(parents=True, exist_ok=True)
     update_manifest(job_id, status="running", error=None,
                     startedAt=_now(), finishedAt=None)
@@ -1849,9 +1751,40 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
 # --------------------------------------------------------------------------- #
 # Rutas
 # --------------------------------------------------------------------------- #
+_AUDIO_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".mp4": "video/mp4",
+    ".opus": "audio/opus", ".ogg": "audio/ogg", ".oga": "audio/ogg",
+    ".flac": "audio/flac", ".wav": "audio/wav", ".aac": "audio/aac",
+    ".webm": "video/webm", ".mkv": "video/x-matroska",
+}
+
+# Un tope para que una llamada equivocada no ocupe Ollama media hora. Una capa
+# entera de un mix de tres horas cabe de sobra.
+MAX_TRANSLATE_LINES = 4000
+
+
+def audio_media_type(path: Path) -> str:
+    return _AUDIO_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
+
+
+class TranslateRequest(BaseModel):
+    """Una línea suelta (`text`) o una capa entera (`lines`)."""
+
+    text: str | None = None
+    lines: list[str] | None = None
+    sourceLanguage: str | None = None
+    targetLanguage: str | None = None
+    romaji: bool = False
+
+    def payload_lines(self) -> list[str]:
+        if self.lines is not None:
+            return self.lines
+        return [self.text] if self.text is not None else []
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    return (paths.STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
 @app.get("/api/info")
@@ -1921,13 +1854,21 @@ def info():
             "available": translation.translation_available(),
             "model": translation.pick_model(),
         },
+        # Lo que un cliente necesita para integrarse sin adivinar puertos.
+        "service": {
+            **config.as_dict(),
+            "bridgeSchemaVersion": lyrixa_bridge.BRIDGE_SCHEMA_VERSION,
+            "layerRoles": list(lyrixa_bridge.LAYER_ROLES),
+            "translationLanguages": sorted(translation.LANGUAGE_NAMES),
+            "romanizable": sorted(translation.ROMANIZABLE),
+        },
     })
 
 
 @app.get("/api/jobs")
 def list_saved_jobs():
     jobs = []
-    for outdir in OUTPUT_DIR.iterdir():
+    for outdir in paths.OUTPUT_DIR.iterdir():
         if not outdir.is_dir() or not _JOB_ID_RE.fullmatch(outdir.name):
             continue
         record = saved_job(outdir.name)
@@ -1942,7 +1883,7 @@ def saved_job_detail(job_id: str):
     record = saved_job(job_id)
     if record is None:
         return JSONResponse({"error": "job no existe"}, status_code=404)
-    tracklist = OUTPUT_DIR / job_id / "tracklist.txt"
+    tracklist = paths.OUTPUT_DIR / job_id / "tracklist.txt"
     record["tracklistText"] = (
         tracklist.read_text(encoding="utf-8") if tracklist.is_file() else ""
     )
@@ -1960,8 +1901,8 @@ def delete_saved_job(job_id: str):
             {"error": "El trabajo sigue en curso. Espera a que termine o detén el servidor."},
             status_code=409,
         )
-    outdir = (OUTPUT_DIR / job_id).resolve()
-    if not outdir.is_dir() or OUTPUT_DIR.resolve() not in outdir.parents:
+    outdir = (paths.OUTPUT_DIR / job_id).resolve()
+    if not outdir.is_dir() or paths.OUTPUT_DIR.resolve() not in outdir.parents:
         return JSONResponse({"error": "El trabajo ya no existe."}, status_code=404)
     shutil.rmtree(outdir)
     JOBS.pop(job_id, None)
@@ -2044,7 +1985,7 @@ async def create_job(
 
     job_id = uuid.uuid4().hex[:12]
     upload_path = None
-    outdir = OUTPUT_DIR / job_id
+    outdir = paths.OUTPUT_DIR / job_id
     outdir.mkdir(parents=True, exist_ok=True)
     if source_type == "file":
         # Nunca confiamos en el nombre que manda el navegador para armar rutas.
@@ -2272,11 +2213,136 @@ def events(job_id: str, request: Request):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+@app.get("/api/health")
+def health():
+    """¿Está vivo el motor? Lo primero que preguntará una shell de escritorio.
+
+    Deliberadamente barato: no toca disco ni consulta a Ollama, porque un
+    supervisor lo va a llamar en bucle mientras arranca.
+    """
+    return {
+        "status": "ok",
+        "service": "transcriptor",
+        "bridgeSchemaVersion": lyrixa_bridge.BRIDGE_SCHEMA_VERSION,
+        "publicUrl": config.PUBLIC_URL,
+    }
+
+
+@app.get("/api/jobs/{job_id}/lyrixa")
+def lyrixa_project(job_id: str, download: bool = False):
+    """El proyecto Lyrixa de este trabajo, por id y no por nombre de archivo.
+
+    Se sirve como archivo en vez de releerlo y volver a serializarlo: en un mix
+    de tres horas el envelope pesa varios megas y volver a construirlo no
+    añadiría nada.
+    """
+    path = lyrixa_project_path(job_id)
+    if path is None:
+        return JSONResponse(
+            {"error": "Este trabajo todavía no tiene proyecto de Lyrixa."},
+            status_code=404,
+        )
+    return FileResponse(
+        path, media_type="application/json",
+        filename=path.name if download else None,
+    )
+
+
+@app.get("/api/jobs/{job_id}/audio")
+def job_audio(job_id: str, download: bool = False):
+    """El audio original del trabajo, para que Lyrixa no lo pida a mano.
+
+    `FileResponse` responde a `Range`, así que un `<audio>` puede buscar dentro
+    de una mezcla de tres horas sin descargarla entera.
+    """
+    assets = recovery_assets(job_id)
+    original = (assets or {}).get("original")
+    if original is None:
+        return JSONResponse({"error": "No hay audio original guardado."},
+                            status_code=404)
+    return FileResponse(
+        original, media_type=audio_media_type(original),
+        filename=original.name if download else None,
+    )
+
+
+@app.post("/api/translate")
+def translate_text(request: TranslateRequest):
+    """Traducción y romaji como servicio, con el mismo motor que el pipeline.
+
+    Lyrixa corrige una línea a mano y necesita su traducción sin volver a
+    transcribir nada. Que llame aquí es lo que evita que acabe con su propia
+    copia de la configuración de Ollama, del pivote por inglés y del romaji.
+    """
+    lines = request.payload_lines()
+    if not lines:
+        return JSONResponse({"error": "No hay texto que traducir."},
+                            status_code=400)
+    if len(lines) > MAX_TRANSLATE_LINES:
+        return JSONResponse(
+            {"error": f"Máximo {MAX_TRANSLATE_LINES} líneas por llamada."},
+            status_code=413,
+        )
+
+    source = translation.normalize_code(request.sourceLanguage)
+    target = translation.normalize_code(request.targetLanguage)
+    if target and target not in translation.LANGUAGE_NAMES:
+        return JSONResponse(
+            {"error": f"Idioma de destino desconocido: {request.targetLanguage}"},
+            status_code=400,
+        )
+    if not target and not request.romaji:
+        return JSONResponse({"error": "Elige un idioma o activa romaji."},
+                            status_code=400)
+
+    out: dict = {"sourceLanguage": source, "targetLanguage": target,
+                 "lines": None, "romaji": None, "route": [], "routeLabel": None,
+                 "backend": None, "romajiBackend": None}
+
+    if request.romaji:
+        try:
+            converted, backend = translation.romanize(lines)
+        except translation.TranslationUnavailable as error:
+            return JSONResponse({"error": str(error)}, status_code=503)
+        except Exception as error:  # noqa: BLE001
+            return JSONResponse({"error": str(error)}, status_code=502)
+        out["romaji"] = converted
+        out["romajiBackend"] = backend
+
+    if target:
+        route = translation.plan_route(source, target)
+        if not route:
+            # Ya está en el idioma pedido: devolverlo tal cual es la respuesta
+            # correcta, no un error.
+            out["lines"] = list(lines)
+        else:
+            try:
+                result = translation.translate(
+                    lines, source=source, target=target,
+                    cache_dir=paths.TRANSLATION_CACHE_DIR)
+            except translation.TranslationUnavailable as error:
+                return JSONResponse({"error": str(error)}, status_code=503)
+            except Exception as error:  # noqa: BLE001
+                return JSONResponse({"error": str(error)}, status_code=502)
+            out["lines"] = result["lines"]
+            out["backend"] = result["backend"]
+            out["route"] = [list(step) for step in route]
+            out["routeLabel"] = translation.route_label(route)
+
+    if request.text is not None:
+        # Petición de una sola línea: se responde en la misma forma en que
+        # llegó, para que el cliente no tenga que desenvolver una lista de uno.
+        out["text"] = (out["lines"] or lines)[0]
+        if out["romaji"]:
+            out["romajiText"] = out["romaji"][0]
+    return out
+
+
 @app.get("/download/{job_id}/{name}")
 def download(job_id: str, name: str):
     # El nombre viene de la URL: nos quedamos solo con el archivo y verificamos
     # que el resultado siga dentro de la carpeta del job (nada de "../").
-    job_dir = (OUTPUT_DIR / job_id).resolve()
+    job_dir = (paths.OUTPUT_DIR / job_id).resolve()
     path = (job_dir / Path(name).name).resolve()
     if not path.is_file() or job_dir not in path.parents:
         return JSONResponse({"error": "no existe"}, status_code=404)
@@ -2293,7 +2359,7 @@ def download_stem(job_id: str, stem: str):
     target_names = names.get(stem)
     if target_names is None:
         return JSONResponse({"error": "pista desconocida"}, status_code=404)
-    job_dir = (OUTPUT_DIR / job_id).resolve()
+    job_dir = (paths.OUTPUT_DIR / job_id).resolve()
     matches = []
     job = JOBS.get(job_id)
     stored = (job or {}).get("stem_paths", {}).get(stem)
@@ -2317,4 +2383,4 @@ def download_stem(job_id: str, stem: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=config.HOST, port=config.PORT)

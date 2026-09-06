@@ -74,6 +74,13 @@ NON_LATIN_SOURCES = {
 # Languages that need transliteration to be readable in Latin script.
 ROMANIZABLE = {"ja"}
 
+# The caller does not know what language the text is in.  Routine once
+# translation is a service: the transcription knew the language of every line,
+# an editor asking to re-translate one edited line usually does not.
+AUTO_SOURCE = "auto"
+# What the codes nobody should treat as a language look like in the wild.
+_UNKNOWN_CODES = {"auto", "und", "unknown", "detect"}
+
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 # `1| text`, and the shapes models drift into: `1. text`, `1) text`,
 # `[1] text`, `(1) text`.  A bare number needs a separator after it so that a
@@ -187,6 +194,13 @@ def parse_numbered(reply: str, expected: int) -> dict[int, str]:
         if 1 <= index <= expected:
             out[index] = match.group("text").strip()
     return out
+
+
+def _language_name(code: str) -> str:
+    """The name the prompt uses for a language code."""
+    if code == AUTO_SOURCE:
+        return "their original language"
+    return LANGUAGE_NAMES.get(code, code)
 
 
 def _system_prompt(source_name: str, target_name: str) -> str:
@@ -327,7 +341,7 @@ def normalize_code(language: str | None) -> str | None:
     if not language:
         return None
     code = language.strip().lower().replace("_", "-")
-    if not code:
+    if not code or code in _UNKNOWN_CODES:
         return None
     # Whisper reports both "es" and "spanish" depending on the runtime.
     if len(code) > 3:
@@ -339,6 +353,8 @@ def normalize_code(language: str | None) -> str | None:
 
 
 def language_label(code: str | None) -> str:
+    if code == AUTO_SOURCE:
+        return "Idioma detectado"
     code = normalize_code(code)
     if not code:
         return "desconocido"
@@ -346,10 +362,20 @@ def language_label(code: str | None) -> str:
 
 
 def plan_route(source: str | None, target: str | None) -> list[tuple[str, str]]:
-    """The hops needed to get from `source` to `target`."""
+    """The hops needed to get from `source` to `target`.
+
+    An unknown source still gets translated — returning "nothing to do" would
+    hand the caller its own text back and let it believe that was the
+    translation.  It gets a single hop: pivoting is a decision about the
+    script, and guessing the script wrong is worse than not pivoting.
+    """
     source = normalize_code(source)
     target = normalize_code(target)
-    if not source or not target or source == target:
+    if not target:
+        return []
+    if not source:
+        return [(AUTO_SOURCE, target)]
+    if source == target:
         return []
     if source in NON_LATIN_SOURCES and target != "en":
         return [(source, "en"), ("en", target)]
@@ -428,10 +454,8 @@ def translate(lines: list[str], *, source: str | None, target: str,
     current = list(lines)
     hops = len(route)
     for index, (hop_source, hop_target) in enumerate(route):
-        system = _system_prompt(
-            LANGUAGE_NAMES.get(hop_source, hop_source),
-            LANGUAGE_NAMES.get(hop_target, hop_target),
-        )
+        system = _system_prompt(_language_name(hop_source),
+                                _language_name(hop_target))
 
         def hop_progress(done: int, total: int, _i=index) -> None:
             if progress:

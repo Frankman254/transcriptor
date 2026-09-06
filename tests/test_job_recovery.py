@@ -11,6 +11,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "webapp"))
 
+import paths  # noqa: E402
 import server  # noqa: E402
 
 
@@ -20,7 +21,7 @@ class JobRecoveryTests(unittest.TestCase):
         server.JOBS.clear()
         self.temp = tempfile.TemporaryDirectory()
         self.output = Path(self.temp.name)
-        self.output_patch = mock.patch.object(server, "OUTPUT_DIR", self.output)
+        self.output_patch = mock.patch.object(paths, "OUTPUT_DIR", self.output)
         self.output_patch.start()
 
     def tearDown(self):

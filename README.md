@@ -103,6 +103,33 @@ sin repetir la separación ni Whisper:
   verifican; si algo falla se reintenta línea a línea y, en último caso, se
   conserva el original. Una capa desplazada rompería toda la sincronía.
 
+## Motor local: la API
+
+El Transcriptor no es «la web del 8000»: es el motor, y la interfaz HTML es
+solo uno de sus clientes. Lyrixa y el renderer son los otros, y hablan con él
+por HTTP sin que nadie tenga que buscar archivos a mano.
+
+| Ruta | Para qué |
+|------|----------|
+| `GET /api/health` | ¿Está vivo el motor? Lo primero que pregunta un lanzador. |
+| `GET /api/jobs/{id}` | Metadata del trabajo, con un bloque `links`. |
+| `GET /api/jobs/{id}/lyrixa` | El proyecto `.lyrixa.json`, por id y no por nombre de archivo. |
+| `GET /api/jobs/{id}/audio` | El audio original. Responde a `Range`, así que se puede buscar dentro de una mezcla de tres horas sin descargarla. |
+| `POST /api/translate` | Traducción y romaji como servicio, con el mismo motor que usa el pipeline. |
+
+Nada de esto lleva un puerto escrito dentro: `TRANSCRIPTOR_HOST`,
+`TRANSCRIPTOR_PORT` y `TRANSCRIPTOR_LYRIXA_URL` los decide quien arranque el
+proceso, y `GET /api/info` devuelve los valores resueltos en su bloque
+`service`. Una futura shell de escritorio podrá levantar los tres procesos en
+los puertos que elija.
+
+El permiso de CORS es solo para `localhost`. El servidor escucha en loopback,
+de modo que el único riesgo real sería una página remota usando el navegador
+del usuario como puente — y ese es justo el caso que se niega.
+
+El contrato completo, con lo que falta implementar del lado de Lyrixa, está en
+[`docs/contrato-lyrixa.md`](docs/contrato-lyrixa.md).
+
 ## Puente hacia Lyrixa
 
 Además de conservar las salidas originales de Whisper, cada transcripción
@@ -128,8 +155,12 @@ Con traducción activa, el proyecto llega a Lyrixa con **dos capas de texto**:
 | `layer-main` | `primary` | La letra (romaji si el original era japonés) |
 | `layer-backing` | `translation` | La traducción, con los mismos tiempos al ms |
 
-Cada clip traducido apunta con `sourceId` al clip que traduce, así que las dos
-capas siguen emparejadas aunque después edites los tiempos.
+Cada línea de letra tiene una **identidad propia** (`line-000042`) que las dos
+capas comparten en su `sourceId`, así que siguen emparejadas aunque después
+edites los tiempos o reordenes los clips. La identidad se acuña cuando la
+segmentación ya decidió cuáles son las líneas: un segmento de Whisper partido
+en tres son tres líneas distintas, y numerarlas por su origen les daría la
+misma. En una mezcla real de una hora eso afectaba al 21% de los clips.
 
 Las dos capas de texto salen **en anclas distintas** (letra abajo, traducción
 arriba). Los dos renderizadores colocan los clips de una capa de forma absoluta

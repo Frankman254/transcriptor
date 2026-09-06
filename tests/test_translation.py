@@ -58,8 +58,12 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(T.plan_route("Spanish", "es"), [])
         self.assertEqual(T.route_label([]), "sin traducción")
 
-    def test_a_missing_end_of_the_route_means_no_route(self):
-        self.assertEqual(T.plan_route(None, "es"), [])
+    def test_without_a_target_there_is_no_route_but_an_unknown_source_still_routes(self):
+        # Un origen desconocido sí se traduce: devolver el texto tal cual
+        # sería dejar que quien llama crea que eso es la traducción.
+        self.assertEqual(T.plan_route(None, "es"), [(T.AUTO_SOURCE, "es")])
+        self.assertEqual(T.plan_route("auto", "es"), [(T.AUTO_SOURCE, "es")])
+        self.assertEqual(T.plan_route("es", None), [])
         self.assertEqual(T.plan_route("ru", ""), [])
 
 

@@ -71,11 +71,51 @@ CLIP_TAIL_HOLD = 0.7
 # its successor by this much.
 CLIP_HANDOVER_GAP = 0.05
 
-BRIDGE_SCHEMA_VERSION = 2
+# v3 replaced the overloaded `sourceId` with a real line identity.  A
+# consumer that only reads text and times does not care; one that pairs layers
+# does, and needs to know which contract it is looking at.
+BRIDGE_SCHEMA_VERSION = 3
 
 MAIN_LAYER_ID = "layer-main"
 TRANSLATION_LAYER_ID = "layer-backing"
 FX_LAYER_ID = "layer-fx"
+
+# Lyrixa's own vocabulary (src/core/types/layer.ts).  It says
+# `transliteration`, not `romanization`; an unknown role is dropped on import,
+# so this list is a mirror and not a place to invent a seventh value.
+LAYER_ROLES = ("primary", "translation", "transliteration", "backing", "fx",
+               "annotation")
+
+# The channel a clip belongs to, as it appears in its id.  Only cosmetic —
+# `layerId` is what actually assigns a clip to a layer — but a project opened
+# in an editor is read by people, and `clip-es-000042` says what
+# `clip-0042-t` did not.
+MAIN_CHANNEL = "main"
+TRANSLATION_CHANNEL_FALLBACK = "tr"
+
+_CHANNEL_UNSAFE = re.compile(r"[^a-z0-9]+")
+
+
+def line_id(index: int) -> str:
+    """The stable identity of one lyric line, shared by every layer.
+
+    Minted here and nowhere else, and only *after* segmentation has decided
+    what the lines are: a line born from splitting Whisper segment 7 in three
+    is three lines, and numbering them by their origin would give all three the
+    same identity.  Lyrixa looks clips up by `(layerId, sourceId)`
+    (`src/core/timeline/tapSync.ts`), so a repeated value there silently
+    resolves to the wrong clip.
+    """
+    return f"line-{index:06d}"
+
+
+def channel_slug(language: str | None, fallback: str) -> str:
+    slug = _CHANNEL_UNSAFE.sub("-", (language or "").strip().lower()).strip("-")
+    return slug or fallback
+
+
+def clip_id(channel: str, index: int) -> str:
+    return f"clip-{channel}-{index:06d}"
 
 _STRONG_PUNCTUATION = re.compile(r"[.!?…。！？][\"'’”)\]}]*$")
 _WEAK_PUNCTUATION = re.compile(r"[,;:،؛，、—–-][\"'’”)\]}]*$")
@@ -118,7 +158,9 @@ def _fallback_clip(segment: dict[str, Any], segment_index: int) -> dict[str, Any
         "text": text,
         "startTime": _round_time(start),
         "endTime": _round_time(end),
-        "sourceId": f"segment-{segment_index}",
+        # Which Whisper segment this came from.  Provenance, not identity:
+        # several lines legitimately share one segment.
+        "segmentIndex": segment_index,
     }
     if segment.get("language"):
         clip["language"] = segment["language"]
@@ -318,7 +360,7 @@ def segment_whisper_segment(
             "text": _join_tokens(word["_raw"] for word in chunk),
             "startTime": chunk[0]["startTime"],
             "endTime": chunk[-1]["endTime"],
-            "sourceId": f"segment-{segment_index}",
+            "segmentIndex": segment_index,
             "words": [
                 {
                     "text": word["text"],
@@ -349,8 +391,9 @@ def _merge_clips(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
         "startTime": min(left["startTime"], right["startTime"]),
         "endTime": max(left["endTime"], right["endTime"]),
     }
-    if left.get("sourceId") != right.get("sourceId"):
-        merged.pop("sourceId", None)
+    if left.get("segmentIndex") != right.get("segmentIndex"):
+        # A line stitched from two Whisper segments belongs to neither.
+        merged.pop("segmentIndex", None)
     words = [*(left.get("words") or []), *(right.get("words") or [])]
     if words:
         merged["words"] = words
@@ -411,8 +454,9 @@ def normalize_whisper_segments(segments: Any,
     final: list[dict[str, Any]] = []
     for index, clip in enumerate(normalized):
         final.append({
-            "id": f"clip-{index:04d}",
             **clip,
+            "id": clip_id(MAIN_CHANNEL, index),
+            "sourceId": line_id(index),
             "sourceIndex": index,
             "layerId": MAIN_LAYER_ID,
             "createdBy": "import",
@@ -468,24 +512,30 @@ def apply_romaji(clips: list[dict[str, Any]],
     return out
 
 
-def translation_clips(clips: list[dict[str, Any]],
-                      translations: list[str]) -> list[dict[str, Any]]:
+def translation_clips(clips: list[dict[str, Any]], translations: list[str],
+                      *, language: str | None = None,
+                      ) -> list[dict[str, Any]]:
     """Mirror the main clips onto the translation layer, timing untouched.
 
-    One translated line per main clip, sharing `sourceId` so both layers can be
-    edited (or re-timed) together in Lyrixa without re-running the alignment.
+    One translated line per main clip, carrying *the same* `sourceId` — not the
+    main clip's id.  The two are different things: the id says which box on the
+    timeline this is, the `sourceId` says which lyric line it renders.  Pairing
+    the layers through the id worked only until someone re-cut or replaced a
+    clip in Lyrixa, and it left the main layer pointing at Whisper segments
+    while the translation layer pointed at clips.
     """
     out: list[dict[str, Any]] = []
+    channel = channel_slug(language, TRANSLATION_CHANNEL_FALLBACK)
     for clip, text in zip(clips, translations):
         text = (text or "").strip()
         if not text:
             continue
         out.append({
-            "id": f"{clip['id']}-t",
+            "id": clip_id(channel, clip["sourceIndex"]),
             "text": text,
             "startTime": clip["startTime"],
             "endTime": clip["endTime"],
-            "sourceId": clip["id"],
+            "sourceId": clip["sourceId"],
             "sourceIndex": clip["sourceIndex"],
             "layerId": TRANSLATION_LAYER_ID,
             "createdBy": "import",
@@ -497,7 +547,8 @@ def translation_clips(clips: list[dict[str, Any]],
 
 
 def build_layers(*, source_language: str | None, translation_language: str | None,
-                 translation_name: str | None = None) -> list[dict[str, Any]]:
+                 translation_name: str | None = None,
+                 romanized: bool = False) -> list[dict[str, Any]]:
     """The three Lyrixa channels, with the roles this bridge assigns them.
 
     `role` and `language` are additive fields: Lyrixa passes unknown layer keys
@@ -509,7 +560,12 @@ def build_layers(*, source_language: str | None, translation_language: str | Non
         "id": MAIN_LAYER_ID,
         "name": "Letra original",
         "layerType": "lyrics",
+        # Still `primary`, not `transliteration`: this is the lead vocal line,
+        # and a renderer that hides transliteration channels must not hide the
+        # only lyric on screen.  That the script was swapped is said by
+        # `romanized` here and by `originalText` on each clip.
         "role": "primary",
+        "romanized": romanized,
         "language": source_language,
         "color": "#2e7afb",
         "visible": True,
@@ -574,7 +630,9 @@ def build_lyrixa_envelope(
     if romaji:
         clips = apply_romaji(clips, romaji)
     lines = [clip["text"] for clip in clips]
-    translated = translation_clips(clips, translations) if translations else []
+    translated = (translation_clips(clips, translations,
+                                    language=translation_language)
+                  if translations else [])
     timestamp = exported_at or datetime.now(timezone.utc).isoformat()
     detected_language = language or whisper_data.get("language") or None
     audio_tracks = {
@@ -611,6 +669,7 @@ def build_lyrixa_envelope(
             "layers": build_layers(
                 source_language=detected_language,
                 translation_language=translation_language,
+                romanized=bool(romaji),
             ),
             "clips": [*clips, *translated],
             "currentTime": 0,

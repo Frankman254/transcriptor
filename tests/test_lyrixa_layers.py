@@ -171,7 +171,9 @@ class TwoLayerEnvelopeTests(unittest.TestCase):
         translated = [c for c in clips if c["layerId"] == TRANSLATION_LAYER_ID]
         self.assertEqual(len(main), len(translated))
         for source, target in zip(main, translated):
-            self.assertEqual(target["sourceId"], source["id"])
+            # The shared identity is the *line*, not the main clip's id.
+            self.assertEqual(target["sourceId"], source["sourceId"])
+            self.assertNotEqual(target["id"], source["id"])
             self.assertEqual(target["startTime"], source["startTime"])
             self.assertEqual(target["endTime"], source["endTime"])
 

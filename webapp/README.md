@@ -223,6 +223,29 @@ rescate revisa como máximo 24 zonas desde el audio original; si el modelo
 principal es Turbo usa `large-v3` únicamente allí. Para una revisión inicial,
 Rápido hace una sola lectura. La traducción no suma tiempo salvo que la elijas.
 
+## La API local
+
+`server.py` sirve la interfaz HTML, pero no depende de que esté abierta: los
+trabajos corren en su propio hilo y el SSE es solo una ventana a lo que ya está
+pasando. Cerrar la pestaña no detiene nada.
+
+Además de los endpoints que usa la interfaz, hay cuatro pensados para otros
+programas:
+
+- `GET /api/health` — barato a propósito: no toca disco ni consulta a Ollama,
+  porque un supervisor lo va a llamar en bucle mientras arranca.
+- `GET /api/jobs/{id}/lyrixa` — el `.lyrixa.json` por id. Se sirve como archivo
+  en vez de releerlo y re-serializarlo: en un mix de tres horas el envelope
+  pesa varios megas.
+- `GET /api/jobs/{id}/audio` — el audio original con soporte de `Range`.
+- `POST /api/translate` — el mismo `translation.py` que usa el pipeline,
+  expuesto para que Lyrixa no acabe con su propia copia de la configuración de
+  Ollama, del pivote por inglés y del romaji.
+
+Puertos, URL pública, dónde vive Lyrixa y quién puede llamar por CORS salen de
+`config.py` y de variables de entorno. Ver
+[`../docs/contrato-lyrixa.md`](../docs/contrato-lyrixa.md).
+
 ## Modelos
 | Modelo | Calidad | Velocidad (CPU) |
 |--------|---------|-----------------|
