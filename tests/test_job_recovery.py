@@ -14,13 +14,14 @@ sys.path.insert(0, str(ROOT / "webapp"))
 import jobstore  # noqa: E402
 import media  # noqa: E402
 import paths  # noqa: E402
-import server  # noqa: E402
+import routes_jobs  # noqa: E402
 
 
 class JobRecoveryTests(unittest.TestCase):
     def setUp(self):
-        self.previous_jobs = server.JOBS.copy()
-        server.JOBS.clear()
+        self.previous_jobs = {j: routes_jobs.hub.get(j)
+                              for j in routes_jobs.hub._jobs}
+        routes_jobs.hub._jobs.clear()
         self.temp = tempfile.TemporaryDirectory()
         self.output = Path(self.temp.name)
         self.output_patch = mock.patch.object(paths, "OUTPUT_DIR", self.output)
@@ -29,8 +30,9 @@ class JobRecoveryTests(unittest.TestCase):
     def tearDown(self):
         self.output_patch.stop()
         self.temp.cleanup()
-        server.JOBS.clear()
-        server.JOBS.update(self.previous_jobs)
+        routes_jobs.hub._jobs.clear()
+        routes_jobs.hub._jobs.update(
+            {k: v for k, v in self.previous_jobs.items() if v is not None})
 
     def make_interrupted_job(self, job_id="a1b2c3d4e5f6"):
         outdir = self.output / job_id
@@ -55,7 +57,7 @@ class JobRecoveryTests(unittest.TestCase):
     def test_state_marks_a_disk_checkpoint_as_interrupted_and_recoverable(self):
         job_id, _ = self.make_interrupted_job()
         with mock.patch.object(media, "ffprobe_duration", return_value=10.0):
-            response = server.job_state(job_id)
+            response = routes_jobs.job_state(job_id)
         self.assertEqual(response["status"], "interrupted")
         self.assertTrue(response["recoverable"])
         self.assertEqual(response["checkpoint"], "asr")
@@ -63,18 +65,18 @@ class JobRecoveryTests(unittest.TestCase):
 
     def test_resume_registers_the_same_job_without_starting_separation(self):
         job_id, _ = self.make_interrupted_job()
-        with mock.patch.object(server.threading, "Thread") as thread, \
+        with mock.patch.object(routes_jobs.threading, "Thread") as thread, \
              mock.patch.object(jobstore, "reusable_checkpoint",
                                return_value=(Path("asr-input.wav"), "asr")):
-            response = asyncio.run(server.resume_job(
+            response = asyncio.run(routes_jobs.resume_job(
                 job_id, model="small", language="", precision_level="fast",
                 translate_to="", romaji="1", tracklist_text="",
                 fetch_lyrics="1",
             ))
         self.assertEqual(response, {"job_id": job_id, "resumed": True})
-        self.assertIn(job_id, server.JOBS)
-        self.assertFalse(server.JOBS[job_id]["done"])
-        self.assertIsInstance(server.JOBS[job_id]["cond"], threading.Condition)
+        self.assertTrue(routes_jobs.hub.live(job_id))
+        self.assertIsInstance(routes_jobs.hub.get(job_id)["cond"],
+                              threading.Condition)
         thread.return_value.start.assert_called_once()
 
     def test_checkpoint_prefers_complete_asr_and_falls_back_to_vocals(self):
@@ -96,7 +98,7 @@ class JobRecoveryTests(unittest.TestCase):
         transcript.write_text("{}", encoding="utf-8")
         with mock.patch.object(jobstore, "reusable_checkpoint",
                                return_value=(None, None)):
-            response = asyncio.run(server.resume_job(job_id))
+            response = asyncio.run(routes_jobs.resume_job(job_id))
         self.assertEqual(response.status_code, 409)
         self.assertTrue(transcript.is_file())
         self.assertFalse((outdir / "iterations").exists())
@@ -104,22 +106,20 @@ class JobRecoveryTests(unittest.TestCase):
     def test_delete_removes_only_the_requested_inactive_job(self):
         job_id, outdir = self.make_interrupted_job()
         other_id, other = self.make_interrupted_job("b1c2d3e4f5a6")
-        response = server.delete_saved_job(job_id)
+        response = routes_jobs.delete_saved_job(job_id)
         self.assertEqual(response, {"deleted": True, "job_id": job_id})
         self.assertFalse(outdir.exists())
         self.assertTrue(other.exists())
 
     def test_delete_refuses_a_running_job(self):
         job_id, outdir = self.make_interrupted_job()
-        server.JOBS[job_id] = {
-            "events": [], "cond": threading.Condition(), "done": False,
-        }
-        response = server.delete_saved_job(job_id)
+        routes_jobs.hub.create(job_id)
+        response = routes_jobs.delete_saved_job(job_id)
         self.assertEqual(response.status_code, 409)
         self.assertTrue(outdir.exists())
 
     def test_missing_job_state_is_a_404(self):
-        response = server.job_state("000000000000")
+        response = routes_jobs.job_state("000000000000")
         self.assertEqual(response.status_code, 404)
         self.assertEqual(json.loads(response.body)["error"], "job no existe")
 

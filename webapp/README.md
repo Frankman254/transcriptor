@@ -225,9 +225,11 @@ Rápido hace una sola lectura. La traducción no suma tiempo salvo que la elijas
 
 ## La API local
 
-`server.py` sirve la interfaz HTML, pero no depende de que esté abierta: los
-trabajos corren en su propio hilo y el SSE es solo una ventana a lo que ya está
-pasando. Cerrar la pestaña no detiene nada.
+`server.py` solo cablea la app: las rutas viven en `routes_system`,
+`routes_jobs` y `routes_serve`, los trabajos largos en `pipelines`, y las
+colas de eventos SSE con reconexión en `jobhub`. Nada de eso depende de que
+la interfaz esté abierta: los trabajos corren en su propio hilo y el SSE es
+solo una ventana a lo que ya está pasando. Cerrar la pestaña no detiene nada.
 
 Además de los endpoints que usa la interfaz, hay cuatro pensados para otros
 programas:

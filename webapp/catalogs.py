@@ -149,14 +149,15 @@ LANGUAGES = [
 # Idiomas de destino para la capa 2 de Lyrixa (la traducción).
 TARGET_LANGUAGES = ["es", "en", "pt", "fr", "it", "de", "ja", "ko", "zh", "ru"]
 
-# Presupuesto de reconocimiento del modo ultra. Los perfiles públicos están
-# acotados a una o tres pasadas; el rescate posterior trabaja solo en ventanas
-# dudosas, no vuelve a recorrer el mix completo.
+# Presupuesto de reconocimiento del modo ultra. El rescate posterior trabaja
+# solo en ventanas dudosas, no vuelve a recorrer el mix completo. `stability`
+# es la parada anticipada: con max > min, el bucle deja de pagar pasadas
+# cuando una extra ya no cambia el texto (o cuando el voto fue unánime).
 PRECISION_LEVELS = {
     "balanced": {
         "label": "Equilibrado · 3 pasadas",
-        "hint": ("Tres lecturas decorrelacionadas y una votación. Evita repetir "
-                 "todo el mix cinco veces cuando el stem no puede converger."),
+        "hint": ("Tres lecturas decorrelacionadas y una votación. Evita "
+                 "repetir todo el mix cuando el stem no puede converger."),
         "min_passes": 3, "max_passes": 3, "stability": 0.0,
     },
     "fast": {
@@ -166,9 +167,10 @@ PRECISION_LEVELS = {
         "min_passes": 1, "max_passes": 1, "stability": 0.0,
     },
     "maximum": {
-        "label": "Máximo útil · 3 pasadas + rescate",
-        "hint": ("Tres votos y revisión selectiva desde el audio original. No "
-                 "añade pasadas globales que ya demostraron no converger."),
-        "min_passes": 3, "max_passes": 3, "stability": 0.0,
+        "label": "Máximo útil · hasta 5 pasadas + rescate",
+        "hint": ("Tres votos y revisión selectiva desde el audio original. "
+                 "Si algo sigue dudoso, paga hasta dos pasadas extra; si el "
+                 "texto deja de moverse, se detiene antes de gastarlas."),
+        "min_passes": 3, "max_passes": 5, "stability": 0.99,
     },
 }

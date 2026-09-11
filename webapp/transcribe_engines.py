@@ -342,6 +342,11 @@ class _MlxWhisperEngine:
 
     def transcribe(self, pcm: np.ndarray, spec: PassSpec, *,
                    language: str | None, initial_prompt: str | None) -> Hypothesis:
+        # Same rule as openai-whisper above: this decoder has no `hotwords`
+        # channel, and Whisper is known to echo an `initial_prompt` verbatim.
+        # An echoed lyric line would match the reference perfectly, sail
+        # through every vote AND the acoustic refine gate, and masquerade as
+        # corroborated text — so engines without hotwords get no prompt at all.
         result = self._run(
             pcm, language=language, initial_prompt=None, spec=spec)
         words: list[Word] = []

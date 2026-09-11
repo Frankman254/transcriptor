@@ -48,6 +48,14 @@ DEFAULT_MAX_PASSES = 5
 DOMINANT_LANGUAGE_SHARE = 0.97
 MIN_LANGUAGE_PROBABILITY = 0.60
 
+# Gate del rescate: una zona donde el consenso tiene letra sostenida por dos o
+# más pasadas no se reemplaza jamás contra UNA sola hipótesis del mix. Una
+# pasada sobre audio con música nunca aporta evidencia más fuerte que varios
+# votos sobre el stem limpio, y la acústica del mix está correlacionada con la
+# de cualquier pasada solitaria. Lo que sí gana siempre: huecos sin letra
+# (count-ins borrados por el separador) y texto que ninguna mayoría sostiene.
+RESCUE_MIN_VOTED_WORDS = 3
+
 
 @dataclass
 class PrecisionConfig:
@@ -595,6 +603,28 @@ def _rescue_intervals(segments: list[dict], duration: float,
     return [(start, end) for start, end in merged[:limit] if end - start > 0.2]
 
 
+def _consensus_protects(current: list[dict], start: float, end: float,
+                        passes: int) -> bool:
+    """True si la zona ya está escrita por mayoría y el rescate no debe tocarla.
+
+    Con varias pasadas, dos o más votos sobre la misma palabra son consenso
+    real: una sola hipótesis del mix con música no puede borrar ese texto. Sin
+    votación (una pasada) no hay consenso que proteger y manda la acústica.
+    Solo cuentan las palabras caídas dentro de la ventana: los bordes vecinos
+    (el relleno de 0.8 s) no deben proteger un hueco vacío.
+    """
+    if passes <= 1:
+        return False
+    voted_inside = sum(
+        1
+        for segment in current
+        for word in (segment.get("words") or ())
+        if word.get("votes", 0) >= 2
+        and start <= float(word.get("start", 0.0)) < end
+    )
+    return voted_inside >= RESCUE_MIN_VOTED_WORDS
+
+
 def rescue_from_original(original: Path, result: PrecisionResult,
                          config: PrecisionConfig, emit,
                          max_windows: int = 24) -> PrecisionResult:
@@ -641,6 +671,8 @@ def rescue_from_original(original: Path, result: PrecisionResult,
         current = [segment for segment in segments
                    if float(segment["start"]) < end
                    and float(segment["end"]) > start]
+        if _consensus_protects(current, start, end, result.passes):
+            continue
         current_score = (
             sum(float(segment.get("confidence", 0.0))
                 * float(segment.get("agreement", 0.0)) for segment in current)

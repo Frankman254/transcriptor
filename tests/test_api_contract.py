@@ -22,6 +22,8 @@ import config  # noqa: E402
 import jobstore  # noqa: E402
 import media  # noqa: E402
 import paths  # noqa: E402
+import routes_serve  # noqa: E402
+import routes_system  # noqa: E402
 import server  # noqa: E402
 import translation  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -173,7 +175,8 @@ class AudioTests(ApiTestCase):
     def test_each_container_declares_its_own_media_type(self):
         for name, expected in [("a.opus", "audio/opus"), ("a.m4a", "audio/mp4"),
                                ("a.flac", "audio/flac"), ("a.wav", "audio/wav")]:
-            self.assertEqual(server.audio_media_type(Path(name)), expected)
+            self.assertEqual(routes_serve.audio_media_type(Path(name)),
+                             expected)
 
 
 class JobLinkTests(ApiTestCase):
@@ -277,7 +280,7 @@ class TranslateEndpointTests(ApiTestCase):
 
     def test_a_runaway_request_is_capped(self):
         response = self.client.post("/api/translate", json={
-            "lines": ["x"] * (server.MAX_TRANSLATE_LINES + 1),
+            "lines": ["x"] * (routes_system.MAX_TRANSLATE_LINES + 1),
             "targetLanguage": "es"})
         self.assertEqual(response.status_code, 413)
 

@@ -7,7 +7,12 @@
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --border: #2a2f3a;
-    --text: #e6e8ec; --muted: #9aa3b2; --accent: #5b8cff; --accent2: #38d39f;
+    --text: #e6e8ec; --accent: #5b8cff; --accent2: #38d39f;
+    /* --muted aclarado de #9aa3b2 (6.26:1 sobre #1e222b) a #aeb6c4: ratio
+       7.80:1 sobre #1e222b, 7.41:1 sobre #202634, 7.60:1 sobre el fondo
+       mezclado de .option-detail (~#1e2432) — >=7:1 AAA en texto pequeño
+       en todas las superficies donde aparece (fórmula WCAG sRGB). */
+    --muted: #aeb6c4;
     --danger: #ff6b6b;
   }
   * { box-sizing: border-box; }
@@ -20,7 +25,7 @@
   .sub { color: var(--muted); margin: 0 0 24px; }
   .card { background: var(--panel); border: 1px solid var(--border);
           border-radius: 14px; padding: 20px; margin-bottom: 20px; }
-  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  label, .ctl-label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
   select, input[type=text], textarea {
     width: 100%; padding: 10px 12px; background: var(--panel2);
     border: 1px solid var(--border); border-radius: 9px; color: var(--text);
@@ -30,10 +35,12 @@
   input[type=file] { color: var(--muted); font-size: 13px; }
   .row { display: flex; gap: 14px; flex-wrap: wrap; }
   .row > div { flex: 1; min-width: 160px; }
-  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
   .tab { padding: 8px 16px; border-radius: 9px; border: 1px solid var(--border);
-         background: var(--panel2); cursor: pointer; font-size: 14px; color: var(--muted); }
+         background: var(--panel2); cursor: pointer; font-size: 14px; color: var(--muted);
+         outline: none; }
   .tab.active { border-color: var(--accent); color: var(--text); background: #202634; }
+  .tab:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
   button.go {
     margin-top: 16px; width: 100%; padding: 12px; border: none; border-radius: 10px;
     background: var(--accent); color: #fff; font-size: 15px; font-weight: 600;
@@ -61,6 +68,11 @@
   .seg .t { color: var(--accent); font-variant-numeric: tabular-nums; font-size: 12px;
             white-space: nowrap; padding-top: 1px; min-width: 168px; }
   .seg .x { flex: 1; }
+  /* En pantallas estrechas la marca de tiempo debe encogerse con ellipsis:
+     min-width:168px fijo desbordaba la fila (flex no baja de min-content). */
+  @media (max-width: 560px) {
+    .seg .t { min-width: 0; max-width: 38vw; overflow: hidden; text-overflow: ellipsis; }
+  }
   .downloads { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
   .downloads a, .downloads button { text-decoration: none; padding: 8px 14px; border-radius: 9px;
                  background: var(--panel2); border: 1px solid var(--border); color: var(--text);
@@ -113,13 +125,13 @@
          border: 1px solid var(--border); }
   .job-main { display: flex; gap: 12px; justify-content: space-between; align-items: start; }
   .job-title { font-weight: 600; overflow-wrap: anywhere; }
-  .job-meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .job-meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
   .job-actions { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 9px; }
   button.danger { color: #ff8585; border-color: rgba(255,100,100,.35); }
   button.danger:hover { background: rgba(255,80,80,.12); }
   .option-detail { margin: 7px 2px 0; padding: 9px 11px; border-radius: 8px;
                    background: rgba(90,130,220,.08); line-height: 1.45; }
-  .guide-preview { color: var(--muted); font-size: 12px; margin-top: 8px;
+  .guide-preview { color: var(--muted); font-size: 13px; margin-top: 8px;
                    white-space: pre-line; }
 </style>
 </head>
@@ -133,44 +145,47 @@
       <h2>🗂️ Trabajos guardados</h2>
       <button class="small-button" onclick="loadSavedJobs()">Actualizar</button>
     </div>
-    <p class="sub" style="margin-bottom:12px;font-size:12px">Abre resultados anteriores o vuelve a procesar sus WAV sin descargar ni separar el mix otra vez.</p>
+    <p class="sub" style="margin-bottom:12px;font-size:13px">Abre resultados anteriores o vuelve a procesar sus WAV sin descargar ni separar el mix otra vez.</p>
     <div class="jobs" id="jobs-list"><cite>Buscando trabajos…</cite></div>
   </div>
 
   <div class="card">
-    <div class="tabs">
-      <div class="tab active" data-src="url" onclick="setSource('url')">🔗 YouTube</div>
-      <div class="tab" data-src="file" onclick="setSource('file')">📁 Archivo</div>
+    <div class="tabs" role="tablist" aria-label="Fuente del audio">
+      <div class="tab active" role="tab" id="src-tab-url" aria-selected="true" aria-controls="pane-url" tabindex="0" data-src="url" onclick="setSource('url')">🔗 YouTube</div>
+      <div class="tab" role="tab" id="src-tab-file" aria-selected="false" aria-controls="pane-file" tabindex="-1" data-src="file" onclick="setSource('file')">📁 Archivo</div>
     </div>
 
-    <div id="pane-url">
-      <label>Link de YouTube</label>
+    <div id="pane-url" role="tabpanel" aria-labelledby="src-tab-url">
+      <label for="url">Link de YouTube</label>
       <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=...">
     </div>
-    <div id="pane-file" class="hidden">
-      <label>Audio o video (mp3, m4a, wav, mp4…)</label>
+    <div id="pane-file" class="hidden" role="tabpanel" aria-labelledby="src-tab-file">
+      <label for="file">Audio o video (mp3, m4a, wav, mp4…)</label>
       <input type="file" id="file" accept="audio/*,video/*">
     </div>
 
     <div id="mode-pane" style="margin-top:16px">
-      <label>¿Qué quieres hacer?</label>
-      <div class="tabs">
-        <div class="tab active" data-mode="transcribe" onclick="setMode('transcribe')">🎧 Transcribir</div>
-        <div class="tab" data-mode="lyrics" onclick="setMode('lyrics')">🎤 Letra de canción</div>
-        <div class="tab" data-mode="ultra" onclick="setMode('ultra')">🎯 Letra ultra precisa</div>
-        <div class="tab" data-mode="audio_only" onclick="setMode('audio_only')">⬇️ Solo audio</div>
+      <span class="ctl-label" id="mode-label">¿Qué quieres hacer?</span>
+      <div class="tabs" role="tablist" aria-labelledby="mode-label">
+        <div class="tab active" role="tab" id="mode-tab-transcribe" aria-selected="true" aria-controls="mode-panel" tabindex="0" data-mode="transcribe" onclick="setMode('transcribe')">🎧 Transcribir</div>
+        <div class="tab" role="tab" id="mode-tab-lyrics" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="lyrics" onclick="setMode('lyrics')">🎤 Letra de canción</div>
+        <div class="tab" role="tab" id="mode-tab-ultra" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="ultra" onclick="setMode('ultra')">🎯 Letra ultra precisa</div>
+        <div class="tab" role="tab" id="mode-tab-audio_only" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="audio_only" onclick="setMode('audio_only')">⬇️ Solo audio</div>
       </div>
-      <p class="sub hidden" id="mode-hint" style="margin:8px 2px 0;font-size:12px"></p>
+      <p class="sub hidden" id="mode-hint" style="margin:8px 2px 0;font-size:13px"></p>
     </div>
 
+    <!-- role=tabpanel para los tabs de modo: agrupa las secciones que el modo
+         muestra/oculta (opts, audio, separación, ultra). No cambia el estado. -->
+    <div id="mode-panel" role="tabpanel" aria-labelledby="mode-tab-transcribe">
     <div class="row" id="opts" style="margin-top:16px">
       <div>
-        <label>Modelo</label>
+        <label for="model">Modelo</label>
         <select id="model" onchange="onModelChange()"></select>
         <p class="sub option-detail" id="model-hint"></p>
       </div>
       <div>
-        <label>Idioma</label>
+        <label for="language">Idioma</label>
         <select id="language"></select>
       </div>
     </div>
@@ -178,38 +193,38 @@
     <div id="audio-opts" style="margin-top:16px">
       <div class="row">
         <div>
-          <label>Formato de audio</label>
+          <label for="audio_format">Formato de audio</label>
           <select id="audio_format" onchange="onFormatChange()"></select>
         </div>
         <div id="quality-wrap">
-          <label>Calidad</label>
+          <label for="audio_quality">Calidad</label>
           <select id="audio_quality"></select>
         </div>
       </div>
-      <p class="sub" id="fmt-hint" style="margin:8px 2px 0;font-size:12px"></p>
+      <p class="sub" id="fmt-hint" style="margin:8px 2px 0;font-size:13px"></p>
     </div>
 
     <div id="separator-opts" class="hidden" style="margin-top:16px">
-      <label>Calidad de separación vocal</label>
+      <label for="separation_quality">Calidad de separación vocal</label>
       <select id="separation_quality" onchange="onSeparationChange()"></select>
-      <p class="sub" id="separation-hint" style="margin:8px 2px 0;font-size:12px"></p>
+      <p class="sub" id="separation-hint" style="margin:8px 2px 0;font-size:13px"></p>
     </div>
 
     <div id="ultra-opts" class="hidden" style="margin-top:16px">
       <div class="row">
         <div>
-          <label>Nivel de precisión</label>
+          <label for="precision_level">Nivel de precisión</label>
           <select id="precision_level" onchange="onPrecisionChange()"></select>
         </div>
         <div>
-          <label>Traducir a (2ª capa de Lyrixa)</label>
+          <label for="translate_to">Traducir a (2ª capa de Lyrixa)</label>
           <select id="translate_to" onchange="onTranslateChange()"></select>
         </div>
       </div>
-      <p class="sub" id="precision-hint" style="margin:8px 2px 0;font-size:12px"></p>
+      <p class="sub" id="precision-hint" style="margin:8px 2px 0;font-size:13px"></p>
       <div class="row" style="margin-top:12px">
         <div>
-          <label>Motor de reconocimiento</label>
+          <label for="asr_engine">Motor de reconocimiento</label>
           <select id="asr_engine" onchange="onEngineChange()"></select>
           <p class="sub option-detail" id="engine-hint"></p>
         </div>
@@ -222,15 +237,15 @@
         <input type="checkbox" id="romaji">
         Japonés en romaji (no en kana)
       </label>
-      <p class="sub" id="translator-hint" style="margin:8px 2px 0;font-size:12px"></p>
+      <p class="sub" id="translator-hint" style="margin:8px 2px 0;font-size:13px"></p>
 
       <div class="panel" id="tracklist-opts">
         <h3>🧭 Guía del mix (opcional)</h3>
-        <label>Tracklist con tiempo, artista y canción</label>
+        <label for="tracklist_text">Tracklist con tiempo, artista y canción</label>
         <textarea id="tracklist_text" placeholder="00:00 Rollergirl - Dear Jessie (Green Court Remix)&#10;01:25 T-Pau - China in Your Hand"></textarea>
         <div class="row" style="margin-top:9px;align-items:end">
           <div>
-            <label>Cargar un .txt o una lista descargada de Pastebin</label>
+            <label for="tracklist_file">Cargar un .txt o una lista descargada de Pastebin</label>
             <input type="file" id="tracklist_file" accept=".txt,text/plain" onchange="loadTracklistFile(this)">
           </div>
           <div style="flex:0 0 auto;min-width:0">
@@ -241,20 +256,21 @@
           <input type="checkbox" id="fetch_lyrics" checked>
           Buscar letras de referencia en LRCLIB
         </label>
-        <p class="sub" style="margin:7px 0 0;font-size:12px">La letra pública guía el vocabulario, pero solo reemplaza una línea si Whisper ya oyó algo muy parecido. Los remixes no se fuerzan.</p>
+        <p class="sub" style="margin:7px 0 0;font-size:13px">La letra pública guía el vocabulario, pero solo reemplaza una línea si Whisper ya oyó algo muy parecido. Los remixes no se fuerzan.</p>
         <div class="guide-preview" id="tracklist-preview"></div>
       </div>
     </div>
 
     <button class="go" id="go" onclick="start()">Transcribir</button>
+    </div>
   </div>
 
   <div class="card hidden" id="live">
     <div class="badges" id="badges"></div>
-    <div class="stage" id="stage"></div>
+    <div class="stage" id="stage" role="status" aria-live="polite"></div>
     <div class="progress-outer"><div class="progress-inner" id="bar"></div></div>
     <div class="progress-label"><span id="pct">0%</span><span id="clock"></span></div>
-    <div id="err" class="err"></div>
+    <div id="err" class="err" role="alert"></div>
 
     <div class="panel hidden" id="stem-panel">
       <h3>🎚️ Calidad de la voz aislada</h3>
@@ -270,7 +286,7 @@
         </tr></thead>
         <tbody id="rounds-body"></tbody>
       </table>
-      <p class="sub" id="rounds-note" style="margin:10px 2px 0;font-size:12px"></p>
+      <p class="sub" id="rounds-note" style="margin:10px 2px 0;font-size:13px"></p>
     </div>
 
     <div class="panel hidden" id="translation-panel">
@@ -309,6 +325,12 @@ function setSource(s) {
   SOURCE = s;
   document.querySelectorAll(".tab[data-src]").forEach(t =>
     t.classList.toggle("active", t.dataset.src === s));
+  // Sincroniza semántica ARIA de tabs (roving tabindex); no toca el estado.
+  document.querySelectorAll(".tab[data-src]").forEach(t => {
+    const on = t.dataset.src === s;
+    t.setAttribute("aria-selected", on ? "true" : "false");
+    t.setAttribute("tabindex", on ? "0" : "-1");
+  });
   document.getElementById("pane-url").classList.toggle("hidden", s !== "url");
   document.getElementById("pane-file").classList.toggle("hidden", s !== "file");
   syncAudioOpts();
@@ -434,6 +456,14 @@ function setMode(m) {
   MODE = m;
   document.querySelectorAll(".tab[data-mode]").forEach(t =>
     t.classList.toggle("active", t.dataset.mode === m));
+  document.querySelectorAll(".tab[data-mode]").forEach(t => {
+    const on = t.dataset.mode === m;
+    t.setAttribute("aria-selected", on ? "true" : "false");
+    t.setAttribute("tabindex", on ? "0" : "-1");
+  });
+  // El panel agrupado se presenta como el panel del tab activo.
+  document.getElementById("mode-panel")
+    .setAttribute("aria-labelledby", "mode-tab-" + m);
   // En "solo audio" no hacen falta modelo ni idioma; en letra sí (usa Whisper).
   document.getElementById("opts").classList.toggle("hidden", m === "audio_only");
   if (m !== "ultra") ITERATE_JOB_ID = null;
@@ -459,6 +489,33 @@ function setMode(m) {
   }
   syncAudioOpts();
 }
+
+// Tabs accesibles: flechas mueven la selección (activación automática, que
+// reusa el onclick existente → misma lógica de estado), Enter/Espacio activan,
+// Home/End saltan al primero/último. No reescribe setSource/setMode.
+function wireTablist(tablistEl) {
+  const tabs = () => Array.from(tablistEl.querySelectorAll(".tab"));
+  tablistEl.addEventListener("keydown", ev => {
+    const items = tabs();
+    const i = items.indexOf(document.activeElement);
+    if (i < 0) return;
+    let next = null;
+    if (ev.key === "ArrowRight" || ev.key === "ArrowDown") next = items[(i + 1) % items.length];
+    else if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") next = items[(i - 1 + items.length) % items.length];
+    else if (ev.key === "Home") next = items[0];
+    else if (ev.key === "End") next = items[items.length - 1];
+    else if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      items[i].click();
+      return;
+    }
+    if (!next) return;
+    ev.preventDefault();
+    next.focus();
+    next.click();
+  });
+}
+document.querySelectorAll(".tabs[role=tablist]").forEach(wireTablist);
 
 // Qué mostrar a la derecha de la barra en las etapas que no son transcripción.
 const STAGE_LABELS = {
@@ -650,7 +707,7 @@ async function openSavedJob(jobId) {
   const live = document.getElementById("live");
   live.classList.remove("hidden");
   resetPanels();
-  document.getElementById("segments").innerHTML = "";
+  clearSegmentView();
   document.getElementById("err").textContent = job.error ? "⚠️ " + job.error : "";
   setBadges({model: job.settings?.model || null, device: INFO.device,
              title: job.title, duration: job.duration});
@@ -712,10 +769,15 @@ async function translateSavedJob(jobId) {
   const fd = new FormData();
   fd.append("translate_to", target);
   fd.append("romaji", romanize ? "1" : "0");
-  const response = await fetch(`/api/jobs/${jobId}/translate`, {
-    method: "POST", body: fd,
-  });
-  const data = await response.json();
+  let response, data;
+  try {
+    response = await fetch(`/api/jobs/${jobId}/translate`, {
+      method: "POST", body: fd,
+    });
+    data = await response.json();
+  } catch (_) {
+    return alert("No se pudo contactar con el servidor.");
+  }
   if (!response.ok) return alert(data.error || "No pude iniciar la traducción.");
   const job = await (await fetch(`/api/jobs/${jobId}`)).json();
   document.getElementById("live").classList.remove("hidden");
@@ -833,7 +895,7 @@ function showStem(d) {
     `<span class="metric"><cite>Fuga instrumental</cite> <b>${d.bleedRatio}</b></span>`;
   const body = document.getElementById("stem-body");
   body.innerHTML = html + (d.notes || []).map(n =>
-    `<p class="sub" style="margin:8px 0 0;font-size:12px"></p>`).join("");
+    `<p class="sub" style="margin:8px 0 0;font-size:13px"></p>`).join("");
   (d.notes || []).forEach((note, i) => {
     body.querySelectorAll("p")[i].textContent = note;
   });
@@ -842,6 +904,22 @@ function showStem(d) {
 
 function pct(value) {
   return value == null ? "—" : (value * 100).toFixed(1) + "%";
+}
+
+function renderSegment(d) {
+  // Una fila de letra en la vista. La usan tanto el stream en vivo como el
+  // `snapshot` de reconexión: una recarga pinta exactamente igual.
+  const row = document.createElement("div");
+  // Menos del 80% de acuerdo entre pasadas = la línea que hay que escuchar.
+  const shaky = d.agreement != null && d.agreement < 0.8;
+  row.className = shaky ? "seg shaky" : "seg";
+  row.innerHTML = `<span class="t">${fmtMs(d.start)} → ${fmtMs(d.end)}</span>` +
+                  `<span class="x"></span>` +
+                  (d.referenceScore ? `<span class="ref">🧭 ${(d.referenceScore * 100).toFixed(0)}%</span>` : "") +
+                  (shaky ? `<span class="ag">${pct(d.agreement)}</span>` : "");
+  row.querySelector(".x").textContent = d.text;
+  if (d.track?.title) row.title = `${d.track.artist || ""} — ${d.track.title}`;
+  document.getElementById("segments").appendChild(row);
 }
 
 function showRound(d) {
@@ -896,7 +974,7 @@ function showPrecision(d) {
   if (!langs || !langs.dominant) return;
   const note = document.createElement("p");
   note.className = "sub";
-  note.style.cssText = "margin:8px 2px 0;font-size:12px";
+  note.style.cssText = "margin:8px 2px 0;font-size:13px";
   const parts = Object.entries(langs.seconds || {})
     .map(([code, secs]) => `${code} ${fmt(secs)}`).join(" · ");
   note.textContent = langs.multilingual
@@ -925,13 +1003,13 @@ function showTranslation(d) {
   const body = document.getElementById("translation-body");
   const rows = [];
   if (d.romajiBackend && d.romajiBackend !== "none") {
-    rows.push(`<span class="metric"><cite>Romaji</cite> <b>${d.romajiBackend}</b></span>`);
+    rows.push(`<span class="metric"><cite>Romaji</cite> <b>${esc(d.romajiBackend)}</b></span>`);
   }
   if (d.routeLabel) {
-    rows.push(`<span class="metric"><cite>Ruta</cite> <b>${d.routeLabel}</b></span>`);
+    rows.push(`<span class="metric"><cite>Ruta</cite> <b>${esc(d.routeLabel)}</b></span>`);
   }
   if (d.backend) {
-    rows.push(`<span class="metric"><cite>Motor</cite> <b>${d.backend}</b></span>`);
+    rows.push(`<span class="metric"><cite>Motor</cite> <b>${esc(d.backend)}</b></span>`);
   }
   body.innerHTML = rows.join("") || "<cite>Sin traducción.</cite>";
   if (d.error) {
@@ -942,7 +1020,7 @@ function showTranslation(d) {
   } else if (d.targetLanguage) {
     const p = document.createElement("p");
     p.className = "sub";
-    p.style.cssText = "margin:8px 0 0;font-size:12px";
+    p.style.cssText = "margin:8px 0 0;font-size:13px";
     p.textContent = "La traducción viaja en el .lyrixa.json como segunda capa "
       + "(layer-backing), con los mismos tiempos que la letra original.";
     body.appendChild(p);
@@ -979,7 +1057,7 @@ function showReference(d) {
   if (d.stage === "prepared") {
     const note = document.createElement("p");
     note.className = "sub";
-    note.style.cssText = "margin:7px 0 0;font-size:12px";
+    note.style.cssText = "margin:7px 0 0;font-size:13px";
     note.textContent = "Cada ventana de Whisper recibe solo la canción de ese tramo. Una referencia distinta al remix no se fuerza.";
     body.appendChild(note);
   }
@@ -1028,7 +1106,7 @@ async function start() {
   document.getElementById("go").disabled = true;
   const live = document.getElementById("live");
   live.classList.remove("hidden");
-  document.getElementById("segments").innerHTML = "";
+  clearSegmentView();
   document.getElementById("downloads").classList.add("hidden");
   document.getElementById("downloads").innerHTML = "";
   document.getElementById("err").textContent = "";
@@ -1037,9 +1115,20 @@ async function start() {
   setStage("Iniciando…", true);
   setProgress(0);
 
-  const res = await fetch("/api/jobs", { method: "POST", body: fd });
-  const payload = await res.json();
-  if (!res.ok || !payload.job_id) {
+  let payload;
+  try {
+    const res = await fetch("/api/jobs", { method: "POST", body: fd });
+    payload = await res.json();
+  } catch (_) {
+    // El servidor cayó a mitad del POST (o se fue la red): sin esto el botón
+    // "Empezar" quedaba inutilizable hasta recargar la pestaña.
+    document.getElementById("err").textContent =
+      "⚠️ No se pudo contactar con el servidor. ¿Sigue corriendo?";
+    setStage("Error", false);
+    document.getElementById("go").disabled = false;
+    return;
+  }
+  if (!payload.job_id) {
     document.getElementById("err").textContent =
       "⚠️ " + (payload.error || "No se pudo iniciar el trabajo.");
     setStage("Error", false);
@@ -1051,20 +1140,39 @@ async function start() {
   listen(job_id);
 }
 
+function esc(s) {
+  // Textura 100% defensiva: títulos de video, mensajes de stage y nombres de
+  // motor vienen del servidor/SSE y aterrizan en `innerHTML`. Escaparlos aquí
+  // en un solo punto evita que un título like `<img src=x onerror=…>` ejecute
+  // JS contra esta API local (que incluye DELETE /api/jobs/{id}).
+  return String(s ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 function setBadges({ model, device, title, duration }) {
   const b = document.getElementById("badges");
+  // Todo lo que entra aquí (título de YouTube, motor, device) puede llevar
+  // HTML: `esc` lo vuelve texto antes de tocar `innerHTML`.
   let html = model
-    ? `<span class="badge"><span class="dot"></span>Modelo <b>${model}</b></span>`
+    ? `<span class="badge"><span class="dot"></span>Modelo <b>${esc(model)}</b></span>`
     : "";
-  html += `<span class="badge">Dispositivo <b>${device}</b></span>`;
-  if (title) html += `<span class="badge" title="${title}">🎬 <b>${title.slice(0, 40)}</b></span>`;
-  if (duration) html += `<span class="badge">Duración <b>${fmt(duration)}</b></span>`;
+  html += `<span class="badge">Dispositivo <b>${esc(device)}</b></span>`;
+  if (title) html += `<span class="badge" title="${esc(title)}">🎬 <b>${esc(title.slice(0, 40))}</b></span>`;
+  if (duration) html += `<span class="badge">Duración <b>${esc(fmt(duration))}</b></span>`;
   b.innerHTML = html;
 }
 
 function setStage(text, spinning) {
-  document.getElementById("stage").innerHTML =
-    (spinning ? '<span class="spin">⏳</span> ' : "") + text;
+  // `text` puede traer el título del video o un mensaje crudo del servidor.
+  const stage = document.getElementById("stage");
+  stage.textContent = "";
+  if (spinning) {
+    const spin = document.createElement("span");
+    spin.className = "spin";
+    spin.textContent = "⏳";
+    stage.append(spin, " ");
+  }
+  stage.append(text ?? "");
 }
 
 function resetPanels() {
@@ -1133,11 +1241,15 @@ function showFiles(jobId, files, links) {
       const player = document.createElement("div");
       player.className = "stem-player";
       const playerLabel = document.createElement("label");
-      playerLabel.textContent = `${icon} Escuchar ${label.toLowerCase()}`;
+      const playerName = `${icon} Escuchar ${label.toLowerCase()}`;
+      playerLabel.textContent = playerName;
       const audio = document.createElement("audio");
       audio.controls = true;
       audio.preload = "metadata";
       audio.src = url;
+      // <audio> no es etiquetable: el <label> visible no asocia con for;
+      // el reproductor se anuncia con su propio nombre.
+      audio.setAttribute("aria-label", playerName);
       player.append(playerLabel, audio);
       dl.appendChild(player);
     }
@@ -1147,7 +1259,7 @@ function showFiles(jobId, files, links) {
 function showRecovery(jobId, state) {
   const live = document.getElementById("live");
   live.classList.remove("hidden");
-  document.getElementById("segments").innerHTML = "";
+  clearSegmentView();
   document.getElementById("downloads").classList.add("hidden");
   resetPanels();
   setMode("ultra");
@@ -1199,8 +1311,18 @@ async function resumeSavedJob(jobId) {
   document.getElementById("err").textContent = "";
   document.getElementById("go").disabled = true;
   setStage("Retomando desde asr-input.wav…", true);
-  const res = await fetch(`/api/jobs/${jobId}/resume`, {method: "POST", body: fd});
-  const payload = await res.json();
+  let res, payload;
+  try {
+    res = await fetch(`/api/jobs/${jobId}/resume`, {method: "POST", body: fd});
+    payload = await res.json();
+  } catch (_) {
+    document.getElementById("err").textContent =
+      "⚠️ No se pudo contactar con el servidor para retomar.";
+    setStage("No se pudo retomar", false);
+    document.getElementById("go").disabled = false;
+    actions.classList.remove("hidden");
+    return;
+  }
   if (!res.ok) {
     document.getElementById("err").textContent =
       "⚠️ " + (payload.error || "No se pudo retomar el trabajo.");
@@ -1223,65 +1345,121 @@ async function interruptedState(jobId) {
   }
 }
 
+let ACTIVE_EVENTS = null;
+// Último `id:` SSE oído en esta sesión de página, del trabajo escuchado.
+// Al reconectar (corte de red o pestaña reabierta) vale como `?since=`: así
+// no reenvían desde el evento 0 miles de segmentos ya pintados. Va unido a
+// la vista de segmentos: si la vista se limpia, el único punto de reanudo
+// honesto es el principio del anillo del servidor (clearSegmentView). Si al
+// pedir since el servidor ya no lo retiene, manda `reset` y vaciamos la
+// vista antes del replay.
+let LAST_EVENT = { job: null, id: 0 };
+
+// Única forma de vaciar la vista de segmentos: olvida también el since.
+function clearSegmentView() {
+  LAST_EVENT = { job: null, id: 0 };
+  document.getElementById("segments").innerHTML = "";
+}
+
 function listen(jobId) {
   // EventSource se reconecta solo tras un corte (dormir la Mac, WiFi, etc.) y,
   // gracias a los `id:` del servidor, retoma justo donde se quedó, sin duplicar.
-  const es = new EventSource(`/api/jobs/${jobId}/events`);
+  // Solo puede haber una escucha viva: si arranca otro trabajo (o se reabre la
+  // pestaña sobre otro job), la sesión vieja debe morir o sus eventos seguirían
+  // pintando paneles ajenos en la vista nueva.
+  if (ACTIVE_EVENTS) ACTIVE_EVENTS.close();
+  // Si ya tenemos eventos pintados de este job (reconexión en la misma
+  // página) pedimos solo lo que falta; si no, el anillo completo.
+  const resume = (LAST_EVENT.job === jobId && LAST_EVENT.id > 0) ? LAST_EVENT.id : 0;
+  LAST_EVENT = { job: jobId, id: resume };
+  const es = new EventSource(
+    `/api/jobs/${jobId}/events` + (resume ? `?since=${resume}` : ""));
+  ACTIVE_EVENTS = es;
+  // Cada mensaje trae `id:` (ev.lastEventId): lo apuntamos para el future
+  // `?since=` y para que la reconexión automática de EventSource (cabecera
+  // Last-Event-ID) coincida con lo que realmente hemos pintado.
+  const on = (name, fn) => es.addEventListener(name, e => {
+    const n = Number(e.lastEventId);
+    if (Number.isFinite(n) && n > LAST_EVENT.id) LAST_EVENT.id = n;
+    fn(e);
+  });
   let duration = 0;
   let tries = 0;
   let checkingState = false;
 
   es.addEventListener("open", () => { tries = 0; });  // reconectó bien
 
-  es.addEventListener("status", e => {
+  // El anillo del servidor podó eventos más antiguos que nuestro `since`:
+  // llega el resumen acumulado (letra, stems, rondas retirados + el último
+  // valor de cada panel) y la cola reanuda justo después. Reconstruimos todo.
+  on("snapshot", e => {
+    const s = JSON.parse(e.data);
+    const L = s.latest || {};
+    resetPanels();
+    document.getElementById("segments").innerHTML = "";
+    for (const d of (s.rounds || [])) showRound(d);
+    for (const d of (s.stems || [])) showStem(d);
+    for (const d of (s.segments || [])) renderSegment(d);
+    const box = document.getElementById("segments");
+    box.scrollTop = box.scrollHeight;
+    const lastSeg = (s.segments || []).slice(-1)[0];
+    if (lastSeg) document.getElementById("clock").textContent =
+      `${fmt(lastSeg.end)}${duration ? " / " + fmt(duration) : ""}`;
+    if (L.meta) { duration = L.meta.duration || duration; setBadges(L.meta); }
+    if (L.progress) {
+      setProgress(L.progress.progress);
+      document.getElementById("clock").textContent =
+        STAGE_LABELS[L.progress.stage] || "";
+    }
+    if (L.status) {
+      setStage(L.status.message || L.status.stage, true);
+      if (L.status.engine) showActualEngine(L.status.engine);
+    }
+    if (L.consensus) showRound(L.consensus);
+    if (L.precision) showPrecision(L.precision);
+    if (L.translation) showTranslation(L.translation);
+    if (L.reference) showReference(L.reference);
+  });
+
+  on("status", e => {
     const d = JSON.parse(e.data);
     setStage(d.message || d.stage, true);
     if (d.model) setBadges({ model: d.model, device: d.device, duration: d.duration });
     if (d.engine) showActualEngine(d.engine);
   });
-  es.addEventListener("meta", e => {
+  on("meta", e => {
     const d = JSON.parse(e.data);
     duration = d.duration;
     setBadges({ model: d.model, device: d.device, title: d.title, duration: d.duration });
   });
   // Avance de las etapas largas que no son Whisper (descarga, Demucs, conversión).
-  es.addEventListener("progress", e => {
+  on("progress", e => {
     const d = JSON.parse(e.data);
     setProgress(d.progress);
     document.getElementById("clock").textContent = STAGE_LABELS[d.stage] || "";
   });
-  es.addEventListener("stem", e => showStem(JSON.parse(e.data)));
-  es.addEventListener("consensus", e => showRound(JSON.parse(e.data)));
-  es.addEventListener("precision", e => showPrecision(JSON.parse(e.data)));
-  es.addEventListener("translation", e => showTranslation(JSON.parse(e.data)));
-  es.addEventListener("reference", e => showReference(JSON.parse(e.data)));
-  es.addEventListener("rescue", e => {
+  on("stem", e => showStem(JSON.parse(e.data)));
+  on("consensus", e => showRound(JSON.parse(e.data)));
+  on("precision", e => showPrecision(JSON.parse(e.data)));
+  on("translation", e => showTranslation(JSON.parse(e.data)));
+  on("reference", e => showReference(JSON.parse(e.data)));
+  on("rescue", e => {
     const d = JSON.parse(e.data);
     if (d.error) {
       document.getElementById("err").textContent =
         "⚠️ El rescate opcional no se pudo completar: " + d.error;
     }
   });
-  es.addEventListener("segment", e => {
+  on("segment", e => {
     const d = JSON.parse(e.data);
     if (d.progress != null) setProgress(d.progress);
     document.getElementById("clock").textContent =
       `${fmt(d.end)}${duration ? " / " + fmt(duration) : ""}`;
-    const row = document.createElement("div");
-    // Menos del 80% de acuerdo entre pasadas = la línea que hay que escuchar.
-    const shaky = d.agreement != null && d.agreement < 0.8;
-    row.className = shaky ? "seg shaky" : "seg";
-    row.innerHTML = `<span class="t">${fmtMs(d.start)} → ${fmtMs(d.end)}</span>` +
-                    `<span class="x"></span>` +
-                    (d.referenceScore ? `<span class="ref">🧭 ${(d.referenceScore * 100).toFixed(0)}%</span>` : "") +
-                    (shaky ? `<span class="ag">${pct(d.agreement)}</span>` : "");
-    row.querySelector(".x").textContent = d.text;
-    if (d.track?.title) row.title = `${d.track.artist || ""} — ${d.track.title}`;
+    renderSegment(d);
     const box = document.getElementById("segments");
-    box.appendChild(row);
     box.scrollTop = box.scrollHeight;
   });
-  es.addEventListener("done", e => {
+  on("done", e => {
     const d = JSON.parse(e.data);
     setStage("✅ Listo — " + (d.title || ""), false);
     setProgress(1);
@@ -1291,7 +1469,7 @@ function listen(jobId) {
     es.close();
     finishJob();
   });
-  es.addEventListener("error", async e => {
+  on("error", async e => {
     if (e.data) {
       // Error real de la app (p. ej. yt-dlp/whisper falló).
       let msg = "Ocurrió un error.";
@@ -1336,7 +1514,7 @@ async function resumeIfAny() {
     return;
   }
   document.getElementById("live").classList.remove("hidden");
-  document.getElementById("segments").innerHTML = "";
+  clearSegmentView();
   document.getElementById("downloads").classList.add("hidden");
   document.getElementById("err").textContent = "";
   document.getElementById("go").disabled = true;
@@ -1347,7 +1525,15 @@ async function resumeIfAny() {
 }
 
 async function boot() {
-  await loadInfo();
+  try {
+    await loadInfo();
+  } catch (_) {
+    // Sin /api/info no hay modelos ni idiomas: lo decimos en pantalla en vez
+    // de dejar una página muda que el usuario debe adivinar por qué.
+    document.getElementById("err").textContent =
+      "⚠️ No hay servidor. Arranca `python3 server.py` y recarga la página.";
+    return;
+  }
   await loadSavedJobs();
   await resumeIfAny();
 }

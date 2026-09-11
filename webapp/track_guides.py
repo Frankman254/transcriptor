@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable
+from textjoin import space_prefixes
 
 
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
@@ -410,6 +411,106 @@ def _line_score(heard: str, reference: str) -> float:
     return 0.45 * sequence + 0.35 * coverage + 0.20 * precision
 
 
+def _resync_words(item: dict, reference: str) -> None:
+    """Rewrite `words[]` so its tokens are the reference's, at the heard times.
+
+    A corrected line is worthless to Lyrixa if `words[]` still holds the old
+    tokens: the bridge builds clips from words, so the export would carry the
+    superseded text.  Tokens are aligned on their folded form — the same
+    comparison `_line_score` already accepted — so matched reference words
+    inherit the time of the word they replace, unmatched ones interpolate
+    between their nearest anchors, and heard words the reference rejects are
+    dropped: the acceptance gate already decided the reference is the better
+    surface.  A line whose script `_fold` cannot transliterate (kana, Cyrillic)
+    folds to nothing, and gets its times redistributed proportionally instead.
+    """
+    words = item.get("words") or []
+    tokens = [token for token in reference.split() if token.strip()]
+    if not words or not tokens:
+        return
+
+    heard_start = [float(w.get("start", 0.0)) for w in words]
+    heard_end = [float(w.get("end", 0.0)) for w in words]
+
+    heard_keys = [_fold(word.get("word", "")) for word in words]
+    ref_keys = [_fold(token) for token in tokens]
+    anchor_of = (_align_keys(heard_keys, ref_keys)
+                 if any(heard_keys) and any(ref_keys) else {})
+    m = len(tokens)
+    token_start = [0.0] * m
+    token_end = [0.0] * m
+    for ref_index, heard_index in anchor_of.items():
+        token_start[ref_index] = heard_start[heard_index]
+        token_end[ref_index] = heard_end[heard_index]
+
+    # Unmatched reference words split the gap between their nearest anchors.
+    last = -1
+    for ref_index in range(m):
+        if ref_index in anchor_of:
+            last = ref_index
+            continue
+        nxt = next((k for k in range(ref_index + 1, m) if k in anchor_of), None)
+        left_end = (heard_end[anchor_of[last]] if last >= 0
+                    else heard_start[0])
+        right_start = (heard_start[anchor_of[nxt]] if nxt is not None
+                       else heard_end[-1])
+        run = (nxt if nxt is not None else m) - last
+        offset = ref_index - last
+        span = max(right_start - left_end, 0.02 * run)
+        token_start[ref_index] = left_end + span * (offset - 1) / run
+        token_end[ref_index] = left_end + span * offset / run
+
+    # Keep the timeline strictly increasing: interpolation can make neighbours
+    # touch, and downstream consumers expect a monotone word stream.
+    for index in range(1, m):
+        if token_start[index] < token_end[index - 1]:
+            token_start[index] = token_end[index - 1]
+        if token_end[index] <= token_start[index]:
+            token_end[index] = token_start[index] + 0.02
+
+    new_words = []
+    for index, (prefix, token) in enumerate(zip(space_prefixes(tokens), tokens)):
+        source = words[anchor_of[index]] if index in anchor_of else None
+        new_words.append({
+            "word": f"{prefix}{token}",
+            "start": round(token_start[index], 3),
+            "end": round(token_end[index], 3),
+            # A word the reference supplied but no pass matched keeps average
+            # evidence, never full confidence: it stays contestable downstream.
+            "probability": (source.get("probability", 0.5) if source
+                            else float(item.get("confidence", 0.5))),
+            "agreement": (source.get("agreement", 0.5) if source
+                          else float(item.get("agreement", 0.5))),
+            "votes": source.get("votes", 0) if source else 0,
+        })
+    item["words"] = new_words
+
+
+def _align_keys(heard: list[str], reference: list[str]) -> dict[int, int]:
+    """Monotone matching ref-index → heard-index over folded keys.
+
+    Longest increasing chain anchored by exact key pairs: a word aligns only
+    if it is *the same word*, never a similar-but-different one, so a
+    correction like goodbay→goodbye deliberately finds no anchor and gets an
+    interpolated time instead of inheriting a mismatched word's confidence.
+    Empty keys (pure punctuation, non-Latin scripts) match nothing.
+    """
+    by_key: dict[str, list[int]] = {}
+    for index, key in enumerate(heard):
+        if key:
+            by_key.setdefault(key, []).append(index)
+    anchors: dict[int, int] = {}
+    chain_end = -1
+    for ref_index, key in enumerate(reference):
+        if not key:
+            continue
+        heard_index = next((h for h in by_key.get(key, ()) if h > chain_end), None)
+        if heard_index is not None:
+            anchors[ref_index] = heard_index
+            chain_end = heard_index
+    return anchors
+
+
 def refine_segments(segments: list[dict], guide: dict | None) -> list[dict]:
     """Use exact lyric spelling only for lines Whisper already corroborated."""
     tracks = (guide or {}).get("tracks", [])
@@ -442,6 +543,10 @@ def refine_segments(segments: list[dict], guide: dict | None) -> list[dict]:
                 item["text"] = best
                 item["referenceScore"] = round(score, 4)
                 item["referenceProvider"] = "LRCLIB"
+                # The words are what Lyrixa cuts clips from: replacing only
+                # `text` used to export the superseded tokens at the new
+                # line's boundaries, silently.
+                _resync_words(item, best)
         item["track"] = {
             "artist": track.get("artist", ""), "title": track.get("title", ""),
         }

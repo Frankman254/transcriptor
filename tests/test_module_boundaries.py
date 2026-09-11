@@ -33,6 +33,7 @@ ALLOWED = {
     "paths": set(),
     "catalogs": set(),
     "config": set(),
+    "jobhub": set(),
     "textjoin": set(),
     "audio_analysis": set(),
     "consensus": {"textjoin"},
@@ -47,8 +48,23 @@ ALLOWED = {
     "transcribe_engines": {"paths", "consensus", "textjoin"},
     "precision": {"paths", "consensus", "textjoin", "transcribe_engines",
                   "audio_analysis", "translation"},
-    # La cima: puede usarlo todo, y nadie puede usarla a ella.
-    "server": set(MODULES) - {"server"},
+    # El lado servidor del motor: utilidades de ruta/trabajo y el CLI de
+    # whisper. Nada del pipeline web entra aquí.
+    "serveutil": {"paths"},
+    "whispercli": {"paths", "serveutil"},
+    # El trabajo largo: invoca el motor y publica eventos. No conoce FastAPI.
+    "pipelines": {"audio_analysis", "catalogs", "jobhub", "jobstore",
+                  "lyrixa_bridge", "media", "paths", "precision", "serveutil",
+                  "track_guides", "translation", "whispercli"},
+    # La fachada HTTP, partida por familia de rutas; cada una solo mira hacia
+    # abajo. `routes_jobs` es la única que arranca pipelines.
+    "routes_system": {"catalogs", "config", "lyrixa_bridge", "media", "paths",
+                      "precision", "serveutil", "translation"},
+    "routes_jobs": {"catalogs", "jobhub", "jobstore", "paths", "pipelines",
+                    "track_guides", "translation"},
+    "routes_serve": {"jobhub", "jobstore", "paths", "serveutil"},
+    # El cableado: solo monta routers; el trabajo real ya no vive aquí.
+    "server": {"config", "routes_system", "routes_jobs", "routes_serve"},
 }
 
 
