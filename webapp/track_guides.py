@@ -37,6 +37,16 @@ _TIMED_LINE = re.compile(
 )
 _LRC_LINE = re.compile(r"^\[(\d{1,3}):(\d{2}(?:\.\d+)?)\]\s*(.*)$")
 _CREDIT_SPLIT = re.compile(r"\s+[-–—]\s+", re.UNICODE)
+# Créditos de invitados: lo que va después no es el artista principal.
+_CREDIT_GUEST = re.compile(
+    r"\s*(?:\bfeat\b\.?|\bft\b\.?|\bfeaturing\b|\bwith\b|\bvs\b\.?|"
+    r"[,&×]|\bx\b)\s*", re.IGNORECASE)
+# Umbral de coincidencia de artista. Calibrado sobre una mezcla real de 19
+# temas: los aciertos quedaron en 0.81–1.00 y los falsos positivos en 0.00–0.47.
+ARTIST_MIN = 0.62
+# Horquilla de duración referencia/hueco en la mezcla.
+DURATION_MIN_RATIO = 0.5
+DURATION_MAX_RATIO = 2.5
 _VERSION = re.compile(
     r"\s*[\[(](?:[^\])]*(?:remix|rmx|mix|edit|version|vocal|club|extended|"
     r"radio|original|promo|nightcore)[^\])]*)[\])]",
@@ -161,6 +171,40 @@ def _similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _primary_artist(value: str) -> str:
+    """El nombre principal, sin los invitados.
+
+    "lapix feat. YUC'e" y "lapix" son el mismo artista, pero como cadenas se
+    parecen poco: comparar también los nombres principales evita descartar un
+    acierto por culpa de un crédito más largo.
+    """
+    return _CREDIT_GUEST.split(value or "", maxsplit=1)[0].strip() or (value or "")
+
+
+def artist_agreement(track_artist: str, candidate_artist: str) -> float | None:
+    """Cuánto coinciden dos créditos, o `None` si no se pueden comparar.
+
+    `_fold` se queda solo con letras latinas, así que un artista escrito
+    entero en japonés queda en blanco.  Ahí no hay juicio posible y devolvemos
+    `None`: mejor dejar decidir a la duración que inventar un cero.
+    """
+    if not _fold(track_artist) or not _fold(candidate_artist):
+        return None
+    return max(
+        _similarity(track_artist, candidate_artist),
+        _similarity(_primary_artist(track_artist), _primary_artist(candidate_artist)),
+    )
+
+
+def duration_ratio(track: Track, candidate: dict) -> float | None:
+    """Duración de la referencia partido por la del hueco en la mezcla."""
+    slot = float(track.end or 0.0) - float(track.start or 0.0)
+    reference = float(candidate.get("duration") or 0.0)
+    if slot <= 0 or reference <= 0:
+        return None
+    return reference / slot
+
+
 def candidate_score(track: Track, candidate: dict) -> float:
     title = candidate.get("trackName") or candidate.get("name") or ""
     artist = candidate.get("artistName") or ""
@@ -168,14 +212,54 @@ def candidate_score(track: Track, candidate: dict) -> float:
         _similarity(track.title, title),
         _similarity(_search_title(track.title), _search_title(title)),
     )
-    artist_score = _similarity(track.artist, artist) if track.artist else 0.7
+    agreement = artist_agreement(track.artist, artist) if track.artist else None
+    artist_score = 0.7 if agreement is None else agreement
     content = 0.06 if candidate.get("plainLyrics") else 0.0
     synced = 0.04 if candidate.get("syncedLyrics") else 0.0
     return title_score * 0.72 + artist_score * 0.18 + content + synced
 
 
+def plausible_candidate(track: Track, candidate: dict) -> bool:
+    """Filtros duros antes de aceptar una referencia.
+
+    El título solo no basta.  "Ariel" existe en LRCLIB como canción de Dean
+    Friedman (1977, en inglés) y ese texto acabaría de `initial_prompt` sobre
+    un tema japonés, que es exactamente cómo Whisper empieza a transcribir
+    fonéticamente en inglés algo que se canta en japonés.  Una referencia
+    equivocada hace más daño que ninguna, así que en la duda se descarta.
+    """
+    agreement = artist_agreement(track.artist, candidate.get("artistName") or "")
+    if track.artist and agreement is not None and agreement < ARTIST_MIN:
+        return False
+    ratio = duration_ratio(track, candidate)
+    # Un remix corta o alarga, pero no convierte un tema de 3:30 en uno de 32
+    # segundos: fuera de esta horquilla no es la misma grabación.
+    if ratio is not None and not (DURATION_MIN_RATIO <= ratio <= DURATION_MAX_RATIO):
+        return False
+    return True
+
+
+def still_plausible(track: Track, reference: dict | None) -> bool:
+    """Revalida una referencia que ya estaba en caché.
+
+    El caché guarda la elección, no los candidatos, así que un acierto
+    dudoso de una versión anterior volvería tal cual y se saltaría los
+    filtros.  Comprobarlo al leer cuesta nada y repara también los trabajos
+    ya procesados, sin pedir a nadie que borre la caché a mano.
+    """
+    if not reference:
+        return True
+    return plausible_candidate(track, {
+        "artistName": reference.get("artist") or "",
+        "trackName": reference.get("title") or "",
+        "duration": reference.get("duration"),
+    })
+
+
 def best_candidate(track: Track, candidates: list[dict]) -> dict | None:
-    usable = [candidate for candidate in candidates if not candidate.get("instrumental")]
+    usable = [candidate for candidate in candidates
+              if not candidate.get("instrumental")
+              and plausible_candidate(track, candidate)]
     if not usable:
         return None
     best = max(usable, key=lambda candidate: candidate_score(track, candidate))
@@ -258,7 +342,9 @@ def fetch_reference(track: Track, cache_dir: Path, timeout: float = 12.0) -> dic
                 # nombre genérico "URLError". Ese valor no sirve para decidir
                 # nada y debe reintentarse inmediatamente.
                 legacy_ssl_failure = cached.get("error") == "URLError"
-                if reference or (age < ttl and not legacy_ssl_failure):
+                if reference and not still_plausible(track, reference):
+                    reference = None    # elección de una versión sin filtros
+                elif reference or (age < ttl and not legacy_ssl_failure):
                     track.lookup = {
                         "status": "found" if reference else
                                   "error" if cached.get("error") else "no_match",
@@ -266,7 +352,7 @@ def fetch_reference(track: Track, cache_dir: Path, timeout: float = 12.0) -> dic
                         "error": cached.get("error"),
                     }
                     return reference or None
-            elif cached:
+            elif cached and still_plausible(track, cached):
                 track.lookup = {"status": "found", "candidates": 1,
                                 "error": None}
                 return cached
@@ -365,6 +451,54 @@ def reference_lines(reference: dict | None) -> list[str]:
         lines = [line.strip() for line in (reference.get("plain") or "").splitlines()
                  if line.strip()]
     return lines
+
+
+# --------------------------------------------------------------------------- #
+# Pistas de idioma a partir del tracklist
+# --------------------------------------------------------------------------- #
+_KANA = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
+_HAN = re.compile(r"[\u4e00-\u9fff]")
+_HANGUL = re.compile(r"[\uac00-\ud7af\u1100-\u11ff]")
+
+
+def script_hint(text: str) -> str | None:
+    """El idioma que delata la escritura de un crédito o de una letra.
+
+    Kana es japonés sin discusión.  Han a secas sería ambiguo entre japonés y
+    chino, pero en este material (doujin, core, Vocaloid) el chino es raro y el
+    japonés es la norma, así que se resuelve a japonés; quien tenga una mezcla
+    china fija el idioma a mano.
+    """
+    if not text:
+        return None
+    if _HANGUL.search(text):
+        return "ko"
+    if _KANA.search(text) or _HAN.search(text):
+        return "ja"
+    return None
+
+
+def language_priors(guide: dict | None) -> list[dict]:
+    """Qué idioma se espera en cada tramo, según quién firma la pista.
+
+    El tracklist lo escribe una persona que sabe qué puso: si el crédito está
+    en japonés, ese tramo se canta en japonés.  Es una evidencia más firme que
+    el detector de Whisper, que sobre un stem con instrumental colado tiende a
+    responder "inglés" para casi cualquier cosa — y una vez que responde
+    inglés, transcribe el japonés fonéticamente y la letra se pierde entera.
+    """
+    tracks = (guide or {}).get("tracks") or []
+    out: list[dict] = []
+    for track in tracks:
+        label = track.get("label") or ""
+        reference = track.get("reference") or {}
+        hint = script_hint(label) or script_hint(reference.get("plain") or "")
+        if not hint:
+            continue
+        start, end = float(track.get("start") or 0.0), float(track.get("end") or 0.0)
+        if end > start:
+            out.append({"start": start, "end": end, "language": hint})
+    return out
 
 
 def prompt_spans(guide: dict | None, max_chars: int = 1400) -> list[dict]:

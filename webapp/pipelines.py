@@ -50,6 +50,7 @@ def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
         stability_target=spec["stability"],
         engine_preference=asr_engine,
         prompt_spans=track_guides.prompt_spans(guide),
+        language_priors=track_guides.language_priors(guide),
         segment_refiner=(
             (lambda segments: track_guides.refine_segments(segments, guide))
             if guide else None
@@ -291,7 +292,7 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
             lines, line_languages = read_clip_lines(outdir / files["json"])
             language_report = translation.translate_clip_lines(
                 lines, line_languages, source=detected_language,
-                target=translate_to, romanize=romaji, emit=emit)
+                target=translate_to, romaji=romaji, emit=emit)
             translated_lines = language_report["lines"]
             romaji_lines = language_report["romaji"]
             translation_language = language_report["targetLanguage"]
@@ -420,7 +421,7 @@ def resume_precision_pipeline(
             lines, line_languages = read_clip_lines(outdir / files["json"])
             language_report = translation.translate_clip_lines(
                 lines, line_languages, source=detected_language,
-                target=translate_to, romanize=romaji, emit=emit)
+                target=translate_to, romaji=romaji, emit=emit)
             translated_lines = language_report["lines"]
             romaji_lines = language_report["romaji"]
             translation_language = language_report["targetLanguage"]
@@ -493,7 +494,7 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
              message="Añadiendo capas al resultado guardado; no repetiré Whisper…")
         report = translation.translate_clip_lines(
             lines, languages, source=source_language, target=target,
-            romanize=romanize, emit=emit)
+            romaji=romanize, emit=emit)
         emit("translation", routeLabel=report["routeLabel"],
              backend=report["backend"],
              romajiBackend=report.get("romajiBackend"),

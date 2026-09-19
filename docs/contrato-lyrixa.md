@@ -32,6 +32,7 @@ Su identidad es `sourceId`, y es **la misma en todas las capas**:
 |------|-----------|---------------|------------|
 | Letra | `layer-main` | `clip-main-000042` | `line-000042` |
 | Traducción | `layer-backing` | `clip-es-000042` | `line-000042` |
+| Romaji | `layer-romaji` | `clip-romaji-000042` | `line-000042` |
 
 Reglas:
 
@@ -77,16 +78,18 @@ Lo que emite hoy el puente:
 |------|-------------|--------|------------|-------|
 | `layer-main` | `lyrics` | `primary` | idioma cantado | `bottom` |
 | `layer-backing` | `backing` | `translation` / `backing` | idioma destino | `top` |
+| `layer-romaji` | `lyrics` | `transliteration` | idioma cantado | `bottom` desplazado |
 | `layer-fx` | `fx` | `fx` | — | `top-right` |
 
-**Las tres salen siempre**, aunque el trabajo no lleve traducción: en ese caso
-la capa 1 va vacía y marcada `backing` en vez de `translation` (un canal vacío
-no es traducción de nada). El motivo es que el `order` tiene que significar lo
-mismo en todas las exportaciones — si la capa 1 desapareciera, la de FX pasaría
-de `order: 2` a `order: 1` y una escena de LiveWallpaper montada sobre «la capa
-2» se rompería según el trabajo que se abriese.
+**Las cuatro salen siempre**, aunque el trabajo no lleve traducción ni
+japonés. Sin traducción, la capa 1 va vacía y marcada `backing` en vez de
+`translation` (un canal vacío no es traducción de nada); sin romaji, la capa 2
+va vacía y `visible: false`. El motivo es que el `order` tiene que significar
+lo mismo en todas las exportaciones — si una capa desapareciera, la de FX
+cambiaría de número y una escena de Vibrix montada sobre «la capa 3» se
+rompería según el trabajo que se abriese.
 
-La capa 2 no lleva letra: lleva comandos para el renderer, y su
+La capa 3 no lleva letra: lleva comandos para el renderer, y su
 `suppressClipText: true` es lo que la convierte en un canal de órdenes. El
 Transcriptor la emite vacía y no la interpreta nunca.
 Ver [contrato-capa-fx.md](contrato-capa-fx.md).
@@ -97,14 +100,33 @@ los clips de una capa de forma absoluta según su preset, así que dos capas con
 
 ### Romaji
 
-El romaji sustituye el texto de la capa principal y el original se conserva en
-`clip.originalText`. La capa sigue siendo `role: "primary"` —es la voz
-principal, y un renderizador que oculte las capas de transliteración no debe
-dejar la pantalla sin letra— y declara `romanized: true`.
+**Desde `bridgeSchemaVersion: 4` el romaji es su propia capa** y la letra
+original no se toca nunca. Antes sustituía el texto del clip principal y
+guardaba el original en `clip.originalText`; leer una mezcla japonesa así
+obligaba a elegir entre ver los kanji o ver cómo suenan.
 
-Si algún día hace falta el japonés y el romaji **a la vez**, el sitio correcto
-es una tercera capa con `role: "transliteration"` y su propia ancla. No existe
-hoy porque nadie la ha pedido.
+Las tres lecturas de un mismo verso comparten `sourceId` y se distinguen por
+`layerId`, así que Lyrixa las empareja sola y Vibrix puede encender o apagar
+cada una por separado:
+
+| Capa | Qué lleva |
+|------|-----------|
+| `layer-main` | 君の名は |
+| `layer-backing` | Tu nombre |
+| `layer-romaji` | kimi no na wa |
+
+Detalles:
+
+- La capa principal declara `romanized: false` **siempre**: lo que dice el
+  romaji es la capa de romaji.
+- `clip.originalText` ya no se emite. Un `.lyrixa.json` viejo que lo lleve
+  sigue siendo válido: Lyrixa y Vibrix lo entienden.
+- Una línea que ya estaba en alfabeto latino no genera clip de romaji — su
+  transliteración sería idéntica y solo añadiría ruido. Por eso la capa de
+  romaji suele tener menos clips que la principal.
+- `role: "transliteration"` está en `DERIVED_TEXT_ROLES` de Lyrixa: editar el
+  verso original marca su romaji como desactualizado, que es justo lo que se
+  quiere en una revisión humana.
 
 ## 4. API local
 

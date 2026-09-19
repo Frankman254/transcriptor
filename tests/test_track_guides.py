@@ -125,5 +125,123 @@ class TrackGuideTests(unittest.TestCase):
         self.assertEqual(refined[1]["text"], "everybody everybody")
 
 
+class ReferencePlausibilityTests(unittest.TestCase):
+    """Una referencia equivocada hace más daño que ninguna.
+
+    Su letra acaba de `initial_prompt` sobre el tramo, y eso es exactamente
+    cómo un tema japonés termina transcrito fonéticamente en inglés.
+    """
+
+    def track(self, artist, title, *, start=0.0, end=247.0):
+        return guides.Track(start=start, artist=artist, title=title,
+                            label=f"{artist} - {title}", end=end)
+
+    def candidate(self, artist, title, duration, *, plain="letra"):
+        return {"artistName": artist, "trackName": title,
+                "duration": duration, "plainLyrics": plain}
+
+    def test_the_same_title_by_another_artist_is_not_the_same_song(self):
+        # Caso real: "KARUT feat. 紫崎雪 - Ariel" contra el "Ariel" de Dean
+        # Friedman, 1977, en inglés.
+        track = self.track("KARUT feat. 紫崎雪", "Ariel")
+        self.assertFalse(guides.plausible_candidate(
+            track, self.candidate("Dean Friedman", "Ariel", 262.0)))
+
+    def test_a_guest_credit_does_not_break_a_real_match(self):
+        # "lapix feat. YUC'e" y "lapix" son el mismo artista principal.
+        track = self.track("lapix feat. YUC'e", "Blue Love", end=235.0)
+        self.assertTrue(guides.plausible_candidate(
+            track, self.candidate("lapix", "Blue Love", 230.0)))
+
+    def test_a_wildly_different_duration_is_another_recording(self):
+        track = self.track("Mameyudoufu", "Quality Control", end=214.0)
+        self.assertFalse(guides.plausible_candidate(
+            track, self.candidate("Mameyudoufu", "Quality Control", 32.0)))
+
+    def test_an_artist_written_only_in_japanese_is_judged_by_duration(self):
+        # `_fold` se queda con letras latinas, así que un nombre en japonés se
+        # queda en blanco: ahí no hay juicio de artista posible y no se puede
+        # descartar por eso.
+        self.assertIsNone(guides.artist_agreement("中村さんそ", "Mameyudoufu"))
+        track = self.track("中村さんそ", "Fluffy", end=149.0)
+        self.assertTrue(guides.plausible_candidate(
+            track, self.candidate("Mameyudoufu", "Fluffy", 194.0)))
+
+    def test_best_candidate_refuses_a_list_of_impostors(self):
+        track = self.track("PSYQUI", "Nervousness", end=128.0)
+        self.assertIsNone(guides.best_candidate(
+            track, [self.candidate("Joon", "nervousness", 215.0)]))
+
+
+class LanguagePriorTests(unittest.TestCase):
+
+    def guide(self, *labels):
+        tracks = []
+        for index, label in enumerate(labels):
+            artist, _, title = label.partition(" - ")
+            tracks.append({"start": index * 100.0, "end": (index + 1) * 100.0,
+                           "artist": artist, "title": title, "label": label})
+        return {"tracks": tracks}
+
+    def test_a_japanese_credit_marks_the_span_as_japanese(self):
+        priors = guides.language_priors(
+            self.guide("KARUT feat. 紫崎雪 - Ariel", "braven - Start Again"))
+        self.assertEqual(priors, [{"start": 0.0, "end": 100.0,
+                                   "language": "ja"}])
+
+    def test_a_latin_credit_claims_nothing(self):
+        self.assertEqual(guides.language_priors(
+            self.guide("lapix - Living Dead")), [])
+
+    def test_the_script_of_the_reference_lyrics_also_counts(self):
+        guide = self.guide("Some Artist - Some Title")
+        guide["tracks"][0]["reference"] = {"plain": "きみの名前を呼ぶ"}
+        self.assertEqual(guides.language_priors(guide)[0]["language"], "ja")
+
+    def test_hangul_is_korean_not_japanese(self):
+        self.assertEqual(guides.script_hint("아이유 - Love wins all"), "ko")
+
+
+class CachedReferenceRevalidationTests(unittest.TestCase):
+    """El caché guarda la elección, no los candidatos.
+
+    Un acierto dudoso de una versión sin filtros volvería tal cual y se los
+    saltaría enteros, así que se revalida al leer.
+    """
+
+    def test_a_cached_impostor_is_dropped_and_searched_again(self):
+        track = guides.Track(start=0.0, artist="KARUT feat. 紫崎雪",
+                             title="Ariel", label="KARUT - Ariel", end=247.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            guides._cache_path(cache, track).write_text(json.dumps({
+                "reference": {"provider": "LRCLIB", "artist": "Dean Friedman",
+                              "title": "Ariel", "duration": 262.0,
+                              "plain": "Way on the other side"},
+                "fetchedAt": time.time(), "error": None, "candidateCount": 17,
+            }), encoding="utf-8")
+            with mock.patch.object(guides, "_search_candidates",
+                                   return_value=[]) as search:
+                self.assertIsNone(guides.fetch_reference(track, cache))
+            self.assertTrue(search.called)
+
+    def test_a_cached_good_match_is_served_without_a_search(self):
+        track = guides.Track(start=0.0, artist="YUC'e", title="Pump",
+                             label="YUC'e - Pump", end=117.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            guides._cache_path(cache, track).write_text(json.dumps({
+                "reference": {"provider": "LRCLIB", "artist": "YUC'e",
+                              "title": "PUMP", "duration": 194.0,
+                              "plain": "pump it up"},
+                "fetchedAt": time.time(), "error": None, "candidateCount": 3,
+            }), encoding="utf-8")
+            with mock.patch.object(guides, "_search_candidates") as search:
+                reference = guides.fetch_reference(track, cache)
+            self.assertEqual(reference["artist"], "YUC'e")
+            self.assertFalse(search.called)
+
+
+
 if __name__ == "__main__":
     unittest.main()

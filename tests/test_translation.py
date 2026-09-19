@@ -8,6 +8,7 @@ language quality is the local model's job.
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -201,6 +202,40 @@ class MultilingualGroupingTests(unittest.TestCase):
         routes = {code: T.plan_route(code, "es") for code in groups}
         self.assertEqual(routes["ja"], [("ja", "en"), ("en", "es")])
         self.assertEqual(routes["en"], [("en", "es")])
+
+
+class ClipRomanizationTests(unittest.TestCase):
+    """El romaji se pedía y no salía, sin un solo error visible.
+
+    El parámetro se llamaba `romanize` igual que la función del módulo, así
+    que la tapaba: la llamada reventaba con "'bool' object is not callable",
+    el `except` se lo tragaba y el trabajo terminaba con la capa vacía y la
+    etapa "romanizing" en 0.0 s.
+    """
+
+    def test_japanese_lines_come_back_romanized(self):
+        with mock.patch.object(T, "romanize",
+                               return_value=(["kimi no na wa"], "test")):
+            report = T.translate_clip_lines(
+                ["君の名は", "hello"], ["ja", "en"], source=None, target="",
+                romaji=True, emit=lambda *a, **k: None)
+        self.assertEqual(report["romaji"], ["kimi no na wa", "hello"])
+        self.assertEqual(report["romajiBackend"], "test")
+        self.assertIsNone(report["error"])
+
+    def test_asking_for_no_romaji_leaves_the_channel_empty(self):
+        report = T.translate_clip_lines(
+            ["君の名は"], ["ja"], source=None, target="", romaji=False,
+            emit=lambda *a, **k: None)
+        self.assertIsNone(report["romaji"])
+
+    def test_a_romanizer_that_fails_says_so_instead_of_staying_silent(self):
+        with mock.patch.object(T, "romanize", side_effect=RuntimeError("boom")):
+            report = T.translate_clip_lines(
+                ["君の名は"], ["ja"], source=None, target="", romaji=True,
+                emit=lambda *a, **k: None)
+        self.assertIsNone(report["romaji"])
+        self.assertIn("boom", report["error"])
 
 
 if __name__ == "__main__":

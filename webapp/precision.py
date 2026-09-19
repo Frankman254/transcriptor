@@ -48,6 +48,15 @@ DEFAULT_MAX_PASSES = 5
 DOMINANT_LANGUAGE_SHARE = 0.97
 MIN_LANGUAGE_PROBABILITY = 0.60
 
+# Cuánto tiene que sumar un idioma que no sea inglés dentro de un tramo con
+# pista de idioma para quedarse con el tramo entero.  El umbral es bajo a
+# propósito y la asimetría está justificada: sobre voz con instrumental colado
+# Whisper responde "inglés" por defecto, pero casi nunca inventa japonés — para
+# decir "ja" tiene que oír fonética japonesa.  Una minoría en japonés dentro de
+# una canción pesa más que una mayoría en inglés, porque dentro de una misma
+# canción no cambia quién canta ni en qué idioma.
+PRIOR_MINORITY_SHARE = 0.15
+
 # Gate del rescate: una zona donde el consenso tiene letra sostenida por dos o
 # más pasadas no se reemplaza jamás contra UNA sola hipótesis del mix. Una
 # pasada sobre audio con música nunca aporta evidencia más fuerte que varios
@@ -68,6 +77,7 @@ class PrecisionConfig:
     workers: int | None = None
     initial_prompt: str | None = None
     prompt_spans: list[dict] = field(default_factory=list)
+    language_priors: list[dict] = field(default_factory=list)
     segment_refiner: Callable[[list[dict]], list[dict]] | None = None
 
 
@@ -306,9 +316,45 @@ def _by_region(detected: list[tuple[float, float, str]],
     return spans
 
 
+def _apply_priors(spans: list[tuple[float, float, str]],
+                  priors: list[dict]) -> list[tuple[float, float, str]]:
+    """Reescribe los tramos que el tracklist dice que no están en inglés.
+
+    Un tramo con pista de idioma se queda entero con ese idioma si el detector
+    lo apoya aunque sea en minoría, o si el detector solo vio inglés — que es
+    justo el fallo que la pista está para corregir.  Si el detector vio otro
+    idioma distinto del inglés y distinto de la pista, manda el detector: oyó
+    el audio y la pista solo leyó un nombre.
+    """
+    if not priors or not spans:
+        return spans
+    out = list(spans)
+    for prior in priors:
+        start, end = float(prior["start"]), float(prior["end"])
+        expected = prior["language"]
+        inside = [index for index, (a, b, _) in enumerate(out)
+                  if min(b, end) - max(a, start) > 0]
+        if not inside:
+            continue
+        seconds: dict[str, float] = {}
+        for index in inside:
+            a, b, language = out[index]
+            seconds[language] = seconds.get(language, 0.0) + (b - a)
+        total = sum(seconds.values()) or 1.0
+        others = {k: v for k, v in seconds.items() if k not in ("en", expected)}
+        if others and max(others.values()) / total >= PRIOR_MINORITY_SHARE:
+            continue                    # el detector oyó otra cosa: le creemos
+        if seconds.get(expected, 0.0) / total >= PRIOR_MINORITY_SHARE or (
+                set(seconds) <= {"en"}):
+            for index in inside:
+                a, b, _ = out[index]
+                out[index] = (a, b, expected)
+    return out
+
+
 def _detect_language(executor: ProcessPoolExecutor, name: str, total: int,
                      windows: list[aa.Window], regions: list[aa.SpeechRegion],
-                     emit) -> LanguageMap:
+                     emit, priors: list[dict] | None = None) -> LanguageMap:
     """Detect the language of every window, then decide if one rules them all."""
     if not windows:
         return LanguageMap()
@@ -333,7 +379,7 @@ def _detect_language(executor: ProcessPoolExecutor, name: str, total: int,
     detected.sort()
     # Region first, then smoothing: a whole region detected as something odd
     # between two regions that agree is still noise.
-    spans = _smooth(_by_region(detected, regions))
+    spans = _apply_priors(_smooth(_by_region(detected, regions)), priors or [])
 
     seconds: dict[str, float] = {}
     for start, end, language in spans:
@@ -456,7 +502,8 @@ def run(audio: Path, config: PrecisionConfig, emit,
                 spans=[(0.0, float("inf"), forced)], seconds={forced: speech})
         else:
             languages = _detect_language(
-                executor, name, samples, base_windows, regions, emit)
+                executor, name, samples, base_windows, regions, emit,
+                priors=config.language_priors)
             if languages.multilingual:
                 mix = " · ".join(
                     f"{code} {seconds / 60:.0f} min"

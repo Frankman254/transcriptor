@@ -206,12 +206,14 @@ normal), el modo ultra escribe:
 
 - `<título>.letra.txt` — original, romaji y traducción una debajo de otra,
   para revisarlo sin abrir un JSON de varios megas.
-- `<título>.lyrixa.json` — el proyecto con **dos capas de texto**:
-  `layer-main` (`role: "primary"`) con la letra, y `layer-backing`
-  (`role: "translation"`) con la traducción en los mismos tiempos al
-  milisegundo. Cada clip traducido apunta con `sourceId` al clip que traduce.
-  Si hubo romaji, el clip principal lleva el romaji en `text` y el original en
-  `originalText`.
+- `<título>.lyrixa.json` — el proyecto con **tres capas de texto**:
+  `layer-main` (`role: "primary"`) con la letra en su escritura original,
+  `layer-backing` (`role: "translation"`) con la traducción y `layer-romaji`
+  (`role: "transliteration"`) con el romaji, las tres en los mismos tiempos al
+  milisegundo. Las tres lecturas de un mismo verso comparten `sourceId`, así
+  que se pueden encender y apagar por separado sin desemparejarlas. La cuarta
+  capa, `layer-fx`, sale siempre vacía: es el canal de efectos
+  ([contrato-capa-fx.md](../docs/contrato-capa-fx.md)).
 
 En la interfaz, las líneas con menos del 80% de acuerdo entre pasadas salen
 marcadas en ámbar: son las que conviene escuchar antes de darlas por buenas.

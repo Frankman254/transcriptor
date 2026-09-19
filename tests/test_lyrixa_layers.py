@@ -11,6 +11,7 @@ from lyrixa_bridge import (  # noqa: E402
     HARD_MAX_DURATION,
     MAIN_LAYER_ID,
     FX_LAYER_ID,
+    ROMAJI_LAYER_ID,
     TRANSLATION_LAYER_ID,
     build_lyrixa_envelope,
     clip_lines,
@@ -179,18 +180,19 @@ class TwoLayerEnvelopeTests(unittest.TestCase):
             self.assertEqual(target["endTime"], source["endTime"])
 
     def test_without_a_translation_the_channel_exists_but_is_empty(self):
-        # Las tres capas salen siempre: un canal vacío se puede rellenar a
-        # mano en Lyrixa, y que estén siempre las tres mantiene el `order`
+        # Las cuatro capas salen siempre: un canal vacío se puede rellenar a
+        # mano en Lyrixa, y que estén siempre las cuatro mantiene el `order`
         # estable entre trabajos, que es de lo que depende una escena de
-        # LiveWallpaper montada sobre la capa 2.
+        # Vibrix montada sobre una capa concreta.
         project = self.envelope(translations=None,
                                 translation_language=None)["project"]
         by_id = {layer["id"]: layer for layer in project["layers"]}
         self.assertEqual(set(by_id), {MAIN_LAYER_ID, TRANSLATION_LAYER_ID,
-                                      FX_LAYER_ID})
+                                      ROMAJI_LAYER_ID, FX_LAYER_ID})
         self.assertEqual([by_id[i]["order"] for i in
-                          (MAIN_LAYER_ID, TRANSLATION_LAYER_ID, FX_LAYER_ID)],
-                         [0, 1, 2])
+                          (MAIN_LAYER_ID, TRANSLATION_LAYER_ID,
+                           ROMAJI_LAYER_ID, FX_LAYER_ID)],
+                         [0, 1, 2, 3])
         # Vacío y sin idioma, así que no dice ser una traducción de nada.
         self.assertEqual(by_id[TRANSLATION_LAYER_ID]["role"], "backing")
         self.assertIsNone(by_id[TRANSLATION_LAYER_ID]["language"])
@@ -208,23 +210,52 @@ class TwoLayerEnvelopeTests(unittest.TestCase):
         self.assertEqual([c for c in project["clips"]
                           if c["layerId"] == FX_LAYER_ID], [])
 
-    def test_romaji_replaces_the_line_but_keeps_the_original_script(self):
+    def test_romaji_is_its_own_layer_and_never_touches_the_original(self):
+        # Leer una mezcla japonesa no puede obligar a elegir entre los kanji y
+        # cómo suenan: las dos lecturas conviven, cada una en su capa.
         lines = clip_lines({"segments": [LONG]})
         romaji = [f"romaji {i}" for i in range(len(lines))]
         project = self.envelope(romaji=romaji)["project"]
         main = [c for c in project["clips"] if c["layerId"] == MAIN_LAYER_ID]
-        self.assertEqual([c["text"] for c in main], romaji)
-        self.assertEqual([c["originalText"] for c in main], lines)
-        # The visible lyric text is the romaji, so that is what Lyrixa lists.
-        self.assertEqual(project["normalizedLyrics"], romaji)
+        reading = [c for c in project["clips"]
+                   if c["layerId"] == ROMAJI_LAYER_ID]
+        self.assertEqual([c["text"] for c in main], lines)
+        self.assertEqual([c["text"] for c in reading], romaji)
+        self.assertNotIn("originalText", main[0])
+        # La letra que Lyrixa lista sigue siendo la original.
+        self.assertEqual(project["normalizedLyrics"], lines)
+
+    def test_the_romaji_layer_pairs_with_the_original_by_source_id(self):
+        # Mismo `sourceId`, ids distintos: así siguen emparejadas aunque
+        # alguien recorte o sustituya un clip en Lyrixa.
+        lines = clip_lines({"segments": [LONG]})
+        romaji = [f"romaji {i}" for i in range(len(lines))]
+        project = self.envelope(romaji=romaji, translations=None,
+                                translation_language=None)["project"]
+        by_layer = {MAIN_LAYER_ID: [], ROMAJI_LAYER_ID: []}
+        for clip in project["clips"]:
+            by_layer.setdefault(clip["layerId"], []).append(clip)
+        main, reading = by_layer[MAIN_LAYER_ID], by_layer[ROMAJI_LAYER_ID]
+        self.assertEqual([c["sourceId"] for c in main],
+                         [c["sourceId"] for c in reading])
+        self.assertTrue(set(c["id"] for c in main)
+                        .isdisjoint(c["id"] for c in reading))
 
     def test_a_short_romaji_list_never_truncates_the_lyric(self):
         lines = clip_lines({"segments": [LONG]})
         project = self.envelope(romaji=["solo la primera"])["project"]
         main = [c for c in project["clips"] if c["layerId"] == MAIN_LAYER_ID]
-        self.assertEqual(len(main), len(lines))
-        self.assertEqual(main[0]["text"], "solo la primera")
-        self.assertEqual(main[1]["text"], lines[1])
+        reading = [c for c in project["clips"]
+                   if c["layerId"] == ROMAJI_LAYER_ID]
+        self.assertEqual([c["text"] for c in main], lines)
+        self.assertEqual([c["text"] for c in reading], ["solo la primera"])
+
+    def test_a_line_already_in_latin_script_gets_no_romaji_clip(self):
+        # Su romaji es idéntico al original: duplicarlo sería una capa de ruido.
+        lines = clip_lines({"segments": [LONG]})
+        project = self.envelope(romaji=list(lines))["project"]
+        self.assertEqual([c for c in project["clips"]
+                          if c["layerId"] == ROMAJI_LAYER_ID], [])
 
     def test_metadata_survives_a_round_trip_through_a_file(self):
         envelope = self.envelope(precision={"passes": 5, "converged": True})

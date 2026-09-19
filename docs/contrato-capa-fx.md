@@ -6,15 +6,17 @@
 
 ## 1. La idea
 
-Las tres capas del proyecto son un canal cada una:
+Las cuatro capas del proyecto son un canal cada una:
 
 | # | id | role | Qué lleva |
 |---|----|------|-----------|
-| 0 | `layer-main` | `primary` | La letra cantada. |
+| 0 | `layer-main` | `primary` | La letra cantada, en su escritura original. |
 | 1 | `layer-backing` | `translation` / `backing` | Traducción o voz secundaria. |
-| 2 | `layer-fx` | `fx` | **Órdenes para el renderer.** |
+| 2 | `layer-romaji` | `transliteration` | Cómo suena la letra en alfabeto latino. |
+| 3 | `layer-fx` | `fx` | **Órdenes para el renderer.** |
 
-La capa 2 no lleva letra. Lleva comandos: un clip que dice `glitch 0.8` no es
+Las tres primeras son lecturas del mismo verso y comparten su `sourceId`. La
+cuarta es de otra naturaleza: no lleva letra. Lleva comandos: un clip que dice `glitch 0.8` no es
 texto que se dibuje, es una orden que enciende el glitch mientras ese clip
 dura.
 
@@ -132,15 +134,15 @@ luces sería LiveWallpaper con otro nombre.
 
 ## 6. Por qué el canal sale siempre
 
-`build_layers` emite las tres capas incluso cuando el trabajo no tiene
-traducción, con la capa 1 vacía y marcada `backing` en vez de `translation`
-(vacía no es traducción de nada).
+`build_layers` emite las cuatro capas incluso cuando el trabajo no tiene
+traducción ni japonés: la capa 1 va vacía y marcada `backing` en vez de
+`translation` (vacía no es traducción de nada), y la capa 2 va vacía y
+`visible: false`.
 
-El motivo es el `order`. Si el canal de traducción desapareciera en los
-trabajos sin traducir, la capa FX pasaría de `order: 2` a `order: 1`, y una
-escena de LiveWallpaper montada sobre «la capa 2» se rompería según el trabajo
-que se abriese. Tres canales fijos cuestan un objeto vacío y hacen que el
-número de capa signifique siempre lo mismo.
+El motivo es el `order`. Si un canal desapareciera cuando está vacío, la capa
+FX cambiaría de número según el trabajo, y una escena de Vibrix montada sobre
+«la capa 3» se rompería al abrir la siguiente. Cuatro canales fijos cuestan
+dos objetos vacíos y hacen que el número de capa signifique siempre lo mismo.
 
 ## 7. Lo que falta
 

@@ -503,7 +503,7 @@ def group_by_language(languages: list[str | None],
 
 def translate_clip_lines(lines: list[str], languages: list[str | None], *,
                          source: str | None, target: str,
-                         romanize: bool, emit) -> dict:
+                         romaji: bool, emit) -> dict:
     """Romaniza y traduce las líneas ya confirmadas por el consenso.
 
     Se hace al final a propósito: traducir un texto que todavía puede cambiar
@@ -525,8 +525,12 @@ def translate_clip_lines(lines: list[str], languages: list[str | None], *,
     routes: list[str] = []
 
     # --- Romaji: sólo los tramos que realmente se cantaron en japonés ---
+    # Ojo con el nombre: el parámetro NO puede llamarse `romanize`, porque
+    # taparía a la función `romanize()` de este mismo módulo y la llamada de
+    # abajo reventaría con "'bool' object is not callable" — silenciada por el
+    # `except` y dejando el romaji vacío sin que nadie se entere.
     romaji_lines: list[str] | None = None
-    if romanize:
+    if romaji:
         for code, indices in groups.items():
             if code not in ROMANIZABLE:
                 continue

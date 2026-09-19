@@ -74,10 +74,11 @@ CLIP_HANDOVER_GAP = 0.05
 # v3 replaced the overloaded `sourceId` with a real line identity.  A
 # consumer that only reads text and times does not care; one that pairs layers
 # does, and needs to know which contract it is looking at.
-BRIDGE_SCHEMA_VERSION = 3
+BRIDGE_SCHEMA_VERSION = 4
 
 MAIN_LAYER_ID = "layer-main"
 TRANSLATION_LAYER_ID = "layer-backing"
+ROMAJI_LAYER_ID = "layer-romaji"
 FX_LAYER_ID = "layer-fx"
 
 # Lyrixa's own vocabulary (src/core/types/layer.ts).  It says
@@ -92,6 +93,7 @@ LAYER_ROLES = ("primary", "translation", "transliteration", "backing", "fx",
 # `clip-0042-t` did not.
 MAIN_CHANNEL = "main"
 TRANSLATION_CHANNEL_FALLBACK = "tr"
+ROMAJI_CHANNEL = "romaji"
 
 _CHANNEL_UNSAFE = re.compile(r"[^a-z0-9]+")
 
@@ -492,43 +494,24 @@ def clip_languages(whisper_data: dict[str, Any]) -> list[str | None]:
             in normalize_whisper_segments(whisper_data.get("segments"))]
 
 
-def apply_romaji(clips: list[dict[str, Any]],
-                 romaji: list[str]) -> list[dict[str, Any]]:
-    """Swap each main clip's text for its transliteration.
+def derived_clips(clips: list[dict[str, Any]], texts: list[str], *,
+                  layer_id: str, channel: str,
+                  skip_identical: bool = False) -> list[dict[str, Any]]:
+    """Duplica los clips principales en otro canal, sin tocar los tiempos.
 
-    The original script is kept in `originalText`, and `words[]` keeps its
-    original tokens: the transliteration is per line, so pretending it is also
-    per word would invent word boundaries that were never measured.
+    Una línea derivada —traducción o transliteración— lleva *el mismo*
+    `sourceId` que la original, no su id: el id dice qué caja de la línea de
+    tiempo es esto, el `sourceId` dice qué verso representa.  Emparejar las
+    capas por el id funcionaba solo hasta que alguien recortaba o sustituía un
+    clip en Lyrixa.
+
+    No se copian `words[]`: el texto derivado es por línea, y fingir que
+    también es por palabra inventaría fronteras que nadie midió.
     """
     out: list[dict[str, Any]] = []
-    for clip, reading in zip(clips, romaji):
-        reading = (reading or "").strip()
-        if not reading or reading == clip["text"]:
-            out.append(clip)
-            continue
-        out.append({**clip, "text": reading, "originalText": clip["text"]})
-    # A shorter romaji list must not truncate the lyric.
-    out.extend(clips[len(out):])
-    return out
-
-
-def translation_clips(clips: list[dict[str, Any]], translations: list[str],
-                      *, language: str | None = None,
-                      ) -> list[dict[str, Any]]:
-    """Mirror the main clips onto the translation layer, timing untouched.
-
-    One translated line per main clip, carrying *the same* `sourceId` — not the
-    main clip's id.  The two are different things: the id says which box on the
-    timeline this is, the `sourceId` says which lyric line it renders.  Pairing
-    the layers through the id worked only until someone re-cut or replaced a
-    clip in Lyrixa, and it left the main layer pointing at Whisper segments
-    while the translation layer pointed at clips.
-    """
-    out: list[dict[str, Any]] = []
-    channel = channel_slug(language, TRANSLATION_CHANNEL_FALLBACK)
-    for clip, text in zip(clips, translations):
+    for clip, text in zip(clips, texts):
         text = (text or "").strip()
-        if not text:
+        if not text or (skip_identical and text == clip["text"]):
             continue
         out.append({
             "id": clip_id(channel, clip["sourceIndex"]),
@@ -537,7 +520,7 @@ def translation_clips(clips: list[dict[str, Any]], translations: list[str],
             "endTime": clip["endTime"],
             "sourceId": clip["sourceId"],
             "sourceIndex": clip["sourceIndex"],
-            "layerId": TRANSLATION_LAYER_ID,
+            "layerId": layer_id,
             "createdBy": "import",
             "transitionIn": "fade",
             "transitionOut": "fade",
@@ -546,16 +529,43 @@ def translation_clips(clips: list[dict[str, Any]], translations: list[str],
     return out
 
 
+def romaji_clips(clips: list[dict[str, Any]],
+                 romaji: list[str]) -> list[dict[str, Any]]:
+    """La transliteración, en su propia capa.
+
+    Antes el romaji sustituía el texto del clip principal y guardaba el
+    original en `originalText`.  Leer una mezcla japonesa así obliga a elegir:
+    o ves los kanji o ves cómo suenan, nunca las dos cosas.  Como capa propia
+    las tres lecturas —original, traducción y romaji— conviven en pantalla y
+    cada una se puede ocultar por separado.
+
+    Las líneas que ya estaban en alfabeto latino no generan clip: su romaji es
+    idéntico al original y sería una capa duplicada sin información.
+    """
+    return derived_clips(clips, romaji, layer_id=ROMAJI_LAYER_ID,
+                         channel=ROMAJI_CHANNEL, skip_identical=True)
+
+
+def translation_clips(clips: list[dict[str, Any]], translations: list[str],
+                      *, language: str | None = None,
+                      ) -> list[dict[str, Any]]:
+    """La traducción, un clip por cada línea principal."""
+    return derived_clips(
+        clips, translations, layer_id=TRANSLATION_LAYER_ID,
+        channel=channel_slug(language, TRANSLATION_CHANNEL_FALLBACK))
+
+
 def build_layers(*, source_language: str | None, translation_language: str | None,
                  translation_name: str | None = None,
                  romanized: bool = False) -> list[dict[str, Any]]:
-    """Las tres capas de Lyrixa, con el papel que les asigna este puente.
+    """Las cuatro capas de Lyrixa, con el papel que les asigna este puente.
 
-    Siempre son tres, incluso cuando el trabajo no tiene traducción.  Un canal
-    vacío al que arrastrar clips es más útil que un canal ausente, y sobre todo
-    mantiene el `order` estable (0/1/2) en todas las exportaciones: una escena
-    de LiveWallpaper montada sobre la capa 2 no se desplaza porque el siguiente
-    trabajo no llevara traducción.
+    Tres son de lectura —original, traducción y romaji— y la cuarta es el
+    canal de efectos.  Siempre están las cuatro, incluso cuando el trabajo no
+    tiene traducción ni japonés.  Un canal vacío al que arrastrar clips es más
+    útil que un canal ausente, y sobre todo mantiene el `order` estable
+    (0/1/2/3) en todas las exportaciones: una escena de Vibrix montada sobre
+    una capa no se desplaza porque el siguiente trabajo no llevara traducción.
 
     `role` y `language` son campos aditivos: Lyrixa deja pasar las claves de
     capa que no conoce hasta el bundle de letras, así que LiveWallpaper puede
@@ -566,12 +576,11 @@ def build_layers(*, source_language: str | None, translation_language: str | Non
         "id": MAIN_LAYER_ID,
         "name": "Letra original",
         "layerType": "lyrics",
-        # Still `primary`, not `transliteration`: this is the lead vocal line,
-        # and a renderer that hides transliteration channels must not hide the
-        # only lyric on screen.  That the script was swapped is said by
-        # `romanized` here and by `originalText` on each clip.
+        # `primary` y en su escritura original: los kanji no se sustituyen
+        # nunca.  Cómo suenan lo dice la capa de romaji, que va aparte
+        # justamente para que se puedan leer las dos a la vez.
         "role": "primary",
-        "romanized": romanized,
+        "romanized": False,
         "language": source_language,
         "color": "#2e7afb",
         "visible": True,
@@ -609,6 +618,27 @@ def build_layers(*, source_language: str | None, translation_language: str | Non
                               "opacity": 0.9},
     })
     layers.append({
+        "id": ROMAJI_LAYER_ID,
+        "name": "Romaji",
+        "layerType": "lyrics",
+        # `transliteration` es el papel que Lyrixa ya conoce: un renderer que
+        # oculte los canales de transliteración apaga este y deja la letra.
+        "role": "transliteration",
+        "romanized": True,
+        "language": source_language,
+        "color": "#39c2a3",
+        "visible": romanized,
+        "locked": False,
+        "order": 2,
+        # Tercer anclaje distinto: original abajo, traducción arriba y romaji
+        # justo debajo del original, que es donde se lee sin tapar nada.
+        "renderSettings": {"positionPreset": "bottom", "textAlign": "center",
+                           "zIndex": 19, "offsetY": "-3.4rem"},
+        "styleDefaults": {"fontSize": "1.5rem", "fontWeight": "600",
+                          "textColor": "rgba(196, 244, 232, 0.92)",
+                          "opacity": 0.9},
+    })
+    layers.append({
         "id": FX_LAYER_ID,
         "name": "FX / Adlibs",
         "layerType": "fx",
@@ -616,7 +646,7 @@ def build_layers(*, source_language: str | None, translation_language: str | Non
         "color": "#f6a25c",
         "visible": True,
         "locked": False,
-        "order": len(layers),
+        "order": 3,
         # `suppressClipText` es lo que convierte esta capa en un canal de
         # comandos: su texto no se dibuja, así que un clip que diga
         # "glitch 0.8" es una orden para el renderer y no una línea de letra.
@@ -642,12 +672,11 @@ def build_lyrixa_envelope(
     safe_duration = max(0.0, _finite_number(duration) or 0.0)
     clips = normalize_whisper_segments(whisper_data.get("segments"),
                                        safe_duration or None)
-    if romaji:
-        clips = apply_romaji(clips, romaji)
     lines = [clip["text"] for clip in clips]
     translated = (translation_clips(clips, translations,
                                     language=translation_language)
                   if translations else [])
+    transliterated = romaji_clips(clips, romaji) if romaji else []
     timestamp = exported_at or datetime.now(timezone.utc).isoformat()
     detected_language = language or whisper_data.get("language") or None
     audio_tracks = {
@@ -686,7 +715,7 @@ def build_lyrixa_envelope(
                 translation_language=translation_language,
                 romanized=bool(romaji),
             ),
-            "clips": [*clips, *translated],
+            "clips": [*clips, *translated, *transliterated],
             "currentTime": 0,
             "renderMode": "editor",
         },

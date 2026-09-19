@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "webapp"))
 
 from lyrixa_bridge import (  # noqa: E402
     MAIN_LAYER_ID,
+    ROMAJI_LAYER_ID,
     TRANSLATION_LAYER_ID,
     build_lyrixa_envelope,
     channel_slug,
@@ -172,21 +173,33 @@ class CrossLayerIdentityTests(unittest.TestCase):
 
 
 class RomanizationDeclarationTests(unittest.TestCase):
-    def test_a_romanized_project_says_so_on_the_layer(self):
+    def test_the_main_layer_never_claims_to_be_romanized(self):
+        # El romaji vive en su propia capa: la principal siempre lleva la
+        # escritura original, con o sin transliteración en el trabajo.
         clips = normalize_whisper_segments(SEGMENTS["segments"])
         envelope = build_lyrixa_envelope(
             SEGMENTS, title="P", duration=20.0,
             romaji=[f"romaji {i}" for i in range(len(clips))])
         main = next(layer for layer in envelope["project"]["layers"]
                     if layer["id"] == MAIN_LAYER_ID)
-        self.assertTrue(main["romanized"])
+        self.assertFalse(main["romanized"])
         self.assertEqual(main["role"], "primary")
 
-    def test_an_untouched_project_does_not_claim_romanization(self):
-        envelope = build_lyrixa_envelope(SEGMENTS, title="P", duration=20.0)
-        main = next(layer for layer in envelope["project"]["layers"]
-                    if layer["id"] == MAIN_LAYER_ID)
-        self.assertFalse(main["romanized"])
+    def test_the_romaji_layer_only_shows_up_visible_when_there_is_romaji(self):
+        clips = normalize_whisper_segments(SEGMENTS["segments"])
+        with_romaji = build_lyrixa_envelope(
+            SEGMENTS, title="P", duration=20.0,
+            romaji=[f"romaji {i}" for i in range(len(clips))])
+        without = build_lyrixa_envelope(SEGMENTS, title="P", duration=20.0)
+
+        def layer(envelope):
+            return next(l for l in envelope["project"]["layers"]
+                        if l["id"] == ROMAJI_LAYER_ID)
+
+        self.assertEqual(layer(with_romaji)["role"], "transliteration")
+        self.assertTrue(layer(with_romaji)["visible"])
+        # El canal sigue existiendo (el `order` no se mueve), pero apagado.
+        self.assertFalse(layer(without)["visible"])
 
 
 if __name__ == "__main__":
