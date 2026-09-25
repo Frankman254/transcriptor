@@ -64,7 +64,9 @@ ALLOWED = {
                     "track_guides", "translation"},
     "routes_serve": {"jobhub", "jobstore", "paths", "serveutil"},
     # El cableado: solo monta routers; el trabajo real ya no vive aquí.
-    "server": {"config", "routes_system", "routes_jobs", "routes_serve"},
+    # `paths` para montar /static: la interfaz ya no es un único HTML.
+    "server": {"config", "paths", "routes_system", "routes_jobs",
+               "routes_serve"},
 }
 
 

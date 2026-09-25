@@ -91,3 +91,43 @@ limpio no demuestra que un módulo funcione.
 - Los catálogos son datos que solo consume `/api/info`. Si la shell de
   escritorio acaba dibujando su propio formulario, querrán ser un JSON servido
   y no un módulo Python.
+
+## La interfaz
+
+`webapp/static/` son tres archivos servidos tal cual: `index.html` (marcado),
+`app.css` (diseño) y `app.js` (comportamiento). Hasta el rediseño eran uno
+solo de 1543 líneas; se partieron porque el CSS y el JS ya no cabían en la
+cabeza de nadie y porque el navegador puede cachearlos por separado.
+`server.py` monta `paths.STATIC_DIR` en `/static` —es su único motivo para
+importar `paths`— y `routes_system` sigue sirviendo el `index.html` en `/`.
+
+La pantalla es un shell de dos paneles:
+
+```
+┌─ topbar ──────────────────────────────────────────────┐
+│ 🎙️ Transcriptor  [device]              [+ Nuevo]      │
+├──────────────┬────────────────────────────────────────┤
+│ BIBLIOTECA   │ Nuevo trabajo  |  Trabajo              │
+│ buscar · 🔍  │                                        │
+│ filtros      │ (formulario  o  progreso + resultados) │
+│ orden        │                                        │
+│ N filas ↕    │                                        │
+└──────────────┴────────────────────────────────────────┘
+```
+
+Dos decisiones explican el resto:
+
+- **La biblioteca es una columna fija con su propio scroll, no una tarjeta
+  apilada.** Con 57 trabajos guardados, la versión anterior obligaba a
+  recorrer la lista entera para llegar al formulario. Ahora la lista no
+  compite por el espacio vertical con nada, y tiene búsqueda (`/`), filtros
+  por estado con su contador y orden por fecha, título, duración o tamaño.
+- **El panel derecho enseña una sola cosa a la vez.** El formulario y el
+  trabajo en curso son dos vistas del mismo espacio (`setView`), no dos
+  tarjetas que conviven. Abrir un trabajo guardado, lanzar uno nuevo o
+  recuperar uno interrumpido llevan siempre a la vista correcta.
+
+Por debajo no cambió nada: los mismos `id` de elemento, el mismo stream SSE
+con `?since=`, el mismo `esc()` antes de cualquier `innerHTML` —los títulos de
+YouTube y los mensajes del servidor son texto ajeno, y esta API local incluye
+`DELETE /api/jobs/{id}`.

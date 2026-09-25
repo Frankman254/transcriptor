@@ -6,6 +6,9 @@ módulos de motor; aquí solo se cablea.
 import config
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+import paths
 
 import routes_jobs
 import routes_serve
@@ -28,6 +31,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# La interfaz dejó de ser un único index.html con todo dentro: la hoja de
+# estilos y el JS viven aparte y necesitan quien los sirva. `paths` sigue
+# siendo el dueño de la ruta.
+app.mount("/static", StaticFiles(directory=paths.STATIC_DIR), name="static")
 
 app.include_router(routes_system.router)
 app.include_router(routes_jobs.router)

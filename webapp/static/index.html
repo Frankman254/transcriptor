@@ -1,1543 +1,243 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Transcriptor local</title>
-<style>
-  :root {
-    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --border: #2a2f3a;
-    --text: #e6e8ec; --accent: #5b8cff; --accent2: #38d39f;
-    /* --muted aclarado de #9aa3b2 (6.26:1 sobre #1e222b) a #aeb6c4: ratio
-       7.80:1 sobre #1e222b, 7.41:1 sobre #202634, 7.60:1 sobre el fondo
-       mezclado de .option-detail (~#1e2432) — >=7:1 AAA en texto pequeño
-       en todas las superficies donde aparece (fórmula WCAG sRGB). */
-    --muted: #aeb6c4;
-    --danger: #ff6b6b;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 80px; }
-  h1 { font-size: 24px; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 24px; }
-  .card { background: var(--panel); border: 1px solid var(--border);
-          border-radius: 14px; padding: 20px; margin-bottom: 20px; }
-  label, .ctl-label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
-  select, input[type=text], textarea {
-    width: 100%; padding: 10px 12px; background: var(--panel2);
-    border: 1px solid var(--border); border-radius: 9px; color: var(--text);
-    font: inherit; font-size: 14px;
-  }
-  textarea { min-height: 125px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  input[type=file] { color: var(--muted); font-size: 13px; }
-  .row { display: flex; gap: 14px; flex-wrap: wrap; }
-  .row > div { flex: 1; min-width: 160px; }
-  .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-  .tab { padding: 8px 16px; border-radius: 9px; border: 1px solid var(--border);
-         background: var(--panel2); cursor: pointer; font-size: 14px; color: var(--muted);
-         outline: none; }
-  .tab.active { border-color: var(--accent); color: var(--text); background: #202634; }
-  .tab:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
-  button.go {
-    margin-top: 16px; width: 100%; padding: 12px; border: none; border-radius: 10px;
-    background: var(--accent); color: #fff; font-size: 15px; font-weight: 600;
-    cursor: pointer;
-  }
-  button.go:disabled { opacity: .5; cursor: not-allowed; }
-  .badges { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
-  .badge { font-size: 12px; padding: 4px 10px; border-radius: 999px;
-           background: var(--panel2); border: 1px solid var(--border); color: var(--muted); }
-  .badge b { color: var(--text); font-weight: 600; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-         background: var(--accent2); margin-right: 5px; }
-  .progress-outer { height: 10px; background: var(--panel2); border-radius: 999px;
-                    overflow: hidden; border: 1px solid var(--border); }
-  .progress-inner { height: 100%; width: 0%; background: linear-gradient(90deg,var(--accent),var(--accent2));
-                    transition: width .3s ease; }
-  .progress-label { display: flex; justify-content: space-between; font-size: 13px;
-                    color: var(--muted); margin: 8px 2px 0; }
-  .stage { font-size: 14px; color: var(--muted); margin-bottom: 12px; }
-  .stage .spin { display: inline-block; animation: spin 1s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .segments { max-height: 420px; overflow-y: auto; margin-top: 6px; }
-  .seg { display: flex; gap: 12px; padding: 7px 4px; border-bottom: 1px solid var(--border); }
-  .seg:last-child { border-bottom: none; }
-  .seg .t { color: var(--accent); font-variant-numeric: tabular-nums; font-size: 12px;
-            white-space: nowrap; padding-top: 1px; min-width: 168px; }
-  .seg .x { flex: 1; }
-  /* En pantallas estrechas la marca de tiempo debe encogerse con ellipsis:
-     min-width:168px fijo desbordaba la fila (flex no baja de min-content). */
-  @media (max-width: 560px) {
-    .seg .t { min-width: 0; max-width: 38vw; overflow: hidden; text-overflow: ellipsis; }
-  }
-  .downloads { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
-  .downloads a, .downloads button { text-decoration: none; padding: 8px 14px; border-radius: 9px;
-                 background: var(--panel2); border: 1px solid var(--border); color: var(--text);
-                 font: inherit; font-size: 13px; cursor: pointer; }
-  .downloads a:hover, .downloads button:hover { border-color: var(--accent); }
-  .downloads button.primary { background: var(--accent); border-color: var(--accent); }
-  .downloads a.open-in-lyrixa { border-color: var(--accent); font-weight: 600; }
-  .downloads a b { display: block; font-size: 11px; color: var(--muted);
-                   font-weight: 400; max-width: 220px; overflow: hidden;
-                   text-overflow: ellipsis; white-space: nowrap; }
-  .stem-player { width: 100%; margin-top: 10px; padding: 10px 12px;
-                 border-radius: 9px; background: var(--panel2); border: 1px solid var(--border); }
-  .stem-player label { display: block; margin-bottom: 7px; color: var(--text); }
-  .stem-player audio { display: block; width: 100%; height: 36px; }
-  .err { color: var(--danger); font-size: 14px; }
-  .warn { color: #ffc36b; font-size: 13px; margin: 8px 2px 0; }
-  .hidden { display: none; }
-  cite { color: var(--muted); font-style: normal; }
-  .check { display: flex; align-items: center; gap: 8px; margin-top: 12px;
-           color: var(--text); font-size: 14px; cursor: pointer; }
-  .check input { accent-color: var(--accent); width: 16px; height: 16px; }
-  .panel { margin-top: 14px; padding: 12px 14px; border-radius: 10px;
-           background: var(--panel2); border: 1px solid var(--border); }
-  .panel h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted);
-              font-weight: 600; letter-spacing: .02em; }
-  table.rounds { width: 100%; border-collapse: collapse; font-size: 12.5px;
-                 font-variant-numeric: tabular-nums; }
-  table.rounds th { text-align: left; color: var(--muted); font-weight: 500;
-                    padding: 4px 8px 4px 0; }
-  table.rounds td { padding: 4px 8px 4px 0; border-top: 1px solid var(--border); }
-  .metric { display: inline-flex; gap: 6px; align-items: baseline;
-            margin: 0 16px 6px 0; font-size: 13px; }
-  .metric b { font-variant-numeric: tabular-nums; }
-  .verdict-ok { color: var(--accent2); }
-  .verdict-warn { color: #ffc36b; }
-  .verdict-bad { color: var(--danger); }
-  /* Baja confianza = la fila que conviene escuchar antes de dar por buena. */
-  .seg.shaky { background: rgba(255, 195, 107, .07); }
-  .seg .ag { font-size: 11px; color: #ffc36b; align-self: center; }
-  .seg .ref { font-size: 11px; color: var(--accent2); align-self: center; white-space: nowrap; }
-  .card-head { display: flex; align-items: center; justify-content: space-between;
-               gap: 12px; margin-bottom: 10px; }
-  .card-head h2 { font-size: 16px; margin: 0; }
-  .small-button { padding: 7px 11px; border-radius: 8px; cursor: pointer;
-                  border: 1px solid var(--border); background: var(--panel2);
-                  color: var(--text); font: inherit; font-size: 12px; }
-  .small-button:hover { border-color: var(--accent); }
-  .jobs { display: grid; gap: 8px; }
-  .job { padding: 11px 12px; border-radius: 10px; background: var(--panel2);
-         border: 1px solid var(--border); }
-  .job-main { display: flex; gap: 12px; justify-content: space-between; align-items: start; }
-  .job-title { font-weight: 600; overflow-wrap: anywhere; }
-  .job-meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
-  .job-actions { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 9px; }
-  button.danger { color: #ff8585; border-color: rgba(255,100,100,.35); }
-  button.danger:hover { background: rgba(255,80,80,.12); }
-  .option-detail { margin: 7px 2px 0; padding: 9px 11px; border-radius: 8px;
-                   background: rgba(90,130,220,.08); line-height: 1.45; }
-  .guide-preview { color: var(--muted); font-size: 13px; margin-top: 8px;
-                   white-space: pre-line; }
-</style>
+<link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<div class="wrap">
-  <h1>🎙️ Transcriptor local</h1>
-  <p class="sub">Whisper corriendo en tu máquina · progreso en vivo · cada frase con su tiempo</p>
 
-  <div class="card" id="library-card">
-    <div class="card-head">
-      <h2>🗂️ Trabajos guardados</h2>
-      <button class="small-button" onclick="loadSavedJobs()">Actualizar</button>
-    </div>
-    <p class="sub" style="margin-bottom:12px;font-size:13px">Abre resultados anteriores o vuelve a procesar sus WAV sin descargar ni separar el mix otra vez.</p>
-    <div class="jobs" id="jobs-list"><cite>Buscando trabajos…</cite></div>
-  </div>
+<header class="topbar">
+  <button class="icon-button sidebar-toggle" id="sidebar-toggle" type="button"
+          aria-expanded="false" aria-controls="sidebar"
+          aria-label="Mostrar la biblioteca" onclick="toggleSidebar()">☰</button>
+  <span class="brand">🎙️ <b>Transcriptor</b> local</span>
+  <span class="badge" id="device-badge">…</span>
+  <span class="spacer"></span>
+  <button class="small-button primary" type="button" aria-label="Nuevo trabajo"
+          onclick="setView('new')">+<span class="label"> Nuevo trabajo</span></button>
+</header>
 
-  <div class="card">
-    <div class="tabs" role="tablist" aria-label="Fuente del audio">
-      <div class="tab active" role="tab" id="src-tab-url" aria-selected="true" aria-controls="pane-url" tabindex="0" data-src="url" onclick="setSource('url')">🔗 YouTube</div>
-      <div class="tab" role="tab" id="src-tab-file" aria-selected="false" aria-controls="pane-file" tabindex="-1" data-src="file" onclick="setSource('file')">📁 Archivo</div>
-    </div>
+<div class="shell">
 
-    <div id="pane-url" role="tabpanel" aria-labelledby="src-tab-url">
-      <label for="url">Link de YouTube</label>
-      <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=...">
-    </div>
-    <div id="pane-file" class="hidden" role="tabpanel" aria-labelledby="src-tab-file">
-      <label for="file">Audio o video (mp3, m4a, wav, mp4…)</label>
-      <input type="file" id="file" accept="audio/*,video/*">
-    </div>
-
-    <div id="mode-pane" style="margin-top:16px">
-      <span class="ctl-label" id="mode-label">¿Qué quieres hacer?</span>
-      <div class="tabs" role="tablist" aria-labelledby="mode-label">
-        <div class="tab active" role="tab" id="mode-tab-transcribe" aria-selected="true" aria-controls="mode-panel" tabindex="0" data-mode="transcribe" onclick="setMode('transcribe')">🎧 Transcribir</div>
-        <div class="tab" role="tab" id="mode-tab-lyrics" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="lyrics" onclick="setMode('lyrics')">🎤 Letra de canción</div>
-        <div class="tab" role="tab" id="mode-tab-ultra" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="ultra" onclick="setMode('ultra')">🎯 Letra ultra precisa</div>
-        <div class="tab" role="tab" id="mode-tab-audio_only" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="audio_only" onclick="setMode('audio_only')">⬇️ Solo audio</div>
+  <aside class="sidebar" id="sidebar" aria-label="Trabajos guardados">
+    <div class="library-head">
+      <div class="search">
+        <span class="search-icon" aria-hidden="true">🔍</span>
+        <input type="search" id="job-search" placeholder="Buscar por título o id"
+               aria-label="Buscar en los trabajos guardados" autocomplete="off">
+        <kbd>/</kbd>
       </div>
-      <p class="sub hidden" id="mode-hint" style="margin:8px 2px 0;font-size:13px"></p>
-    </div>
-
-    <!-- role=tabpanel para los tabs de modo: agrupa las secciones que el modo
-         muestra/oculta (opts, audio, separación, ultra). No cambia el estado. -->
-    <div id="mode-panel" role="tabpanel" aria-labelledby="mode-tab-transcribe">
-    <div class="row" id="opts" style="margin-top:16px">
-      <div>
-        <label for="model">Modelo</label>
-        <select id="model" onchange="onModelChange()"></select>
-        <p class="sub option-detail" id="model-hint"></p>
-      </div>
-      <div>
-        <label for="language">Idioma</label>
-        <select id="language"></select>
+      <div class="filters" id="job-filters" role="group" aria-label="Filtrar por estado"></div>
+      <div class="library-tools">
+        <label class="sr-only" for="job-sort">Ordenar</label>
+        <select id="job-sort">
+          <option value="recent">Más recientes</option>
+          <option value="oldest">Más antiguos</option>
+          <option value="title">Por título</option>
+          <option value="longest">Más largos</option>
+          <option value="largest">Más pesados</option>
+        </select>
+        <span class="count-label" id="job-count"></span>
+        <button class="icon-button" type="button" title="Actualizar la lista"
+                aria-label="Actualizar la lista" onclick="loadSavedJobs()">⟳</button>
       </div>
     </div>
+    <div class="jobs" id="jobs-list">
+      <div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>
+    </div>
+  </aside>
 
-    <div id="audio-opts" style="margin-top:16px">
-      <div class="row">
-        <div>
-          <label for="audio_format">Formato de audio</label>
-          <select id="audio_format" onchange="onFormatChange()"></select>
+  <div class="scrim hidden" id="scrim" onclick="closeSidebar()"></div>
+
+  <main class="main">
+    <div class="main-inner">
+
+      <div class="viewswitch" role="tablist" aria-label="Vista">
+        <button role="tab" id="switch-new" aria-selected="true" type="button"
+                onclick="setView('new')">Nuevo trabajo</button>
+        <button role="tab" id="switch-job" aria-selected="false" type="button"
+                disabled onclick="setView('job')">Trabajo</button>
+      </div>
+
+      <p class="err" id="boot-error" role="alert"></p>
+
+      <!-- Vista: nuevo trabajo -->
+      <section id="view-new">
+        <div class="view-head">
+          <h1>Nuevo trabajo</h1>
+          <p>Whisper corriendo en tu máquina · progreso en vivo · cada frase con su tiempo.</p>
         </div>
-        <div id="quality-wrap">
-          <label for="audio_quality">Calidad</label>
-          <select id="audio_quality"></select>
-        </div>
-      </div>
-      <p class="sub" id="fmt-hint" style="margin:8px 2px 0;font-size:13px"></p>
-    </div>
 
-    <div id="separator-opts" class="hidden" style="margin-top:16px">
-      <label for="separation_quality">Calidad de separación vocal</label>
-      <select id="separation_quality" onchange="onSeparationChange()"></select>
-      <p class="sub" id="separation-hint" style="margin:8px 2px 0;font-size:13px"></p>
-    </div>
-
-    <div id="ultra-opts" class="hidden" style="margin-top:16px">
-      <div class="row">
-        <div>
-          <label for="precision_level">Nivel de precisión</label>
-          <select id="precision_level" onchange="onPrecisionChange()"></select>
-        </div>
-        <div>
-          <label for="translate_to">Traducir a (2ª capa de Lyrixa)</label>
-          <select id="translate_to" onchange="onTranslateChange()"></select>
-        </div>
-      </div>
-      <p class="sub" id="precision-hint" style="margin:8px 2px 0;font-size:13px"></p>
-      <div class="row" style="margin-top:12px">
-        <div>
-          <label for="asr_engine">Motor de reconocimiento</label>
-          <select id="asr_engine" onchange="onEngineChange()"></select>
-          <p class="sub option-detail" id="engine-hint"></p>
-        </div>
-      </div>
-      <label class="check">
-        <input type="checkbox" id="rescue_original" checked>
-        Rescatar zonas dudosas desde el audio original (selectivo)
-      </label>
-      <label class="check">
-        <input type="checkbox" id="romaji">
-        Japonés en romaji (no en kana)
-      </label>
-      <p class="sub" id="translator-hint" style="margin:8px 2px 0;font-size:13px"></p>
-
-      <div class="panel" id="tracklist-opts">
-        <h3>🧭 Guía del mix (opcional)</h3>
-        <label for="tracklist_text">Tracklist con tiempo, artista y canción</label>
-        <textarea id="tracklist_text" placeholder="00:00 Rollergirl - Dear Jessie (Green Court Remix)&#10;01:25 T-Pau - China in Your Hand"></textarea>
-        <div class="row" style="margin-top:9px;align-items:end">
-          <div>
-            <label for="tracklist_file">Cargar un .txt o una lista descargada de Pastebin</label>
-            <input type="file" id="tracklist_file" accept=".txt,text/plain" onchange="loadTracklistFile(this)">
+        <div class="card">
+          <div class="segmented tabs" role="tablist" aria-label="Fuente del audio">
+            <div class="tab active" role="tab" id="src-tab-url" aria-selected="true" aria-controls="pane-url" tabindex="0" data-src="url" onclick="setSource('url')">🔗 YouTube</div>
+            <div class="tab" role="tab" id="src-tab-file" aria-selected="false" aria-controls="pane-file" tabindex="-1" data-src="file" onclick="setSource('file')">📁 Archivo</div>
           </div>
-          <div style="flex:0 0 auto;min-width:0">
-            <button class="small-button" onclick="previewTracklist()">Revisar lista</button>
+
+          <div id="pane-url" role="tabpanel" aria-labelledby="src-tab-url">
+            <label for="url">Link de YouTube</label>
+            <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=...">
+          </div>
+          <div id="pane-file" class="hidden" role="tabpanel" aria-labelledby="src-tab-file">
+            <label for="file">Audio o video (mp3, m4a, wav, mp4…)</label>
+            <input type="file" id="file" accept="audio/*,video/*">
           </div>
         </div>
-        <label class="check">
-          <input type="checkbox" id="fetch_lyrics" checked>
-          Buscar letras de referencia en LRCLIB
-        </label>
-        <p class="sub" style="margin:7px 0 0;font-size:13px">La letra pública guía el vocabulario, pero solo reemplaza una línea si Whisper ya oyó algo muy parecido. Los remixes no se fuerzan.</p>
-        <div class="guide-preview" id="tracklist-preview"></div>
-      </div>
+
+        <div class="card">
+          <span class="ctl-label" id="mode-label">¿Qué quieres hacer?</span>
+          <div class="segmented tabs" role="tablist" aria-labelledby="mode-label">
+            <div class="tab active" role="tab" id="mode-tab-transcribe" aria-selected="true" aria-controls="mode-panel" tabindex="0" data-mode="transcribe" onclick="setMode('transcribe')">🎧 Transcribir</div>
+            <div class="tab" role="tab" id="mode-tab-lyrics" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="lyrics" onclick="setMode('lyrics')">🎤 Letra</div>
+            <div class="tab" role="tab" id="mode-tab-ultra" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="ultra" onclick="setMode('ultra')">🎯 Letra ultra precisa</div>
+            <div class="tab" role="tab" id="mode-tab-audio_only" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="audio_only" onclick="setMode('audio_only')">⬇️ Solo audio</div>
+          </div>
+          <p class="hint hidden" id="mode-hint"></p>
+
+          <!-- role=tabpanel para los tabs de modo: agrupa las secciones que el
+               modo muestra/oculta (opts, audio, separación, ultra). -->
+          <div id="mode-panel" role="tabpanel" aria-labelledby="mode-tab-transcribe">
+            <div class="row" id="opts">
+              <div>
+                <label for="model">Modelo</label>
+                <select id="model" onchange="onModelChange()"></select>
+                <p class="hint detail" id="model-hint"></p>
+              </div>
+              <div>
+                <label for="language">Idioma</label>
+                <select id="language"></select>
+              </div>
+            </div>
+
+            <div id="audio-opts">
+              <div class="row">
+                <div>
+                  <label for="audio_format">Formato de audio</label>
+                  <select id="audio_format" onchange="onFormatChange()"></select>
+                </div>
+                <div id="quality-wrap">
+                  <label for="audio_quality">Calidad</label>
+                  <select id="audio_quality"></select>
+                </div>
+              </div>
+              <p class="hint" id="fmt-hint"></p>
+            </div>
+
+            <div id="separator-opts" class="hidden">
+              <label for="separation_quality">Calidad de separación vocal</label>
+              <select id="separation_quality" onchange="onSeparationChange()"></select>
+              <p class="hint" id="separation-hint"></p>
+            </div>
+
+            <div id="ultra-opts" class="hidden">
+              <div class="row">
+                <div>
+                  <label for="precision_level">Nivel de precisión</label>
+                  <select id="precision_level" onchange="onPrecisionChange()"></select>
+                </div>
+                <div>
+                  <label for="translate_to">Traducir a (2ª capa de Lyrixa)</label>
+                  <select id="translate_to" onchange="onTranslateChange()"></select>
+                </div>
+              </div>
+              <p class="hint" id="precision-hint"></p>
+              <div class="row">
+                <div>
+                  <label for="asr_engine">Motor de reconocimiento</label>
+                  <select id="asr_engine" onchange="onEngineChange()"></select>
+                  <p class="hint detail" id="engine-hint"></p>
+                </div>
+              </div>
+              <label class="check">
+                <input type="checkbox" id="rescue_original" checked>
+                Rescatar zonas dudosas desde el audio original (selectivo)
+              </label>
+              <label class="check">
+                <input type="checkbox" id="romaji">
+                Japonés en romaji (3ª capa, además del original)
+              </label>
+              <p class="hint" id="translator-hint"></p>
+
+              <div class="panel subsection" id="tracklist-opts">
+                <h3>🧭 Guía del mix (opcional)</h3>
+                <label for="tracklist_text">Tracklist con tiempo, artista y canción</label>
+                <textarea id="tracklist_text" placeholder="00:00 Rollergirl - Dear Jessie (Green Court Remix)&#10;01:25 T-Pau - China in Your Hand"></textarea>
+                <div class="row" style="align-items:end">
+                  <div>
+                    <label for="tracklist_file">Cargar un .txt o una lista descargada de Pastebin</label>
+                    <input type="file" id="tracklist_file" accept=".txt,text/plain" onchange="loadTracklistFile(this)">
+                  </div>
+                  <div style="flex:0 0 auto;min-width:0">
+                    <button class="small-button" type="button" onclick="previewTracklist()">Revisar lista</button>
+                  </div>
+                </div>
+                <label class="check">
+                  <input type="checkbox" id="fetch_lyrics" checked>
+                  Buscar letras de referencia en LRCLIB
+                </label>
+                <p class="hint">La letra pública guía el vocabulario, pero solo reemplaza una línea si Whisper ya oyó algo muy parecido. Los remixes no se fuerzan.</p>
+                <div class="guide-preview" id="tracklist-preview"></div>
+              </div>
+            </div>
+
+            <button class="go" id="go" type="button" onclick="start()">Transcribir</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Vista: trabajo -->
+      <section id="view-job" class="hidden">
+        <div class="view-head">
+          <h1 id="job-name">Trabajo</h1>
+        </div>
+
+        <div class="card">
+          <div class="badges" id="badges"></div>
+          <div class="stage" id="stage" role="status" aria-live="polite"></div>
+          <div class="progress-outer"><div class="progress-inner" id="bar"></div></div>
+          <div class="progress-label"><span id="pct">0%</span><span id="clock"></span></div>
+          <div id="err" class="err" role="alert"></div>
+
+          <div class="panel hidden" id="stem-panel">
+            <h3>🎚️ Calidad de la voz aislada</h3>
+            <div id="stem-body"></div>
+          </div>
+
+          <div class="panel hidden" id="rounds-panel">
+            <h3>📊 Convergencia del consenso</h3>
+            <table class="rounds">
+              <thead><tr>
+                <th>Pasadas</th><th>Palabras</th><th>Descartadas</th><th>Bucles</th>
+                <th>Acuerdo</th><th>Unánimes</th><th>Estabilidad</th>
+              </tr></thead>
+              <tbody id="rounds-body"></tbody>
+            </table>
+            <p class="hint" id="rounds-note"></p>
+          </div>
+
+          <div class="panel hidden" id="translation-panel">
+            <h3>🌐 Traducción</h3>
+            <div id="translation-body"></div>
+          </div>
+
+          <div class="panel hidden" id="reference-panel">
+            <h3>🧭 Guía del mix y letras de referencia</h3>
+            <div id="reference-body"></div>
+          </div>
+
+          <div class="downloads hidden" id="downloads"></div>
+          <div class="downloads hidden" id="recovery-actions"></div>
+        </div>
+
+        <div class="segments" id="segments"></div>
+      </section>
+
     </div>
-
-    <button class="go" id="go" onclick="start()">Transcribir</button>
-    </div>
-  </div>
-
-  <div class="card hidden" id="live">
-    <div class="badges" id="badges"></div>
-    <div class="stage" id="stage" role="status" aria-live="polite"></div>
-    <div class="progress-outer"><div class="progress-inner" id="bar"></div></div>
-    <div class="progress-label"><span id="pct">0%</span><span id="clock"></span></div>
-    <div id="err" class="err" role="alert"></div>
-
-    <div class="panel hidden" id="stem-panel">
-      <h3>🎚️ Calidad de la voz aislada</h3>
-      <div id="stem-body"></div>
-    </div>
-
-    <div class="panel hidden" id="rounds-panel">
-      <h3>📊 Convergencia del consenso</h3>
-      <table class="rounds">
-        <thead><tr>
-          <th>Pasadas</th><th>Palabras</th><th>Descartadas</th><th>Bucles</th>
-          <th>Acuerdo</th><th>Unánimes</th><th>Estabilidad</th>
-        </tr></thead>
-        <tbody id="rounds-body"></tbody>
-      </table>
-      <p class="sub" id="rounds-note" style="margin:10px 2px 0;font-size:13px"></p>
-    </div>
-
-    <div class="panel hidden" id="translation-panel">
-      <h3>🌐 Traducción</h3>
-      <div id="translation-body"></div>
-    </div>
-
-    <div class="panel hidden" id="reference-panel">
-      <h3>🧭 Guía del mix y letras de referencia</h3>
-      <div id="reference-body"></div>
-    </div>
-
-    <div class="downloads hidden" id="downloads"></div>
-    <div class="downloads hidden" id="recovery-actions"></div>
-    <div class="segments" id="segments"></div>
-  </div>
+  </main>
 </div>
 
-<script>
-let SOURCE = "url";
-let MODE = "transcribe";
-let INFO = null;
-let ITERATE_JOB_ID = null;
-
-function syncGoLabel() {
-  document.getElementById("go").textContent = ITERATE_JOB_ID
-    ? "Reanalizar usando la voz guardada"
-    : MODE === "audio_only" ? "Descargar audio"
-    : MODE === "ultra" ? "Sacar letra ultra precisa"
-    : MODE === "lyrics" ? "Sacar letra" : "Transcribir";
-}
-
-function setSource(s) {
-  // Elegir una fuente explícitamente significa iniciar un trabajo distinto.
-  ITERATE_JOB_ID = null;
-  SOURCE = s;
-  document.querySelectorAll(".tab[data-src]").forEach(t =>
-    t.classList.toggle("active", t.dataset.src === s));
-  // Sincroniza semántica ARIA de tabs (roving tabindex); no toca el estado.
-  document.querySelectorAll(".tab[data-src]").forEach(t => {
-    const on = t.dataset.src === s;
-    t.setAttribute("aria-selected", on ? "true" : "false");
-    t.setAttribute("tabindex", on ? "0" : "-1");
-  });
-  document.getElementById("pane-url").classList.toggle("hidden", s !== "url");
-  document.getElementById("pane-file").classList.toggle("hidden", s !== "file");
-  syncAudioOpts();
-  syncGoLabel();
-}
-
-const SEPARATES = m => m === "lyrics" || m === "ultra";
-
-// El formato de audio solo aplica cuando bajamos de YouTube. En los modos de
-// letra el backend usa siempre el original (separa mejor la voz).
-function syncAudioOpts() {
-  document.getElementById("audio-opts").classList.toggle(
-    "hidden", SOURCE !== "url" || SEPARATES(MODE));
-  document.getElementById("separator-opts").classList.toggle(
-    "hidden", !SEPARATES(MODE));
-  document.getElementById("ultra-opts").classList.toggle(
-    "hidden", MODE !== "ultra");
-}
-
-// El modo ultra corre con faster-whisper, que guarda sus pesos aparte: sin
-// esto la lista diría "descargado" para un modelo que el modo ultra no tiene.
-function syncModelLabels() {
-  const ultra = MODE === "ultra";
-  for (const option of document.getElementById("model").options) {
-    const model = INFO?.models?.find(item => item.name === option.value);
-    if (!model) continue;
-    const engine = effectiveEngine();
-    const cached = ultra
-      ? engine === "mlx-whisper" ? model.mlx_cached
-      : engine === "faster-whisper" ? model.faster_cached
-      : model.cached
-      : model.cached;
-    const description = model.parameters
-      ? `${model.label} · ${model.parameters} · ${model.quality}`
-      : (model.label || model.name);
-    option.textContent = description
-      + (cached ? "  ✓ descargado" : `  ⬇ ${model.download || "requiere descarga"}`);
-  }
-  onModelChange();
-}
-
-function effectiveEngine() {
-  if (MODE !== "ultra") return "openai-whisper";
-  const selected = document.getElementById("asr_engine")?.value || "auto";
-  return selected === "auto" ? (INFO?.auto_engine || "openai-whisper") : selected;
-}
-
-function onModelChange() {
-  if (!INFO) return;
-  const name = document.getElementById("model").value;
-  const model = INFO.models?.find(item => item.name === name);
-  if (!model) return;
-  const engine = effectiveEngine();
-  const artifact = model.artifacts?.[engine] || name;
-  if (!model.parameters) {
-    document.getElementById("model-hint").textContent =
-      `${model.label || name}. Reinicia el servidor para cargar los detalles `
-      + "completos del modelo y del motor.";
-    return;
-  }
-  document.getElementById("model-hint").textContent =
-    `${model.label} · ${model.parameters} parámetros · ${model.download} · `
-    + `${model.speed} · calidad ${model.quality.toLowerCase()}. ${model.hint} `
-    + `Modelo exacto: ${artifact}.`;
-}
-
-function onEngineChange() {
-  if (!INFO) return;
-  const selected = document.getElementById("asr_engine").value || "auto";
-  const engine = INFO.asr_engines?.find(item => item.value === selected);
-  const actual = effectiveEngine();
-  document.getElementById("engine-hint").textContent =
-    `${engine?.hint || ""} Motor efectivo: ${actual}.`;
-  syncModelLabels();
-}
-
-function onPrecisionChange() {
-  const value = document.getElementById("precision_level").value;
-  const spec = (INFO?.precision_levels || []).find(p => p.value === value);
-  document.getElementById("precision-hint").textContent = spec ? spec.hint : "";
-}
-
-function onTranslateChange() {
-  const wants = document.getElementById("translate_to").value;
-  const hint = document.getElementById("translator-hint");
-  const translator = INFO?.translator || {};
-  if (!wants) {
-    hint.textContent = "Sin traducción: Lyrixa recibe una sola capa de texto.";
-    hint.className = "sub";
-  } else if (translator.available) {
-    hint.textContent = `Traduce en tu máquina con ${translator.model}. `
-      + "Los idiomas de escritura no latina pasan por inglés (ruso → inglés → destino).";
-    hint.className = "sub";
-  } else {
-    hint.textContent = "⚠️ No hay traductor local. Arranca Ollama y baja un "
-      + "modelo multilingüe: ollama pull qwen3.5";
-    hint.className = "warn";
-  }
-}
-
-function onFormatChange() {
-  const sel = document.getElementById("audio_format");
-  const spec = (INFO?.audio_formats || []).find(f => f.value === sel.value);
-  // Los formatos sin pérdida no tienen bitrate que elegir.
-  document.getElementById("quality-wrap").classList.toggle(
-    "hidden", !spec || spec.lossless);
-  document.getElementById("fmt-hint").textContent = spec ? spec.hint : "";
-}
-
-function onSeparationChange() {
-  const value = document.getElementById("separation_quality").value;
-  const spec = (INFO?.separation_profiles || []).find(p => p.value === value);
-  const acceleration = INFO?.separator_acceleration;
-  const hardware = spec?.value === "ultra" || spec?.value === "precise"
-    ? ` Motor actual: ${acceleration?.mode || "desconocido"}`
-      + (acceleration?.accelerated ? " acelerado." : " (sin aceleración).")
-    : "";
-  document.getElementById("separation-hint").textContent =
-    (spec ? spec.hint : "") + hardware;
-}
-
-function setMode(m) {
-  MODE = m;
-  document.querySelectorAll(".tab[data-mode]").forEach(t =>
-    t.classList.toggle("active", t.dataset.mode === m));
-  document.querySelectorAll(".tab[data-mode]").forEach(t => {
-    const on = t.dataset.mode === m;
-    t.setAttribute("aria-selected", on ? "true" : "false");
-    t.setAttribute("tabindex", on ? "0" : "-1");
-  });
-  // El panel agrupado se presenta como el panel del tab activo.
-  document.getElementById("mode-panel")
-    .setAttribute("aria-labelledby", "mode-tab-" + m);
-  // En "solo audio" no hacen falta modelo ni idioma; en letra sí (usa Whisper).
-  document.getElementById("opts").classList.toggle("hidden", m === "audio_only");
-  if (m !== "ultra") ITERATE_JOB_ID = null;
-  syncGoLabel();
-  const hints = {
-    lyrics: "🎤 Aísla la voz con el motor elegido y luego la transcribe. " +
-            "BS-RoFormer recupera mejor las voces débiles; Demucs es más rápido.",
-    ultra: "🎯 Aísla la voz, detecta dónde se canta y transcribe varias veces " +
-           "con ajustes distintos. Después vota palabra por palabra y puede " +
-           "revisar solo las zonas dudosas en el audio original: así evita " +
-           "repetir todo el mix. La traducción es opcional y puede añadirse " +
-           "después desde Trabajos guardados. Detecta el idioma " +
-           "tramo por tramo, así que un mix con canciones en japonés y en " +
-           "inglés se transcribe y se traduce bien en las dos partes.",
-  };
-  const hint = document.getElementById("mode-hint");
-  hint.textContent = hints[m] || "";
-  hint.classList.toggle("hidden", !hints[m]);
-  if (INFO && document.getElementById("asr_engine").options.length) {
-    onEngineChange();
-  } else {
-    syncModelLabels();
-  }
-  syncAudioOpts();
-}
-
-// Tabs accesibles: flechas mueven la selección (activación automática, que
-// reusa el onclick existente → misma lógica de estado), Enter/Espacio activan,
-// Home/End saltan al primero/último. No reescribe setSource/setMode.
-function wireTablist(tablistEl) {
-  const tabs = () => Array.from(tablistEl.querySelectorAll(".tab"));
-  tablistEl.addEventListener("keydown", ev => {
-    const items = tabs();
-    const i = items.indexOf(document.activeElement);
-    if (i < 0) return;
-    let next = null;
-    if (ev.key === "ArrowRight" || ev.key === "ArrowDown") next = items[(i + 1) % items.length];
-    else if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") next = items[(i - 1 + items.length) % items.length];
-    else if (ev.key === "Home") next = items[0];
-    else if (ev.key === "End") next = items[items.length - 1];
-    else if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      items[i].click();
-      return;
-    }
-    if (!next) return;
-    ev.preventDefault();
-    next.focus();
-    next.click();
-  });
-}
-document.querySelectorAll(".tabs[role=tablist]").forEach(wireTablist);
-
-// Qué mostrar a la derecha de la barra en las etapas que no son transcripción.
-const STAGE_LABELS = {
-  downloading: "descargando",
-  downloading_model: "descargando modelo",
-  downloading_separator_model: "descargando modelo de separación",
-  separating: "aislando la voz",
-  analyzing: "buscando la voz",
-  references: "preparando guía del mix",
-  detecting_language: "detectando idioma",
-  transcribing: "transcribiendo",
-  romanizing: "pasando a romaji",
-  translating: "traduciendo",
-  postprocessing: "convirtiendo",
-};
-
-// Cómo presentar cada archivo del resultado. El orden manda en la fila.
-const FILE_KINDS = [
-  ["audio", "⬇️", "Audio"],
-  ["vocals", "🎤", "Voz aislada"],
-  ["instrumental", "🎹", "Instrumental sin voz"],
-  ["lyrics", "📝", "Letra legible (original · romaji · traducción)"],
-  ["txt", "📄", "Texto plano"],
-  ["srt", "🎬", "Subtítulos SRT"],
-  ["vtt", "🌐", "Subtítulos VTT"],
-  ["tsv", "📊", "Tabla TSV"],
-  ["json", "{ }", "JSON con tiempos"],
-  ["guide", "🧭", "Guía del mix y referencias"],
-  ["lyrixa", "🎵", "Abrir en Lyrixa / Proyecto Lyrixa"],
-];
-
-function fmt(sec) {
-  sec = Math.max(0, Math.floor(sec || 0));
-  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-  const mm = String(m).padStart(2, "0"), ss = String(s).padStart(2, "0");
-  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
-}
-
-function fmtBytes(bytes) {
-  let value = Math.max(0, Number(bytes) || 0);
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024; unit++;
-  }
-  return `${value.toFixed(unit >= 3 ? 1 : 0)} ${units[unit]}`;
-}
-
-// Igual que fmt pero con milisegundos (importante para sincronizar letras).
-function fmtMs(sec) {
-  sec = Math.max(0, sec || 0);
-  const whole = Math.floor(sec);
-  const ms = Math.floor((sec - whole) * 1000);
-  return fmt(whole) + "." + String(ms).padStart(3, "0");
-}
-
-async function loadTracklistFile(input) {
-  const file = input.files?.[0];
-  if (!file) return;
-  document.getElementById("tracklist_text").value = await file.text();
-  await previewTracklist();
-}
-
-async function previewTracklist() {
-  const text = document.getElementById("tracklist_text").value.trim();
-  const target = document.getElementById("tracklist-preview");
-  if (!text) {
-    target.textContent = "";
-    return;
-  }
-  const fd = new FormData();
-  fd.append("tracklist_text", text);
-  fd.append("duration", "0");
-  const response = await fetch("/api/tracklists/preview", {method: "POST", body: fd});
-  const data = await response.json();
-  if (!response.ok) {
-    target.textContent = "⚠️ " + (data.error || "No pude leer la lista.");
-    return;
-  }
-  const sections = data.sections.map(section =>
-    `${section.name}: ${section.tracks} canciones · última en ${fmt(section.last)}`
-  );
-  target.textContent = `✅ ${sections.join("\n")}\nLa sección correcta se elegirá por la duración real del mix.`;
-}
-
-const JOB_STATUS = {
-  running: "🟢 en curso", completed: "✅ terminado",
-  interrupted: "🟡 interrumpido", error: "⚠️ error", saved: "💾 guardado",
-};
-
-async function loadSavedJobs() {
-  const box = document.getElementById("jobs-list");
-  try {
-    const response = await fetch("/api/jobs", {cache: "no-store"});
-    const data = await response.json();
-    box.innerHTML = "";
-    if (!data.jobs?.length) {
-      box.innerHTML = "<cite>Todavía no hay trabajos guardados.</cite>";
-      return;
-    }
-    for (const job of data.jobs) {
-      const row = document.createElement("div");
-      row.className = "job";
-      const main = document.createElement("div");
-      main.className = "job-main";
-      const copy = document.createElement("div");
-      const title = document.createElement("div");
-      title.className = "job-title";
-      title.textContent = job.title || job.id;
-      const meta = document.createElement("div");
-      meta.className = "job-meta";
-      const reference = job.reference
-        ? ` · 🧭 ${job.reference.found}/${job.reference.total} letras`
-        : "";
-      const runtime = job.timing?.elapsedSeconds
-        ? ` · ⏱ ${fmt(job.timing.elapsedSeconds)}` : "";
-      const requestedEngine = job.precision?.engine || job.settings?.asrEngine || "";
-      const engine = requestedEngine === "auto"
-        ? `auto → ${INFO.auto_engine}` : requestedEngine;
-      const modelInfo = INFO.models?.find(item => item.name === job.settings?.model);
-      const model = job.settings?.model
-        ? ` · 🧠 ${modelInfo?.label || job.settings.model}${engine ? ` / ${engine}` : ""}` : "";
-      const storage = job.diskBytes ? ` · 💾 ${fmtBytes(job.diskBytes)}` : "";
-      meta.textContent = `${fmt(job.duration)} · ${JOB_STATUS[job.status] || job.status}`
-        + ` · iteración ${job.iteration + 1}${model}${runtime}${storage}${reference}`;
-      copy.append(title, meta);
-      const id = document.createElement("span");
-      id.className = "badge";
-      id.textContent = job.id;
-      main.append(copy, id);
-      const actions = document.createElement("div");
-      actions.className = "job-actions";
-      const open = document.createElement("button");
-      open.className = "small-button";
-      open.textContent = "Abrir resultados";
-      open.onclick = () => openSavedJob(job.id);
-      actions.appendChild(open);
-      if (job.recoverable) {
-        const iterate = document.createElement("button");
-        iterate.className = "small-button";
-        iterate.textContent = "↻ Volver a procesar";
-        iterate.onclick = () => prepareSavedIteration(job.id);
-        actions.appendChild(iterate);
-      }
-      if (job.files?.json) {
-        const translate = document.createElement("button");
-        translate.className = "small-button";
-        translate.textContent = "🌐 Añadir traducción";
-        translate.onclick = () => translateSavedJob(job.id);
-        actions.appendChild(translate);
-      }
-      const remove = document.createElement("button");
-      remove.className = "small-button danger";
-      remove.textContent = "🗑️ Eliminar";
-      remove.disabled = job.status === "running";
-      remove.onclick = () => deleteSavedJob(job);
-      actions.appendChild(remove);
-      row.append(main, actions);
-      box.appendChild(row);
-    }
-  } catch (_) {
-    box.innerHTML = "<cite>No pude leer la carpeta de trabajos.</cite>";
-  }
-}
-
-async function deleteSavedJob(job) {
-  const size = job.diskBytes ? ` (${fmtBytes(job.diskBytes)})` : "";
-  if (!confirm(`¿Eliminar permanentemente “${job.title || job.id}”${size}?\n\n`
-      + "Se borrarán el audio, stems, resultados e iteraciones. Esta acción no se puede deshacer.")) {
-    return;
-  }
-  const response = await fetch(`/api/jobs/${job.id}`, {method: "DELETE"});
-  const data = await response.json();
-  if (!response.ok) return alert(data.error || "No pude eliminar el trabajo.");
-  if (ITERATE_JOB_ID === job.id) {
-    ITERATE_JOB_ID = null;
-    syncGoLabel();
-  }
-  if (localStorage.getItem("job_id") === job.id) {
-    localStorage.removeItem("job_id");
-  }
-  await loadSavedJobs();
-}
-
-async function openSavedJob(jobId) {
-  const response = await fetch(`/api/jobs/${jobId}`, {cache: "no-store"});
-  const job = await response.json();
-  if (!response.ok) return alert(job.error || "No pude abrir el trabajo.");
-  const live = document.getElementById("live");
-  live.classList.remove("hidden");
-  resetPanels();
-  clearSegmentView();
-  document.getElementById("err").textContent = job.error ? "⚠️ " + job.error : "";
-  setBadges({model: job.settings?.model || null, device: INFO.device,
-             title: job.title, duration: job.duration});
-  showActualEngine(job.precision?.engine || job.settings?.asrEngine);
-  setStage(`${JOB_STATUS[job.status] || job.status} · iteración ${job.iteration + 1}`, false);
-  setProgress(job.status === "completed" ? 1 : 0);
-  showFiles(job.id, job.files || {}, job.links);
-  if (job.reference) showReference({...job.reference, section: job.section, stage: "loaded"});
-  live.scrollIntoView({behavior: "smooth", block: "start"});
-}
-
-async function prepareSavedIteration(jobId) {
-  const response = await fetch(`/api/jobs/${jobId}`, {cache: "no-store"});
-  const job = await response.json();
-  if (!response.ok) return alert(job.error || "No pude cargar el trabajo.");
-  setMode("ultra");
-  ITERATE_JOB_ID = jobId;
-  syncGoLabel();
-  const settings = job.settings || {};
-  const modelSelect = document.getElementById("model");
-  const savedModel = [...modelSelect.options].find(
-    option => option.value === settings.model && !option.disabled);
-  const cachedUltra = INFO.models?.find(model => model.ultra_cached);
-  if (savedModel) modelSelect.value = savedModel.value;
-  else if (cachedUltra) modelSelect.value = cachedUltra.name;
-  if (settings.precisionLevel) {
-    document.getElementById("precision_level").value = settings.precisionLevel;
-  }
-  if (settings.asrEngine) {
-    document.getElementById("asr_engine").value = settings.asrEngine;
-  }
-  document.getElementById("rescue_original").checked =
-    settings.rescueOriginal !== false;
-  document.getElementById("translate_to").value = settings.translateTo || "";
-  document.getElementById("romaji").checked = Boolean(settings.romaji);
-  document.getElementById("fetch_lyrics").checked = settings.fetchLyrics !== false;
-  onPrecisionChange();
-  onTranslateChange();
-  document.getElementById("tracklist_text").value = job.tracklistText || "";
-  if (job.tracklistText) await previewTracklist();
-  const state = {
-    title: job.title, duration: job.duration, recoverable: job.recoverable,
-  };
-  showRecovery(jobId, state);
-  document.getElementById("err").textContent = job.recoverable
-    ? "✅ Trabajo cargado. Ajusta las opciones y vuelve a procesar; la salida anterior se archivará."
-    : "⚠️ Este trabajo no conserva voz aislada ni asr-input.wav.";
-  document.querySelector(".card:not(#library-card)")?.scrollIntoView({behavior: "smooth"});
-}
-
-async function translateSavedJob(jobId) {
-  const target = document.getElementById("translate_to").value;
-  const romanize = document.getElementById("romaji").checked;
-  if (!target && !romanize) {
-    setMode("ultra");
-    document.getElementById("translate_to").focus();
-    return alert("Elige arriba un idioma de traducción o activa romaji.");
-  }
-  const fd = new FormData();
-  fd.append("translate_to", target);
-  fd.append("romaji", romanize ? "1" : "0");
-  let response, data;
-  try {
-    response = await fetch(`/api/jobs/${jobId}/translate`, {
-      method: "POST", body: fd,
-    });
-    data = await response.json();
-  } catch (_) {
-    return alert("No se pudo contactar con el servidor.");
-  }
-  if (!response.ok) return alert(data.error || "No pude iniciar la traducción.");
-  const job = await (await fetch(`/api/jobs/${jobId}`)).json();
-  document.getElementById("live").classList.remove("hidden");
-  document.getElementById("err").textContent = "";
-  document.getElementById("go").disabled = true;
-  resetPanels();
-  setBadges({model: null, device: INFO.device, title: job.title,
-             duration: job.duration});
-  setStage("Traduciendo el resultado guardado…", true);
-  setProgress(0);
-  localStorage.setItem("job_id", jobId);
-  listen(jobId);
-}
-
-async function loadInfo() {
-  INFO = await (await fetch("/api/info")).json();
-  const ms = document.getElementById("model");
-  INFO.models.forEach(m => {
-    const o = document.createElement("option");
-    o.value = m.name;
-    o.dataset.cached = m.cached ? "1" : "";
-    o.dataset.ultraCached = m.ultra_cached ? "1" : "";
-    if (m.name === "medium") o.selected = true;
-    ms.appendChild(o);
-  });
-  syncModelLabels();
-  const ls = document.getElementById("language");
-  INFO.languages.forEach(l => {
-    const o = document.createElement("option");
-    o.value = l.value; o.textContent = l.label;
-    ls.appendChild(o);
-  });
-  const fs = document.getElementById("audio_format");
-  INFO.audio_formats.forEach(f => {
-    const o = document.createElement("option");
-    o.value = f.value; o.textContent = f.label;
-    if (f.value === "mp3") o.selected = true;   // el más compatible
-    fs.appendChild(o);
-  });
-  const qs = document.getElementById("audio_quality");
-  INFO.audio_qualities.forEach(q => {
-    const o = document.createElement("option");
-    o.value = q; o.textContent = q.replace("K", " kbps");
-    if (q === "192K") o.selected = true;
-    qs.appendChild(o);
-  });
-  const ss = document.getElementById("separation_quality");
-  INFO.separation_profiles.forEach(p => {
-    const o = document.createElement("option");
-    o.value = p.value;
-    o.textContent = p.label + (p.available ? "" : " — no instalado");
-    o.disabled = !p.available;
-    if (p.value === "precise" && p.available) o.selected = true;
-    ss.appendChild(o);
-  });
-  if (!ss.value || ss.selectedOptions[0]?.disabled) {
-    const fallback = INFO.separation_profiles.find(p => p.available);
-    if (fallback) ss.value = fallback.value;
-  }
-  const ps = document.getElementById("precision_level");
-  (INFO.precision_levels || []).forEach(p => {
-    const o = document.createElement("option");
-    o.value = p.value; o.textContent = p.label;
-    if (p.value === "balanced") o.selected = true;
-    ps.appendChild(o);
-  });
-  const engines = document.getElementById("asr_engine");
-  (INFO.asr_engines || []).forEach(engine => {
-    const o = document.createElement("option");
-    o.value = engine.value;
-    o.textContent = engine.label + (engine.available ? "" : " — no instalado");
-    o.disabled = !engine.available;
-    if (engine.value === "auto") o.selected = true;
-    engines.appendChild(o);
-  });
-  const ts = document.getElementById("translate_to");
-  const none = document.createElement("option");
-  none.value = ""; none.textContent = "Sin traducción";
-  ts.appendChild(none);
-  (INFO.target_languages || []).forEach(l => {
-    const o = document.createElement("option");
-    o.value = l.value; o.textContent = l.label;
-    ts.appendChild(o);
-  });
-  ts.value = "";
-  onEngineChange();
-  onModelChange();
-  onPrecisionChange();
-  onTranslateChange();
-  onSeparationChange();
-  onFormatChange();
-  syncAudioOpts();
-}
-
-const VERDICTS = {
-  ok: ["verdict-ok", "✅ Limpia"],
-  bleed: ["verdict-warn", "⚠️ Queda instrumental"],
-  clipping: ["verdict-warn", "⚠️ Satura"],
-  instrumental: ["verdict-warn", "⚠️ Casi no hay canto"],
-  silent: ["verdict-bad", "⛔ Voz en silencio"],
-  empty: ["verdict-bad", "⛔ Pista vacía"],
-  unknown: ["", "· sin medir"],
-};
-
-function showStem(d) {
-  const [cls, label] = VERDICTS[d.verdict] || VERDICTS.unknown;
-  const where = d.stage === "final" ? "pista que recibe Whisper"
-    : `pasada ${d.pass_number} del separador`;
-  const html =
-    `<div class="metric"><span class="${cls}">${label}</span>` +
-    `<cite>· ${where}</cite></div><br>` +
-    `<span class="metric"><cite>Canto</cite> <b>${(d.speechCoverage * 100).toFixed(0)}%</b>` +
-    ` <cite>(${fmt(d.speechSeconds)})</cite></span>` +
-    `<span class="metric"><cite>Nivel</cite> <b>${d.vocalDbfs} dBFS</b></span>` +
-    `<span class="metric"><cite>Fuga instrumental</cite> <b>${d.bleedRatio}</b></span>`;
-  const body = document.getElementById("stem-body");
-  body.innerHTML = html + (d.notes || []).map(n =>
-    `<p class="sub" style="margin:8px 0 0;font-size:13px"></p>`).join("");
-  (d.notes || []).forEach((note, i) => {
-    body.querySelectorAll("p")[i].textContent = note;
-  });
-  document.getElementById("stem-panel").classList.remove("hidden");
-}
-
-function pct(value) {
-  return value == null ? "—" : (value * 100).toFixed(1) + "%";
-}
-
-function renderSegment(d) {
-  // Una fila de letra en la vista. La usan tanto el stream en vivo como el
-  // `snapshot` de reconexión: una recarga pinta exactamente igual.
-  const row = document.createElement("div");
-  // Menos del 80% de acuerdo entre pasadas = la línea que hay que escuchar.
-  const shaky = d.agreement != null && d.agreement < 0.8;
-  row.className = shaky ? "seg shaky" : "seg";
-  row.innerHTML = `<span class="t">${fmtMs(d.start)} → ${fmtMs(d.end)}</span>` +
-                  `<span class="x"></span>` +
-                  (d.referenceScore ? `<span class="ref">🧭 ${(d.referenceScore * 100).toFixed(0)}%</span>` : "") +
-                  (shaky ? `<span class="ag">${pct(d.agreement)}</span>` : "");
-  row.querySelector(".x").textContent = d.text;
-  if (d.track?.title) row.title = `${d.track.artist || ""} — ${d.track.title}`;
-  document.getElementById("segments").appendChild(row);
-}
-
-function showRound(d) {
-  const body = document.getElementById("rounds-body");
-  // Una fila por número de pasadas: la ronda se reescribe, no se duplica.
-  let row = body.querySelector(`tr[data-passes="${d.passes}"]`);
-  if (!row) {
-    row = document.createElement("tr");
-    row.dataset.passes = d.passes;
-    body.appendChild(row);
-  }
-  row.innerHTML =
-    `<td>${d.passes}</td><td>${d.words}</td><td>${d.dropped}</td>` +
-    `<td>${d.looped ?? 0}</td>` +
-    `<td>${pct(d.meanAgreement)}</td><td>${pct(d.unanimous)}</td>` +
-    `<td>${pct(d.stability)}</td>`;
-  document.getElementById("rounds-panel").classList.remove("hidden");
-  document.getElementById("rounds-note").textContent = d.fallback
-    ? "⚠️ Las pasadas no se pudieron alinear de forma segura. Se conservó la "
-      + "lectura principal en vez de borrar toda la letra; revisa las líneas en ámbar."
-    : "Descartadas = palabras que una pasada oyó y la mayoría no: casi siempre " +
-    "texto inventado. Bucles = repeticiones descontroladas en las que todas " +
-    "las pasadas se engancharon a la vez, así que el voto no podía verlas. " +
-    "Estabilidad = cuánto coincide esta ronda con la anterior.";
-}
-
-function showPrecision(d) {
-  showActualEngine(d.engine);
-  const context = `motor ${d.engine} · ${d.windows} ventanas de voz ` +
-    `(${fmt(d.speechSeconds)} de canto) · ${d.droppedSlots} palabras ` +
-    `descartadas por falta de acuerdo` +
-    (d.loopedWords ? ` y ${d.loopedWords} recortadas de bucles` : "") +
-    (d.rescuedWindows ? ` · ${d.rescuedWindows} zonas rescatadas con ${d.rescueModel}` : "") + ".";
-  let verdict;
-  if (d.consensusFallback) {
-    verdict = "⚠️ El voto no pudo alinear las pasadas; se conservó la lectura "
-      + "principal para no perder toda la letra. Revisa las líneas en ámbar · ";
-  } else if (d.converged) {
-    verdict = `✅ Convergió con ${d.passes} pasadas · `;
-  } else if (!d.checked) {
-    // Nivel Rápido: una sola ronda, así que no hay con qué comparar.
-    verdict = `✅ ${d.passes} pasadas votadas (sin comprobar convergencia) · `;
-  } else {
-    verdict = `⚠️ Se agotaron las ${d.passes} pasadas sin llegar al objetivo ` +
-      `de estabilidad; revisa las líneas en ámbar · `;
-  }
-  document.getElementById("rounds-note").textContent = verdict + context;
-
-  // Un mix de una hora no tiene un solo idioma: si lo tuviera, forzarlo es más
-  // estable; si no, cada tramo se transcribe en el suyo.
-  const langs = d.languages;
-  if (!langs || !langs.dominant) return;
-  const note = document.createElement("p");
-  note.className = "sub";
-  note.style.cssText = "margin:8px 2px 0;font-size:13px";
-  const parts = Object.entries(langs.seconds || {})
-    .map(([code, secs]) => `${code} ${fmt(secs)}`).join(" · ");
-  note.textContent = langs.multilingual
-    ? `🌍 Mezcla multilingüe: ${parts}. Cada tramo se transcribió en su propio `
-      + `idioma y se traduce con su propia ruta.`
-    : `🌍 Un solo idioma: ${langs.dominant} (${(langs.share * 100).toFixed(0)}% `
-      + `del canto).`;
-  const panel = document.getElementById("rounds-panel");
-  panel.querySelector(".lang-note")?.remove();
-  note.classList.add("lang-note");
-  panel.appendChild(note);
-}
-
-function showActualEngine(engine) {
-  document.getElementById("actual-engine")?.remove();
-  if (!engine) return;
-  const actual = engine === "auto" ? (INFO?.auto_engine || engine) : engine;
-  const badge = document.createElement("span");
-  badge.className = "badge";
-  badge.id = "actual-engine";
-  badge.textContent = `Motor real ${actual}`;
-  document.getElementById("badges").appendChild(badge);
-}
-
-function showTranslation(d) {
-  const body = document.getElementById("translation-body");
-  const rows = [];
-  if (d.romajiBackend && d.romajiBackend !== "none") {
-    rows.push(`<span class="metric"><cite>Romaji</cite> <b>${esc(d.romajiBackend)}</b></span>`);
-  }
-  if (d.routeLabel) {
-    rows.push(`<span class="metric"><cite>Ruta</cite> <b>${esc(d.routeLabel)}</b></span>`);
-  }
-  if (d.backend) {
-    rows.push(`<span class="metric"><cite>Motor</cite> <b>${esc(d.backend)}</b></span>`);
-  }
-  body.innerHTML = rows.join("") || "<cite>Sin traducción.</cite>";
-  if (d.error) {
-    const p = document.createElement("p");
-    p.className = "warn";
-    p.textContent = "⚠️ " + d.error;
-    body.appendChild(p);
-  } else if (d.targetLanguage) {
-    const p = document.createElement("p");
-    p.className = "sub";
-    p.style.cssText = "margin:8px 0 0;font-size:13px";
-    p.textContent = "La traducción viaja en el .lyrixa.json como segunda capa "
-      + "(layer-backing), con los mismos tiempos que la letra original.";
-    body.appendChild(p);
-  }
-  document.getElementById("translation-panel").classList.remove("hidden");
-}
-
-function showReference(d) {
-  const body = document.getElementById("reference-body");
-  const total = d.total ?? 0;
-  const found = d.found ?? 0;
-  const synced = d.synced ?? 0;
-  const failed = d.failed ?? 0;
-  const noMatch = d.noMatch ?? Math.max(0, total - found - failed);
-  const matched = d.matchedLines;
-  body.innerHTML = "";
-  const summary = document.createElement("p");
-  summary.className = "sub";
-  summary.style.margin = "0";
-  summary.textContent = `${d.section || "Tracklist"} · ${total} canciones · `
-    + `${found} letras encontradas (${synced} sincronizadas)`
-    + (noMatch ? ` · ${noMatch} sin coincidencia` : "")
-    + (failed ? ` · ${failed} búsquedas fallidas` : "")
-    + (matched != null ? ` · ${matched} líneas confirmadas con ortografía exacta` : "");
-  body.appendChild(summary);
-  if (failed) {
-    const firstFailure = (d.tracks || []).find(track => track.lookup?.error);
-    const warning = document.createElement("p");
-    warning.className = "warn";
-    warning.textContent = "⚠️ LRCLIB no respondió correctamente"
-      + (firstFailure ? `: ${firstFailure.lookup.error}` : ". Se reintentará automáticamente.");
-    body.appendChild(warning);
-  }
-  if (d.stage === "prepared") {
-    const note = document.createElement("p");
-    note.className = "sub";
-    note.style.cssText = "margin:7px 0 0;font-size:13px";
-    note.textContent = "Cada ventana de Whisper recibe solo la canción de ese tramo. Una referencia distinta al remix no se fuerza.";
-    body.appendChild(note);
-  }
-  document.getElementById("reference-panel").classList.remove("hidden");
-}
-
-async function start() {
-  // "Volver a iterar" debe conservar el mismo job y entrar por /resume.
-  // Antes esta función creaba otro ID y repetía la separación completa.
-  if (ITERATE_JOB_ID) return resumeSavedJob(ITERATE_JOB_ID);
-  const model = document.getElementById("model").value;
-  const language = document.getElementById("language").value;
-  const fd = new FormData();
-  fd.append("source_type", SOURCE);
-  fd.append("model", model);
-  fd.append("language", language);
-  fd.append("mode", MODE);
-  fd.append("audio_format", document.getElementById("audio_format").value);
-  fd.append("audio_quality", document.getElementById("audio_quality").value);
-  fd.append("separation_quality", document.getElementById("separation_quality").value);
-  fd.append("precision_level", document.getElementById("precision_level").value);
-  fd.append("asr_engine", document.getElementById("asr_engine").value);
-  fd.append("rescue_original", document.getElementById("rescue_original").checked ? "1" : "0");
-  fd.append("translate_to", MODE === "ultra"
-    ? document.getElementById("translate_to").value : "");
-  fd.append("romaji", document.getElementById("romaji").checked ? "1" : "0");
-  fd.append("tracklist_text", MODE === "ultra"
-    ? document.getElementById("tracklist_text").value : "");
-  fd.append("fetch_lyrics", document.getElementById("fetch_lyrics").checked ? "1" : "0");
-
-  if (MODE === "audio_only") {
-    // Solo audio funciona con un link de YouTube.
-    const url = document.getElementById("url").value.trim();
-    if (!url) return alert("Pega un link de YouTube para descargar el audio");
-    fd.append("url", url);
-  } else if (SOURCE === "url") {
-    const url = document.getElementById("url").value.trim();
-    if (!url) return alert("Pega un link de YouTube");
-    fd.append("url", url);
-  } else {
-    const f = document.getElementById("file").files[0];
-    if (!f) return alert("Elige un archivo");
-    fd.append("file", f);
-  }
-
-  document.getElementById("go").disabled = true;
-  const live = document.getElementById("live");
-  live.classList.remove("hidden");
-  clearSegmentView();
-  document.getElementById("downloads").classList.add("hidden");
-  document.getElementById("downloads").innerHTML = "";
-  document.getElementById("err").textContent = "";
-  resetPanels();
-  setBadges({ model: MODE === "audio_only" ? null : model, device: INFO.device });
-  setStage("Iniciando…", true);
-  setProgress(0);
-
-  let payload;
-  try {
-    const res = await fetch("/api/jobs", { method: "POST", body: fd });
-    payload = await res.json();
-  } catch (_) {
-    // El servidor cayó a mitad del POST (o se fue la red): sin esto el botón
-    // "Empezar" quedaba inutilizable hasta recargar la pestaña.
-    document.getElementById("err").textContent =
-      "⚠️ No se pudo contactar con el servidor. ¿Sigue corriendo?";
-    setStage("Error", false);
-    document.getElementById("go").disabled = false;
-    return;
-  }
-  if (!payload.job_id) {
-    document.getElementById("err").textContent =
-      "⚠️ " + (payload.error || "No se pudo iniciar el trabajo.");
-    setStage("Error", false);
-    document.getElementById("go").disabled = false;
-    return;
-  }
-  const { job_id } = payload;
-  localStorage.setItem("job_id", job_id);  // para retomar si se recarga la pestaña
-  listen(job_id);
-}
-
-function esc(s) {
-  // Textura 100% defensiva: títulos de video, mensajes de stage y nombres de
-  // motor vienen del servidor/SSE y aterrizan en `innerHTML`. Escaparlos aquí
-  // en un solo punto evita que un título like `<img src=x onerror=…>` ejecute
-  // JS contra esta API local (que incluye DELETE /api/jobs/{id}).
-  return String(s ?? "").replace(/[&<>"']/g, c => (
-    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-function setBadges({ model, device, title, duration }) {
-  const b = document.getElementById("badges");
-  // Todo lo que entra aquí (título de YouTube, motor, device) puede llevar
-  // HTML: `esc` lo vuelve texto antes de tocar `innerHTML`.
-  let html = model
-    ? `<span class="badge"><span class="dot"></span>Modelo <b>${esc(model)}</b></span>`
-    : "";
-  html += `<span class="badge">Dispositivo <b>${esc(device)}</b></span>`;
-  if (title) html += `<span class="badge" title="${esc(title)}">🎬 <b>${esc(title.slice(0, 40))}</b></span>`;
-  if (duration) html += `<span class="badge">Duración <b>${esc(fmt(duration))}</b></span>`;
-  b.innerHTML = html;
-}
-
-function setStage(text, spinning) {
-  // `text` puede traer el título del video o un mensaje crudo del servidor.
-  const stage = document.getElementById("stage");
-  stage.textContent = "";
-  if (spinning) {
-    const spin = document.createElement("span");
-    spin.className = "spin";
-    spin.textContent = "⏳";
-    stage.append(spin, " ");
-  }
-  stage.append(text ?? "");
-}
-
-function resetPanels() {
-  for (const id of ["stem-panel", "rounds-panel", "translation-panel", "reference-panel"]) {
-    document.getElementById(id).classList.add("hidden");
-  }
-  document.getElementById("rounds-body").innerHTML = "";
-  document.getElementById("stem-body").innerHTML = "";
-  document.getElementById("translation-body").innerHTML = "";
-  document.getElementById("reference-body").innerHTML = "";
-}
-function setProgress(p) {
-  const pct = p == null ? null : Math.round(p * 100);
-  document.getElementById("bar").style.width = (pct == null ? 3 : pct) + "%";
-  document.getElementById("pct").textContent = pct == null ? "…" : pct + "%";
-}
-
-function finishJob() {
-  // Trabajo terminado (bien o mal): dejamos de retomarlo al recargar.
-  localStorage.removeItem("job_id");
-  ITERATE_JOB_ID = null;
-  syncGoLabel();
-  document.getElementById("go").disabled = false;
-  document.getElementById("recovery-actions").classList.add("hidden");
-}
-
-function showFiles(jobId, files, links) {
-  const dl = document.getElementById("downloads");
-  dl.classList.remove("hidden");
-  dl.innerHTML = "<span class='badge'>Archivos:</span>";
-  // El backend arma este enlace porque es el único que sabe dónde vive
-  // Lyrixa y bajo qué dirección se ve a sí mismo. Componerlo aquí obligaría
-  // a la interfaz a conocer puertos, que es justo lo que `config` evita.
-  if (links && links.openInLyrixa && files.lyrixa) {
-    const open = document.createElement("a");
-    open.href = links.openInLyrixa;
-    open.target = "_blank";
-    open.rel = "noopener";
-    open.className = "open-in-lyrixa";
-    open.textContent = "🎛️ Abrir en Lyrixa";
-    open.title = "Abre Lyrixa con este trabajo cargado: proyecto y audio, sin "
-               + "descargar nada. Necesita Lyrixa corriendo.";
-    dl.appendChild(open);
-  }
-  for (const [kind, icon, label] of FILE_KINDS) {
-    const descriptor = files[kind];
-    if (!descriptor) continue;
-    const name = typeof descriptor === "string" ? descriptor : descriptor.name;
-    const url = typeof descriptor === "string"
-      ? `/download/${jobId}/${encodeURIComponent(name)}`
-      : descriptor.url;
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = name;
-    a.title = name;
-    if (kind === "lyrixa") {
-      a.title = "En Lyrixa: More → Import project (.lyrixa.json). Después carga el mismo audio.";
-    }
-    const ext = name.includes(".") ? name.split(".").pop() : "";
-    a.textContent = `${icon} ${label}` + (kind === "audio" ? ` (.${ext})` : "");
-    const small = document.createElement("b");
-    small.textContent = name;
-    a.appendChild(small);
-    dl.appendChild(a);
-    if (kind === "vocals" || kind === "instrumental") {
-      const player = document.createElement("div");
-      player.className = "stem-player";
-      const playerLabel = document.createElement("label");
-      const playerName = `${icon} Escuchar ${label.toLowerCase()}`;
-      playerLabel.textContent = playerName;
-      const audio = document.createElement("audio");
-      audio.controls = true;
-      audio.preload = "metadata";
-      audio.src = url;
-      // <audio> no es etiquetable: el <label> visible no asocia con for;
-      // el reproductor se anuncia con su propio nombre.
-      audio.setAttribute("aria-label", playerName);
-      player.append(playerLabel, audio);
-      dl.appendChild(player);
-    }
-  }
-}
-
-function showRecovery(jobId, state) {
-  const live = document.getElementById("live");
-  live.classList.remove("hidden");
-  clearSegmentView();
-  document.getElementById("downloads").classList.add("hidden");
-  resetPanels();
-  setMode("ultra");
-  const cachedUltra = INFO.models?.find(model => model.ultra_cached);
-  if (cachedUltra) document.getElementById("model").value = cachedUltra.name;
-  setBadges({ model: null, device: INFO.device, title: state.title,
-              duration: state.duration });
-  setProgress(0);
-  setStage("La sesión de macOS cerró este proceso", false);
-  document.getElementById("err").textContent = state.recoverable
-    ? "✅ La separación quedó guardada. Puedes retomar sin repetirla. Revisa arriba el modelo, idioma, precisión y traducción."
-    : "⚠️ No quedó un checkpoint suficiente para retomar este trabajo.";
-  document.getElementById("go").disabled = false;
-
-  const actions = document.getElementById("recovery-actions");
-  actions.innerHTML = "";
-  if (state.recoverable) {
-    const resume = document.createElement("button");
-    resume.className = "primary";
-    resume.textContent = "▶️ Retomar desde el audio guardado";
-    resume.onclick = () => resumeSavedJob(jobId);
-    actions.appendChild(resume);
-  }
-  const discard = document.createElement("button");
-  discard.textContent = "Descartar aviso";
-  discard.onclick = () => {
-    localStorage.removeItem("job_id");
-    actions.classList.add("hidden");
-    live.classList.add("hidden");
-  };
-  actions.appendChild(discard);
-  actions.classList.remove("hidden");
-}
-
-async function resumeSavedJob(jobId) {
-  const fd = new FormData();
-  fd.append("model", document.getElementById("model").value);
-  fd.append("language", document.getElementById("language").value);
-  fd.append("precision_level", document.getElementById("precision_level").value);
-  fd.append("asr_engine", document.getElementById("asr_engine").value);
-  fd.append("rescue_original", document.getElementById("rescue_original").checked ? "1" : "0");
-  fd.append("translate_to", document.getElementById("translate_to").value);
-  fd.append("romaji", document.getElementById("romaji").checked ? "1" : "0");
-  fd.append("tracklist_text", document.getElementById("tracklist_text").value);
-  fd.append("fetch_lyrics", document.getElementById("fetch_lyrics").checked ? "1" : "0");
-
-  const actions = document.getElementById("recovery-actions");
-  actions.classList.add("hidden");
-  document.getElementById("err").textContent = "";
-  document.getElementById("go").disabled = true;
-  setStage("Retomando desde asr-input.wav…", true);
-  let res, payload;
-  try {
-    res = await fetch(`/api/jobs/${jobId}/resume`, {method: "POST", body: fd});
-    payload = await res.json();
-  } catch (_) {
-    document.getElementById("err").textContent =
-      "⚠️ No se pudo contactar con el servidor para retomar.";
-    setStage("No se pudo retomar", false);
-    document.getElementById("go").disabled = false;
-    actions.classList.remove("hidden");
-    return;
-  }
-  if (!res.ok) {
-    document.getElementById("err").textContent =
-      "⚠️ " + (payload.error || "No se pudo retomar el trabajo.");
-    setStage("No se pudo retomar", false);
-    document.getElementById("go").disabled = false;
-    actions.classList.remove("hidden");
-    return;
-  }
-  localStorage.setItem("job_id", jobId);
-  listen(jobId);
-}
-
-async function interruptedState(jobId) {
-  try {
-    const res = await fetch(`/api/jobs/${jobId}/state`, {cache: "no-store"});
-    if (res.status === 404) return {status: "missing", recoverable: false};
-    return await res.json();
-  } catch (_) {
-    return null;  // servidor realmente desconectado: EventSource debe reintentar
-  }
-}
-
-let ACTIVE_EVENTS = null;
-// Último `id:` SSE oído en esta sesión de página, del trabajo escuchado.
-// Al reconectar (corte de red o pestaña reabierta) vale como `?since=`: así
-// no reenvían desde el evento 0 miles de segmentos ya pintados. Va unido a
-// la vista de segmentos: si la vista se limpia, el único punto de reanudo
-// honesto es el principio del anillo del servidor (clearSegmentView). Si al
-// pedir since el servidor ya no lo retiene, manda `reset` y vaciamos la
-// vista antes del replay.
-let LAST_EVENT = { job: null, id: 0 };
-
-// Única forma de vaciar la vista de segmentos: olvida también el since.
-function clearSegmentView() {
-  LAST_EVENT = { job: null, id: 0 };
-  document.getElementById("segments").innerHTML = "";
-}
-
-function listen(jobId) {
-  // EventSource se reconecta solo tras un corte (dormir la Mac, WiFi, etc.) y,
-  // gracias a los `id:` del servidor, retoma justo donde se quedó, sin duplicar.
-  // Solo puede haber una escucha viva: si arranca otro trabajo (o se reabre la
-  // pestaña sobre otro job), la sesión vieja debe morir o sus eventos seguirían
-  // pintando paneles ajenos en la vista nueva.
-  if (ACTIVE_EVENTS) ACTIVE_EVENTS.close();
-  // Si ya tenemos eventos pintados de este job (reconexión en la misma
-  // página) pedimos solo lo que falta; si no, el anillo completo.
-  const resume = (LAST_EVENT.job === jobId && LAST_EVENT.id > 0) ? LAST_EVENT.id : 0;
-  LAST_EVENT = { job: jobId, id: resume };
-  const es = new EventSource(
-    `/api/jobs/${jobId}/events` + (resume ? `?since=${resume}` : ""));
-  ACTIVE_EVENTS = es;
-  // Cada mensaje trae `id:` (ev.lastEventId): lo apuntamos para el future
-  // `?since=` y para que la reconexión automática de EventSource (cabecera
-  // Last-Event-ID) coincida con lo que realmente hemos pintado.
-  const on = (name, fn) => es.addEventListener(name, e => {
-    const n = Number(e.lastEventId);
-    if (Number.isFinite(n) && n > LAST_EVENT.id) LAST_EVENT.id = n;
-    fn(e);
-  });
-  let duration = 0;
-  let tries = 0;
-  let checkingState = false;
-
-  es.addEventListener("open", () => { tries = 0; });  // reconectó bien
-
-  // El anillo del servidor podó eventos más antiguos que nuestro `since`:
-  // llega el resumen acumulado (letra, stems, rondas retirados + el último
-  // valor de cada panel) y la cola reanuda justo después. Reconstruimos todo.
-  on("snapshot", e => {
-    const s = JSON.parse(e.data);
-    const L = s.latest || {};
-    resetPanels();
-    document.getElementById("segments").innerHTML = "";
-    for (const d of (s.rounds || [])) showRound(d);
-    for (const d of (s.stems || [])) showStem(d);
-    for (const d of (s.segments || [])) renderSegment(d);
-    const box = document.getElementById("segments");
-    box.scrollTop = box.scrollHeight;
-    const lastSeg = (s.segments || []).slice(-1)[0];
-    if (lastSeg) document.getElementById("clock").textContent =
-      `${fmt(lastSeg.end)}${duration ? " / " + fmt(duration) : ""}`;
-    if (L.meta) { duration = L.meta.duration || duration; setBadges(L.meta); }
-    if (L.progress) {
-      setProgress(L.progress.progress);
-      document.getElementById("clock").textContent =
-        STAGE_LABELS[L.progress.stage] || "";
-    }
-    if (L.status) {
-      setStage(L.status.message || L.status.stage, true);
-      if (L.status.engine) showActualEngine(L.status.engine);
-    }
-    if (L.consensus) showRound(L.consensus);
-    if (L.precision) showPrecision(L.precision);
-    if (L.translation) showTranslation(L.translation);
-    if (L.reference) showReference(L.reference);
-  });
-
-  on("status", e => {
-    const d = JSON.parse(e.data);
-    setStage(d.message || d.stage, true);
-    if (d.model) setBadges({ model: d.model, device: d.device, duration: d.duration });
-    if (d.engine) showActualEngine(d.engine);
-  });
-  on("meta", e => {
-    const d = JSON.parse(e.data);
-    duration = d.duration;
-    setBadges({ model: d.model, device: d.device, title: d.title, duration: d.duration });
-  });
-  // Avance de las etapas largas que no son Whisper (descarga, Demucs, conversión).
-  on("progress", e => {
-    const d = JSON.parse(e.data);
-    setProgress(d.progress);
-    document.getElementById("clock").textContent = STAGE_LABELS[d.stage] || "";
-  });
-  on("stem", e => showStem(JSON.parse(e.data)));
-  on("consensus", e => showRound(JSON.parse(e.data)));
-  on("precision", e => showPrecision(JSON.parse(e.data)));
-  on("translation", e => showTranslation(JSON.parse(e.data)));
-  on("reference", e => showReference(JSON.parse(e.data)));
-  on("rescue", e => {
-    const d = JSON.parse(e.data);
-    if (d.error) {
-      document.getElementById("err").textContent =
-        "⚠️ El rescate opcional no se pudo completar: " + d.error;
-    }
-  });
-  on("segment", e => {
-    const d = JSON.parse(e.data);
-    if (d.progress != null) setProgress(d.progress);
-    document.getElementById("clock").textContent =
-      `${fmt(d.end)}${duration ? " / " + fmt(duration) : ""}`;
-    renderSegment(d);
-    const box = document.getElementById("segments");
-    box.scrollTop = box.scrollHeight;
-  });
-  on("done", e => {
-    const d = JSON.parse(e.data);
-    setStage("✅ Listo — " + (d.title || ""), false);
-    setProgress(1);
-    document.getElementById("clock").textContent = "";
-    showFiles(d.job_id, d.files, d.links);
-    loadSavedJobs();
-    es.close();
-    finishJob();
-  });
-  on("error", async e => {
-    if (e.data) {
-      // Error real de la app (p. ej. yt-dlp/whisper falló).
-      let msg = "Ocurrió un error.";
-      try { msg = JSON.parse(e.data).message; } catch (_) {}
-      document.getElementById("err").textContent = "⚠️ " + msg;
-      setStage("Error", false);
-      es.close();
-      finishJob();
-      return;
-    }
-    // Sin datos = se cayó la conexión. EventSource reintenta solo.
-    tries++;
-    if (!checkingState) {
-      checkingState = true;
-      const state = await interruptedState(jobId);
-      checkingState = false;
-      if (state?.status === "interrupted" || state?.status === "missing") {
-        es.close();
-        showRecovery(jobId, state);
-        return;
-      }
-    }
-    if (tries > 6) {
-      document.getElementById("err").textContent =
-        "⚠️ No se pudo reconectar. El trabajo pudo terminar o el servidor se cerró.";
-      setStage("Sin conexión", false);
-      es.close();
-      finishJob();
-      return;
-    }
-    setStage("🔌 Conexión perdida, reintentando… (la transcripción sigue en el servidor)", true);
-  });
-}
-
-// Al cargar distinguimos entre una caída de red y un reinicio real del servidor.
-async function resumeIfAny() {
-  const jobId = localStorage.getItem("job_id");
-  if (!jobId) return;
-  const state = await interruptedState(jobId);
-  if (state?.status === "interrupted" || state?.status === "missing") {
-    showRecovery(jobId, state);
-    return;
-  }
-  document.getElementById("live").classList.remove("hidden");
-  clearSegmentView();
-  document.getElementById("downloads").classList.add("hidden");
-  document.getElementById("err").textContent = "";
-  document.getElementById("go").disabled = true;
-  resetPanels();
-  setStage("Retomando el trabajo en curso…", true);
-  setProgress(0);
-  listen(jobId);
-}
-
-async function boot() {
-  try {
-    await loadInfo();
-  } catch (_) {
-    // Sin /api/info no hay modelos ni idiomas: lo decimos en pantalla en vez
-    // de dejar una página muda que el usuario debe adivinar por qué.
-    document.getElementById("err").textContent =
-      "⚠️ No hay servidor. Arranca `python3 server.py` y recarga la página.";
-    return;
-  }
-  await loadSavedJobs();
-  await resumeIfAny();
-}
-boot();
-</script>
+<script src="/static/app.js"></script>
 </body>
 </html>
