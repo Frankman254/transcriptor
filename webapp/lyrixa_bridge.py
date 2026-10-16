@@ -12,6 +12,13 @@ comparable weight, which is the whole point of splitting a long line.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "BRIDGE_SCHEMA_VERSION", "LAYER_ROLES", "build_lyrixa_envelope",
+    "clip_languages", "clip_lines",
+]
+
 import math
 import re
 from datetime import datetime, timezone

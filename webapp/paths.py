@@ -14,6 +14,14 @@ import y deja de seguir al que redirige.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "CACHE_DIR", "LYRICS_CACHE_DIR", "MANIFEST_NAME", "OUTPUT_DIR",
+    "ROFORMER_CLI", "ROFORMER_MODEL", "ROFORMER_MODEL_DIR", "STATIC_DIR",
+    "TRANSLATION_CACHE_DIR",
+]
+
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent

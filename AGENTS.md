@@ -18,7 +18,7 @@ parte de una suite de cuatro proyectos: lee
 ## Leer antes de escribir código
 
 1. [README.md](README.md) y [webapp/README.md](webapp/README.md) — modos, API, modelos.
-2. [docs/arquitectura.md](docs/arquitectura.md) — capas y las tres reglas.
+2. [docs/arquitectura.md](docs/arquitectura.md) — capas y las cuatro reglas.
 3. [docs/contrato-lyrixa.md](docs/contrato-lyrixa.md) — lo que Lyrixa espera. El
    lado que lee está en `/Users/frankman254/Desktop/Personal-Projects/Lyrixa/src/core/bridge/transcriptorClient.ts`.
 4. [docs/contrato-capa-fx.md](docs/contrato-capa-fx.md) — lenguaje de efectos.
@@ -32,7 +32,9 @@ parte de una suite de cuatro proyectos: lee
 - **`paths` es el único dueño de las rutas:** usar `paths.OUTPUT_DIR`, nunca
   `from paths import OUTPUT_DIR`.
 - **`jobstore` no sabe qué está corriendo:** recibe `running=`.
-- Un módulo nuevo necesita su fila en `tests/test_module_boundaries.py`.
+- Un módulo nuevo necesita su fila en `tests/test_module_boundaries.py`
+  y su `__all__`: **lo que no está en `__all__` no lo toca otro módulo**
+  (sus propias pruebas sí).
 - Ningún host ni puerto escrito a mano: todo sale de `webapp/config.py`
   (`TRANSCRIPTOR_*`).
 - **YouTube / yt-dlp es solo para uso personal.** Nunca en un build, imagen o

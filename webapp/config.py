@@ -11,8 +11,15 @@ variable de entorno con la que la shell lo sobreescribe.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "ALLOWED_ORIGINS", "ALLOWED_ORIGIN_REGEX", "HOST", "LYRIXA_API_PARAM",
+    "LYRIXA_JOB_PARAM", "LYRIXA_URL", "PORT", "PUBLIC_URL", "as_dict",
+    "lyrixa_open_url",
+]
+
 import os
-import re
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 
@@ -55,18 +62,6 @@ ALLOWED_ORIGINS = [
     for origin in os.environ.get("TRANSCRIPTOR_ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 ]
-
-
-def origin_allowed(origin: str) -> bool:
-    """El mismo criterio que aplica el middleware, sin montar la app."""
-    if origin in ALLOWED_ORIGINS:
-        return True
-    return bool(re.match(ALLOWED_ORIGIN_REGEX, origin))
-
-
-def api_url(path: str) -> str:
-    """URL absoluta de un recurso de esta API."""
-    return f"{PUBLIC_URL.rstrip('/')}/{path.lstrip('/')}"
 
 
 # Nombres de los parámetros del handshake, tal y como los lee Lyrixa hoy

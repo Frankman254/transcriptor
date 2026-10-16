@@ -3,6 +3,10 @@ traducir un trabajo guardado. Corren en su propio hilo; `jobhub.hub`
 es su única conexión con las rutas.
 """
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = ["pipeline", "resume_precision_pipeline", "translate_saved_pipeline"]
+
 from lyrixa_bridge import build_lyrixa_envelope, clip_languages, clip_lines
 
 import json
@@ -15,7 +19,7 @@ import precision
 import track_guides
 import translation
 from jobhub import hub
-from serveutil import _finish_job_timing, _mark_job_stage, _start_job_timing, device_name, ensure_model, safe_stem, start_caffeinate
+from serveutil import finish_job_timing, mark_job_stage, start_job_timing, device_name, ensure_model, safe_stem, start_caffeinate
 from whispercli import run_whisper, write_whisper_outputs
 from catalogs import PRECISION_LEVELS, SEPARATION_PROFILES
 
@@ -31,7 +35,7 @@ def make_emit(job: dict):
     """
     def emit(event: str, **data):
         if event == "status":
-            _mark_job_stage(job, data.get("stage"))
+            mark_job_stage(job, data.get("stage"))
         hub.publish(job, event, data)
     return emit
 
@@ -168,7 +172,7 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
              fetch_lyrics: bool = True, asr_engine: str = "auto",
              rescue_original: bool = True) -> None:
     job = hub.require(job_id)
-    _start_job_timing(job)
+    start_job_timing(job)
 
     emit = make_emit(job)
 
@@ -188,7 +192,7 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
             files = {"audio": audio.name}
             jobstore.update_manifest(job_id, status="completed", title=title,
                             duration=duration, files=files,
-                            finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
+                            finishedAt=jobstore.utc_now(), timing=finish_job_timing(job))
             emit("done", title=title, files=files, job_id=job_id,
                  links=jobstore.job_links(job_id, files))
             return
@@ -325,13 +329,13 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         files.update(stem_files)
         jobstore.update_manifest(job_id, status="completed", title=title,
                         duration=duration, files=files, error=None,
-                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job),
+                        finishedAt=jobstore.utc_now(), timing=finish_job_timing(job),
                         precision=precision_report)
         emit("done", title=title, files=files, job_id=job_id,
              links=jobstore.job_links(job_id, files))
     except Exception as e:  # noqa: BLE001
         jobstore.update_manifest(job_id, status="error", error=str(e),
-                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
+                        finishedAt=jobstore.utc_now(), timing=finish_job_timing(job))
         emit("error", message=str(e))
     finally:
         if caffeinate is not None:
@@ -345,7 +349,7 @@ def resume_precision_pipeline(
 ) -> None:
     """Continúa un modo ultra desde los WAV que sobrevivieron al reinicio."""
     job = hub.require(job_id)
-    _start_job_timing(job)
+    start_job_timing(job)
 
     emit = make_emit(job)
 
@@ -453,13 +457,13 @@ def resume_precision_pipeline(
         files.update(stem_files)
         jobstore.update_manifest(job_id, status="completed", title=title,
                         duration=duration, files=files, error=None,
-                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job),
+                        finishedAt=jobstore.utc_now(), timing=finish_job_timing(job),
                         precision=precision_report)
         emit("done", title=title, files=files, job_id=job_id,
              links=jobstore.job_links(job_id, files))
     except Exception as error:  # noqa: BLE001
         jobstore.update_manifest(job_id, status="error", error=str(error),
-                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
+                        finishedAt=jobstore.utc_now(), timing=finish_job_timing(job))
         emit("error", message=str(error))
     finally:
         if caffeinate is not None:
@@ -468,7 +472,7 @@ def resume_precision_pipeline(
 def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
     """Add or replace language layers without rerunning separation or ASR."""
     job = hub.require(job_id)
-    _start_job_timing(job)
+    start_job_timing(job)
 
     emit = make_emit(job)
 
@@ -480,7 +484,7 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
             raise RuntimeError("El trabajo guardado ya no existe.")
         outdir: Path = assets["outdir"]
         manifest = jobstore.read_manifest(outdir)
-        files = jobstore._discover_result_files(job_id, outdir, assets)
+        files = jobstore.discover_result_files(job_id, outdir, assets)
         json_name = files.get("json")
         if not isinstance(json_name, str):
             raise RuntimeError("Este trabajo no conserva el JSON cronometrado.")
@@ -519,13 +523,13 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
         settings.update({"translateTo": target, "romaji": romanize})
         jobstore.update_manifest(
             job_id, status="completed", files=files, settings=settings,
-            error=None, finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
+            error=None, finishedAt=jobstore.utc_now(), timing=finish_job_timing(job))
         emit("done", title=manifest.get("title") or assets["title"],
              files=files, job_id=job_id,
              links=jobstore.job_links(job_id, files))
     except Exception as error:  # noqa: BLE001
         jobstore.update_manifest(job_id, status="error", error=str(error),
-                        finishedAt=jobstore.utc_now(), timing=_finish_job_timing(job))
+                        finishedAt=jobstore.utc_now(), timing=finish_job_timing(job))
         emit("error", message=str(error))
     finally:
         hub.finish(job)

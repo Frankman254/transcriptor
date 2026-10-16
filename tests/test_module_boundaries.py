@@ -5,6 +5,11 @@ añadirle una más.  Estas pruebas son ese impedimento: describen en qué
 dirección pueden apuntar las dependencias y qué módulos son hojas, de forma
 que romper la separación falle aquí y no seis meses después.
 
+La tabla de capas dice quién puede hablar con quién; `__all__` dice *qué* se
+le puede decir.  Hicieron falta las dos: hubo un `routes_system` que llegaba a
+`transcribe_engines` escribiendo `precision.te.…`, sin un solo import que
+delatara la dependencia, y la regla de capas lo daba por bueno.
+
 La comprobación de nombres indefinidos existe por un caso real: al mover el
 descargador a `media.py` se quedó atrás su `from collections import deque` y
 el módulo importaba perfectamente — el fallo solo aparecía al descargar algo.
@@ -81,6 +86,47 @@ def local_imports(module: str) -> set[str]:
     return found & set(MODULES)
 
 
+def declared_interface(module: str) -> set[str] | None:
+    """El `__all__` de un módulo, o None si no declara ninguno."""
+    tree = ast.parse((WEBAPP / f"{module}.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "__all__"
+                        for t in node.targets)):
+            return {element.value for element in node.value.elts}
+    return None
+
+
+def crossings(module: str) -> dict[str, set[str]]:
+    """Qué nombre de qué otro módulo local toca este módulo.
+
+    Mira las dos formas de tocarlo, no solo la primera: `from N import x` y
+    `N.x` sobre el nombre con el que se importó `N` (resolviendo `import N as
+    n`).  Leer solo los `import` fue el agujero real de esta prueba: un
+    `routes_system` que llamaba a `precision.te.mlx_whisper_available()`
+    dependía de `transcribe_engines` sin que apareciera ni un import, y la
+    regla de capas daba verde.
+    """
+    tree = ast.parse((WEBAPP / f"{module}.py").read_text(encoding="utf-8"))
+    touched: dict[str, set[str]] = {}
+    alias: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for element in node.names:
+                if element.name in MODULES and element.name != module:
+                    alias[element.asname or element.name] = element.name
+        elif (isinstance(node, ast.ImportFrom) and node.level == 0
+                and node.module in MODULES and node.module != module):
+            touched.setdefault(node.module, set()).update(
+                element.name for element in node.names)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in alias):
+            touched.setdefault(alias[node.value.id], set()).add(node.attr)
+    return touched
+
+
 class LayeringTests(unittest.TestCase):
     def test_every_module_is_declared(self):
         # Un módulo nuevo entra en la tabla de arriba deliberadamente, con una
@@ -119,6 +165,50 @@ class LayeringTests(unittest.TestCase):
 
         for module in MODULES:
             visit(module, [])
+
+
+class InterfaceTests(unittest.TestCase):
+    """Lo que un módulo promete y lo que de verdad le piden.
+
+    Un módulo con veinte nombres públicos de los que fuera solo se llaman seis
+    no tiene una interfaz de veinte: tiene una de seis y catorce detalles que
+    cualquiera puede empezar a usar sin darse cuenta.  `__all__` es la que
+    promete; estas pruebas comprueban que nadie pida nada más.
+    """
+
+    def test_every_module_declares_its_interface(self):
+        # Igual que la tabla de capas: un módulo nuevo decide qué expone, y lo
+        # decide alguien, no el azar de qué quedó sin guión bajo delante.
+        for module in MODULES:
+            with self.subTest(module=module):
+                self.assertIsNotNone(
+                    declared_interface(module),
+                    f"{module} no declara `__all__`: no se sabe qué parte de "
+                    f"él es interfaz y qué parte es implementación")
+
+    def test_nobody_reaches_into_another_module_private(self):
+        for module in MODULES:
+            for target, names in sorted(crossings(module).items()):
+                private = {name for name in names if name.startswith("_")}
+                with self.subTest(module=module, target=target):
+                    self.assertEqual(
+                        private, set(),
+                        f"{module} usa {sorted(private)} de {target}: es la "
+                        f"implementación de {target}, no su interfaz")
+
+    def test_nobody_reaches_past_a_declared_interface(self):
+        for module in MODULES:
+            for target, names in sorted(crossings(module).items()):
+                interface = declared_interface(target)
+                if interface is None:
+                    continue
+                with self.subTest(module=module, target=target):
+                    extra = names - interface
+                    self.assertEqual(
+                        extra, set(),
+                        f"{module} usa {sorted(extra)} de {target}, que no "
+                        f"está en su `__all__`: o es interfaz y se declara, o "
+                        f"no se usa desde fuera")
 
 
 class UndefinedNameTests(unittest.TestCase):

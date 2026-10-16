@@ -13,6 +13,14 @@ para quien lee el código, son el texto que ve el usuario.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "ASR_ENGINES", "AUDIO_FORMATS", "AUDIO_QUALITIES", "FORMATS_BY_VALUE",
+    "LANGUAGES", "MODELS", "MODEL_ARTIFACTS", "MODEL_DETAILS",
+    "PRECISION_LEVELS", "SEPARATION_PROFILES", "TARGET_LANGUAGES",
+]
+
 # Modelos que ofrecemos en la interfaz (nombre -> etiqueta amigable).
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "turbo"]
 MODEL_DETAILS = {
@@ -127,7 +135,9 @@ SEPARATION_PROFILES = {
     },
 }
 
-_FORMATS_BY_VALUE = {f["value"]: f for f in AUDIO_FORMATS}
+# Índice de AUDIO_FORMATS por valor: lo consultan `media` (para armar los
+# argumentos de yt-dlp) y `routes_jobs` (para validar lo que llega).
+FORMATS_BY_VALUE = {f["value"]: f for f in AUDIO_FORMATS}
 
 # Idiomas comunes; "" = detección automática. En el modo ultra la detección
 # automática vota entre varios puntos del audio, así que sirve también para

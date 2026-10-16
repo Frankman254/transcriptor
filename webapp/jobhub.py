@@ -16,6 +16,10 @@ solo los últimos minutos.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = ["hub"]
+
 import json
 import threading
 

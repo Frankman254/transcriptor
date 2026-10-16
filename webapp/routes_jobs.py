@@ -2,6 +2,8 @@
 traducir y borrar.
 """
 
+__all__ = ["router"]
+
 from fastapi import APIRouter
 
 router = APIRouter()
@@ -26,7 +28,7 @@ from catalogs import (
     PRECISION_LEVELS,
     SEPARATION_PROFILES,
     TARGET_LANGUAGES,
-    _FORMATS_BY_VALUE,
+    FORMATS_BY_VALUE,
 )
 
 def job_is_running(job_id: str) -> bool:
@@ -118,7 +120,7 @@ async def create_job(
     fetch_lyrics: str = Form("1"),
     file: UploadFile | None = File(None),
 ):
-    if audio_format not in _FORMATS_BY_VALUE:
+    if audio_format not in FORMATS_BY_VALUE:
         return JSONResponse({"error": f"Formato desconocido: {audio_format}"},
                             status_code=400)
     if audio_quality not in AUDIO_QUALITIES:
@@ -251,7 +253,7 @@ async def resume_job(
     if len(tracklist_text.encode("utf-8")) > 2_000_000:
         return JSONResponse({"error": "El tracklist supera 2 MB."}, status_code=400)
 
-    iteration = jobstore._archive_outputs(assets["outdir"])
+    iteration = jobstore.archive_outputs(assets["outdir"])
     if tracklist_text.strip():
         (assets["outdir"] / "tracklist.txt").write_text(
             tracklist_text.strip() + "\n", encoding="utf-8")

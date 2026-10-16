@@ -17,6 +17,13 @@ Pure functions over plain data: no audio, no models, no I/O.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "ConsensusStats", "ConsensusWord", "consensus_words", "single_pass_words",
+    "summarize", "to_segments",
+]
+
 import math
 import re
 import statistics

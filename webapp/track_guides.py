@@ -9,6 +9,13 @@ the audio-derived text already agrees strongly with the reference.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "Track", "build_guide", "choose_section", "language_priors",
+    "parse_tracklist", "prompt_spans", "refine_segments",
+]
+
 import hashlib
 import json
 import re

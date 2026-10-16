@@ -3,6 +3,9 @@ Servidor FastAPI del transcriptor local: montaje de la app y las tres
 familias de rutas.  El trabajo real está en `pipelines`, `routes_*` y los
 módulos de motor; aquí solo se cablea.
 """
+
+__all__ = ["app"]
+
 import config
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

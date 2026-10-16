@@ -3,11 +3,15 @@
 reusa `write_whisper_outputs`.
 """
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = ["run_whisper", "write_whisper_outputs"]
+
 import os
 import subprocess
 from pathlib import Path
 import paths
-from serveutil import _TS_RE, device_name, parse_ts, safe_stem
+from serveutil import device_name, parse_whisper_line, safe_stem
 
 
 def run_whisper(audio: Path, model: str, language: str, outdir: Path,
@@ -43,11 +47,9 @@ def run_whisper(audio: Path, model: str, language: str, outdir: Path,
     )
     for line in proc.stdout:
         line = line.rstrip("\n")
-        m = _TS_RE.search(line)
-        if m:
-            start = parse_ts(m.group(1))
-            end = parse_ts(m.group(2))
-            text = m.group(3).strip()
+        segment = parse_whisper_line(line)
+        if segment:
+            start, end, text = segment
             progress = min(end / duration, 1.0) if duration else None
             emit("segment", start=start, end=end, text=text, progress=progress)
     proc.wait()

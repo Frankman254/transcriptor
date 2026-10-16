@@ -18,6 +18,15 @@ Two rules shape the whole module:
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "DEFAULT_CACHE_DIR", "LANGUAGE_NAMES", "ROMANIZABLE",
+    "TranslationUnavailable", "language_label", "normalize_code", "pick_model",
+    "plan_route", "romanize", "route_label", "translate",
+    "translate_clip_lines", "translation_available",
+]
+
 import hashlib
 import json
 import re

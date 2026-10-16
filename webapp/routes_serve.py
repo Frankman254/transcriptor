@@ -2,6 +2,8 @@
 el proyecto Lyrixa.
 """
 
+__all__ = ["router"]
+
 from fastapi import APIRouter
 
 router = APIRouter()

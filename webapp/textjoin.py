@@ -9,6 +9,13 @@ produces `Tellmeso,but,but,don'tletmegrow`.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "display_width", "is_no_space_char", "join_raw", "join_tokens",
+    "space_prefixes",
+]
+
 import re
 
 # Scripts written without spaces between words.

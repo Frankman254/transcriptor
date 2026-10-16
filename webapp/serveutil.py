@@ -2,6 +2,14 @@
 modelos, caffeinate, timing de trabajo y nombres de archivo.
 """
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "device_name", "ensure_model", "finish_job_timing", "mark_job_stage",
+    "model_is_cached", "parse_whisper_line", "safe_stem", "start_caffeinate",
+    "start_job_timing",
+]
+
 import os
 import re
 import shutil
@@ -67,13 +75,16 @@ def ensure_model(model: str, emit) -> None:
         raise RuntimeError(
             f"No se pudo descargar el modelo '{model}': {proc.stderr[-300:]}"
         )
-def _start_job_timing(job: dict) -> None:
+# Cronómetro de un trabajo: tres funciones sobre el mismo `job["_timing"]`.
+# Se llaman en este orden — arrancar, marcar cada etapa, cerrar — y cerrar dos
+# veces es seguro: el segundo `finish` devuelve lo mismo sin recontar.
+def start_job_timing(job: dict) -> None:
     now = time.monotonic()
     job["_timing"] = {
         "started": now, "stageStarted": now,
         "stage": "starting", "durations": {}, "finished": False,
     }
-def _mark_job_stage(job: dict, stage: str | None) -> None:
+def mark_job_stage(job: dict, stage: str | None) -> None:
     timing = job.get("_timing")
     if not timing or timing.get("finished") or not stage or stage == timing["stage"]:
         return
@@ -83,7 +94,7 @@ def _mark_job_stage(job: dict, stage: str | None) -> None:
     durations[timing["stage"]] = durations.get(timing["stage"], 0.0) + elapsed
     timing["stage"] = stage
     timing["stageStarted"] = now
-def _finish_job_timing(job: dict) -> dict:
+def finish_job_timing(job: dict) -> dict:
     timing = job.get("_timing") or {}
     if not timing:
         return {}
@@ -117,7 +128,22 @@ def safe_stem(name: str, fallback: str = "transcripcion") -> str:
 _TS_RE = re.compile(
     r"\[(\d+:\d+(?::\d+)?\.\d+)\s*-->\s*(\d+:\d+(?::\d+)?\.\d+)\]\s?(.*)"
 )
-def parse_ts(ts: str) -> float:
+def parse_whisper_line(line: str) -> tuple[float, float, str] | None:
+    """Una línea de la salida del CLI de Whisper como (inicio, fin, texto).
+
+    Devuelve None cuando esa línea no es un segmento: el CLI intercala avisos,
+    progreso y mensajes del modelo con las transcripciones.
+
+    Existe para que quien lee esa salida no tenga que conocer ni el formato
+    `[00:01.000 --> 00:04.120] texto` ni cómo se pasa ese reloj a segundos.
+    Este es el único sitio del proyecto que sabe las dos cosas.
+    """
+    match = _TS_RE.search(line)
+    if not match:
+        return None
+    return (_parse_ts(match.group(1)), _parse_ts(match.group(2)),
+            match.group(3).strip())
+def _parse_ts(ts: str) -> float:
     parts = ts.split(":")
     parts = [float(p) for p in parts]
     while len(parts) < 3:

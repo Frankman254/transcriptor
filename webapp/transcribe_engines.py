@@ -12,6 +12,15 @@ hypothesis: it always gets the same ``Hypothesis`` of timed, scored words.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "FASTER_CACHE", "PassSpec", "build_engine", "detect_language_task",
+    "faster_model_cached", "faster_model_name", "faster_whisper_available",
+    "init_worker", "mlx_model_cached", "mlx_whisper_available", "pass_specs",
+    "transcribe_task",
+]
+
 import math
 import os
 import platform
@@ -118,6 +127,16 @@ def pass_specs(count: int) -> list[PassSpec]:
 # --------------------------------------------------------------------------- #
 # Motores
 # --------------------------------------------------------------------------- #
+def faster_model_name(model: str, default: str = "large-v3") -> str:
+    """El repositorio CTranslate2 que guarda los pesos de este modelo.
+
+    Los nombres no coinciden con los de openai-whisper ("turbo" allí es
+    "large-v3-turbo" aquí), y esa correspondencia es de este módulo: quien
+    solo quiere cargar el modelo pregunta, en vez de leerse la tabla.
+    """
+    return _FASTER_MODEL_NAMES.get(model, default)
+
+
 def faster_model_cached(model: str) -> bool:
     """Is a CTranslate2 conversion of this model already on disk?"""
     name = _FASTER_MODEL_NAMES.get(model)

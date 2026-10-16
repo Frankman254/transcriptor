@@ -13,6 +13,14 @@ llamarlas desde una CLI, desde una prueba o desde una shell de escritorio.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "demucs_available", "download_audio", "ffprobe_duration", "measure_stems",
+    "roformer_available", "separate_vocals", "separation_profile_available",
+    "separator_acceleration",
+]
+
 import json
 import os
 import re
@@ -24,7 +32,7 @@ from pathlib import Path
 
 import audio_analysis
 import paths
-from catalogs import SEPARATION_PROFILES, _FORMATS_BY_VALUE
+from catalogs import SEPARATION_PROFILES, FORMATS_BY_VALUE
 
 
 def ffprobe_duration(path: Path) -> float:
@@ -89,7 +97,7 @@ def audio_download_args(audio_format: str, quality: str) -> tuple[list[str], dic
     convierte con ffmpeg. En ambos casos incrustamos metadatos y, si el
     contenedor lo admite, la carátula del video como portada del álbum.
     """
-    spec = _FORMATS_BY_VALUE.get(audio_format) or _FORMATS_BY_VALUE["best"]
+    spec = FORMATS_BY_VALUE.get(audio_format) or FORMATS_BY_VALUE["best"]
 
     # Siempre extraemos el audio. Con "best", ffmpeg solo lo re-empaqueta (copia
     # el códec tal cual, sin recodificar): el resultado es .opus o .m4a en vez

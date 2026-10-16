@@ -14,6 +14,15 @@ después de un reinicio en el que no queda ningún trabajo vivo.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "archive_outputs", "discover_result_files", "job_links",
+    "lyrixa_project_path", "prepare_track_guide", "read_manifest",
+    "recovery_assets", "reusable_checkpoint", "saved_job",
+    "stored_stem_report", "update_manifest", "utc_now",
+]
+
 import json
 import re
 import shutil
@@ -215,8 +224,15 @@ def prepare_track_guide(outdir: Path, text: str, duration: float,
     return guide
 
 
-def _archive_outputs(outdir: Path) -> int:
-    """Keep small prior transcripts when the user iterates the same stems."""
+def archive_outputs(outdir: Path) -> int:
+    """Archive this run's outputs and return the new iteration number.
+
+    Keeps the small prior transcripts when the user iterates over the same
+    stems.  Mutates the folder: moves the result files into
+    ``iterations/iteration-NN/`` next to a frozen copy of the manifest, so a
+    later reader can tell which model and options produced them.  Call it
+    before queueing the next run, never after.
+    """
     manifest = read_manifest(outdir)
     iteration = int(manifest.get("iteration") or 0) + 1
     archive = outdir / "iterations" / f"iteration-{iteration:02d}"
@@ -246,7 +262,18 @@ def _archive_outputs(outdir: Path) -> int:
     return iteration
 
 
-def _discover_result_files(job_id: str, outdir: Path, assets: dict | None) -> dict:
+def discover_result_files(job_id: str, outdir: Path, assets: dict | None) -> dict:
+    """What a finished job has on disk, as ``kind -> file name``.
+
+    Reads the folder, not just the manifest: a run interrupted before writing
+    its manifest still has results, and the newest file of each kind wins.
+
+    Two shapes, and the caller has to handle both.  Most kinds map to a bare
+    file name, downloadable under ``/download/<job>/<name>``.  The two stems
+    (``vocals``, ``instrumental``) map to ``{"name", "url"}`` instead: they
+    live in their own subfolder and are served by their own route, so the URL
+    is not derivable from the name.
+    """
     manifest_files = read_manifest(outdir).get("files") or {}
     files: dict = {}
     for kind, descriptor in manifest_files.items():
@@ -339,7 +366,7 @@ def saved_job(job_id: str, *, running: bool = False) -> dict | None:
         return None
     outdir = assets["outdir"]
     manifest = read_manifest(outdir)
-    files = _discover_result_files(job_id, outdir, assets)
+    files = discover_result_files(job_id, outdir, assets)
     completed = any(kind in files for kind in ("json", "txt", "lyrixa"))
     if running:
         status = "running"

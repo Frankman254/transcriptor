@@ -2,6 +2,8 @@
 traducción suelta.
 """
 
+__all__ = ["router"]
+
 from fastapi import APIRouter
 
 router = APIRouter()
@@ -48,11 +50,8 @@ def index():
     return (paths.STATIC_DIR / "index.html").read_text(encoding="utf-8")
 @router.get("/api/info")
 def info():
-    auto_engine = (
-        "mlx-whisper" if precision.te.mlx_whisper_available()
-        else "faster-whisper" if precision.te.faster_whisper_available()
-        else "openai-whisper"
-    )
+    engines = precision.engine_availability(MODELS)
+    auto_engine = engines["auto"]
     return JSONResponse({
         "device": device_name(),
         # Cada motor guarda un artefacto distinto: .pt original, conversión
@@ -62,13 +61,9 @@ def info():
                 "name": name, **MODEL_DETAILS[name],
                 "artifacts": MODEL_ARTIFACTS[name],
                 "cached": model_is_cached(name),
-                "faster_cached": precision.te.faster_model_cached(name),
-                "mlx_cached": precision.te.mlx_model_cached(name),
-                "ultra_cached": (
-                    precision.te.mlx_model_cached(name)
-                    if auto_engine == "mlx-whisper"
-                    else precision.te.faster_model_cached(name)
-                ),
+                "faster_cached": engines["cached"][name]["faster-whisper"],
+                "mlx_cached": engines["cached"][name]["mlx-whisper"],
+                "ultra_cached": engines["cached"][name]["auto"],
             }
             for name in MODELS
         ],
@@ -93,17 +88,17 @@ def info():
         "demucs": media.demucs_available(),
         "roformer": media.roformer_available(),
         "media.separator_acceleration": media.separator_acceleration(),
-        "faster_whisper": precision.te.faster_whisper_available(),
-        "mlx_whisper": precision.te.mlx_whisper_available(),
+        "faster_whisper": engines["available"]["faster-whisper"],
+        "mlx_whisper": engines["available"]["mlx-whisper"],
         "asr_engines": [
             {"value": "auto", "label": "Auto · mejor para esta Mac",
              "available": True,
              "hint": f"Elegirá {auto_engine} automáticamente."},
             {"value": "mlx-whisper", "label": "MLX · Apple Silicon",
-             "available": precision.te.mlx_whisper_available(),
+             "available": engines["available"]["mlx-whisper"],
              "hint": "GPU Metal y memoria unificada. Es la ruta más rápida en esta Mac."},
             {"value": "faster-whisper", "label": "faster-whisper · CPU",
-             "available": precision.te.faster_whisper_available(),
+             "available": engines["available"]["faster-whisper"],
              "hint": "CTranslate2 cuantizado: eficiente en CPU y con sus propios pesos."},
             {"value": "openai-whisper", "label": "Whisper original · CPU",
              "available": True,

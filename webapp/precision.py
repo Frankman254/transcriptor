@@ -15,6 +15,13 @@ progress and a plain dict back.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "PrecisionConfig", "PrecisionResult", "engine_availability",
+    "rescue_from_original", "run",
+]
+
 import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -153,6 +160,43 @@ def plan_resources(engine: str, workers: int | None = None) -> tuple[int, int]:
     return workers, max(1, cores // workers)
 
 
+def engine_availability(models) -> dict:
+    """Qué motores de ASR existen en esta máquina y qué pesos tiene cada uno.
+
+    Una sola pregunta en lugar de seis.  Quien pinta el catálogo de motores
+    quiere saber qué puede ofrecer; no tiene por qué saber que debajo hay un
+    `transcribe_engines`, ni que cada runtime guarda un artefacto distinto
+    (el `.pt` de OpenAI, la conversión CTranslate2, los pesos MLX).  Esa
+    correspondencia vive aquí, junto a `choose_engine`, que es quien la usa
+    para decidir de verdad.
+
+    `auto` responde con el mismo criterio que `choose_engine`: lo que la
+    interfaz anuncia y lo que el trabajo acaba usando no pueden divergir.
+    """
+    mlx = te.mlx_whisper_available()
+    faster = te.faster_whisper_available()
+    auto = ("mlx-whisper" if mlx else
+            "faster-whisper" if faster else "openai-whisper")
+    cached = {}
+    for name in models:
+        by_engine = {
+            "mlx-whisper": te.mlx_model_cached(name),
+            "faster-whisper": te.faster_model_cached(name),
+        }
+        cached[name] = {
+            **by_engine,
+            # El modo ultra corre con el motor que elegiría `auto`, así que la
+            # interfaz debe decir si *ese* tiene los pesos, no otro.
+            "auto": by_engine.get(auto, True),
+        }
+    return {
+        "auto": auto,
+        "available": {"mlx-whisper": mlx, "faster-whisper": faster,
+                      "openai-whisper": True},
+        "cached": cached,
+    }
+
+
 def choose_engine(model: str, emit=None, preferred: str = "auto") -> str:
     """Prefer the fast runtime, but never fail the job over it.
 
@@ -185,7 +229,7 @@ def choose_engine(model: str, emit=None, preferred: str = "auto") -> str:
         from faster_whisper import WhisperModel
 
         probe = WhisperModel(
-            te._FASTER_MODEL_NAMES.get(model, "large-v3"), device="cpu",
+            te.faster_model_name(model), device="cpu",
             compute_type="int8_float32", cpu_threads=1,
             download_root=str(te.FASTER_CACHE),
         )

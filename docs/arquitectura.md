@@ -53,7 +53,7 @@ servidor.
 | `textjoin` | 94 | Unir palabras respetando el sistema de escritura. |
 | `paths` | 40 | Las carpetas del disco. |
 
-## Las tres reglas
+## Las cuatro reglas
 
 **1. Nada por debajo de `server` importa `server`.** Es la que hace que el
 motor se pueda usar sin HTTP. Las funciones largas del pipeline reciben un
@@ -70,13 +70,35 @@ apuntan `paths.OUTPUT_DIR` a un temporal y todo el backend las sigue.
 memoria es del servidor y una carpeta tiene que poder describirse después de un
 reinicio en el que no queda ningún trabajo vivo.
 
+**4. Cada módulo declara su interfaz en `__all__`.** Lo que no está ahí es
+implementación, aunque no lleve guión bajo delante: los demás módulos no lo
+tocan, y sus propias pruebas sí. La distinción importa porque casi todos estos
+módulos tienen *seams internos* —`track_guides` tiene siete funciones de
+plausibilidad de una referencia de LRCLIB, `consensus` tiene su alineador y sus
+veinte umbrales— que existen para poder probar la decisión por separado, no
+para que los llame nadie de fuera. Sin la declaración no hay forma de distinguir
+un seam interno de una promesa: `track_guides` parecía ofrecer veintiocho
+nombres cuando de fuera solo se le piden siete.
+
 ## Cómo se hacen cumplir
 
-`tests/test_module_boundaries.py` lee los imports de cada módulo con `ast` y los
-compara con una tabla de lo permitido. Un módulo nuevo falla hasta que alguien
-decida a qué capa pertenece. También comprueba que el grafo no tenga ciclos y
-—con pyflakes, si está instalado— que ningún módulo use un nombre que nunca
-importó.
+`tests/test_module_boundaries.py` lee cada módulo con `ast` y comprueba cuatro
+cosas: que sus imports locales estén en la tabla de lo permitido, que el grafo
+no tenga ciclos, que nadie pida de otro módulo un nombre que no esté en su
+`__all__`, y —con pyflakes, si está instalado— que ningún módulo use un nombre
+que nunca importó. Un módulo nuevo falla hasta que alguien decida a qué capa
+pertenece y qué expone.
+
+La comprobación de interfaz no mira solo los `import`: también los accesos
+`modulo.nombre`, resolviendo los alias. Esa es la diferencia entre las dos
+reglas y no es teórica. `routes_system` llegó a preguntar seis veces por los
+motores de ASR escribiendo `precision.te.mlx_whisper_available()` —el `te` es
+el alias con el que `precision` importa `transcribe_engines`—, así que dependía
+de un módulo que no tiene permitido y lo hacía sin un solo import que lo
+delatara. La regla de capas daba verde porque leía imports; hoy falla porque
+`te` no está en el `__all__` de `precision`. Lo que había detrás eran seis
+preguntas de las que `routes_system` no tenía por qué saber la respuesta:
+ahora son una, `precision.engine_availability()`.
 
 Esa última comprobación no es teórica: al mover el descargador a `media.py` se
 quedó atrás su `from collections import deque`. El módulo importaba
@@ -85,9 +107,10 @@ limpio no demuestra que un módulo funcione.
 
 ## Lo que queda
 
-- `server.py` sigue mezclando el pipeline (~800 líneas) con las rutas (~630).
-  El siguiente corte natural es un `pipeline.py`, pero necesita resolver antes
-  el acoplamiento con `JOBS` y con `emit`.
+- El diagrama y la tabla de arriba son de antes de partir `server.py`: no
+  mencionan `pipelines`, `routes_*`, `jobhub`, `serveutil` ni `whispercli`, y
+  los recuentos de líneas se han quedado atrás. La tabla de
+  `tests/test_module_boundaries.py` sí está al día; es la que manda.
 - Los catálogos son datos que solo consume `/api/info`. Si la shell de
   escritorio acaba dibujando su propio formulario, querrán ser un JSON servido
   y no un módulo Python.

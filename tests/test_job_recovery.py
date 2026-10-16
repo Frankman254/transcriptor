@@ -141,7 +141,7 @@ class JobRecoveryTests(unittest.TestCase):
                                          "asrEngine": "mlx-whisper"})
         transcript = outdir / "Mix recuperable.json"
         transcript.write_text("{}", encoding="utf-8")
-        iteration = jobstore._archive_outputs(outdir)
+        iteration = jobstore.archive_outputs(outdir)
         self.assertEqual(iteration, 1)
         self.assertFalse(transcript.exists())
         self.assertTrue((outdir / "iterations" / "iteration-01" /

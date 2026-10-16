@@ -12,6 +12,13 @@ spent on the (usually large) instrumental-only part of the timeline.
 
 from __future__ import annotations
 
+# Interfaz externa de este módulo; lo que no está aquí es seam interno
+# y solo lo tocan sus propias pruebas (docs/arquitectura.md).
+__all__ = [
+    "SAMPLE_RATE", "SpeechRegion", "StemReport", "Window", "assess_separation",
+    "condition_for_asr", "decode_pcm", "detect_speech_regions", "plan_windows",
+]
+
 import math
 import subprocess
 from dataclasses import dataclass, field
