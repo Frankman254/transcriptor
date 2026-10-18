@@ -110,6 +110,58 @@ class RescuePlanTests(unittest.TestCase):
         self.assertLessEqual(len(self.plan(segments, 1000, limit=24)), 24)
 
 
+def lyric(start, end, words):
+    """Un segmento con `words` palabras repartidas entre start y end."""
+    step = (end - start) / max(words, 1)
+    return {"start": start, "end": end, "agreement": 1.0, "confidence": 0.9,
+            "words": [{"start": start + i * step} for i in range(words)]}
+
+
+class ErasedVoiceTests(unittest.TestCase):
+    """Voz que el VAD oye en el stem y que la letra final no recoge.
+
+    El caso real: 1b0734de70f7 tenía una región de voz de 258 s con 2 palabras
+    escritas.  El rescate solo miraba huecos de 1-8 s y nunca la vio.
+    """
+
+    def setUp(self):
+        import precision
+        self.precision = precision
+        self.plan = precision._erased_intervals
+
+    def test_a_long_voiced_region_without_lyrics_is_reviewed_whole(self):
+        chunks = self.plan([lyric(0, 10, 20)], [(0, 10), (881, 1140)])
+        covered = sum(end - start for start, end in chunks)
+        self.assertAlmostEqual(covered, 259, places=6)
+        self.assertTrue(all(end - start <= 29 for start, end in chunks))
+        self.assertTrue(all(start >= 881 for start, _ in chunks))
+
+    def test_a_region_that_already_has_lyrics_is_left_alone(self):
+        sung = lyric(100, 130, 45)          # 1.5 palabras/s: canto lento real
+        self.assertEqual(self.plan([sung], [(100, 130)]), [])
+
+    def test_a_few_stray_words_do_not_hide_an_erased_region(self):
+        # Dos alucinaciones sueltas en cuatro minutos siguen siendo un hueco.
+        stray = lyric(900, 902, 2)
+        self.assertTrue(self.plan([stray], [(881, 1140)]))
+
+    def test_tiny_regions_are_not_worth_a_whisper_call(self):
+        self.assertEqual(self.plan([], [(10, 12)]), [])
+
+    def test_the_budget_is_spread_across_the_mix(self):
+        regions = [(i * 100.0, i * 100.0 + 29.0) for i in range(50)]
+        chunks = self.plan([], regions, limit=5)
+        self.assertEqual(len(chunks), 5)
+        self.assertEqual(chunks[0][0], 0.0)
+        self.assertEqual(chunks[-1][0], 4900.0)
+
+    def test_the_result_remembers_where_the_stem_had_voice(self):
+        # Sin esto el rescate no puede distinguir silencio de voz perdida.
+        result = self.precision.PrecisionResult(speech_regions=[(1.0, 5.0)])
+        self.assertEqual(result.speech_regions, [(1.0, 5.0)])
+        self.assertNotIn("speechRegions", result.as_report())
+
+
 class SeparationReportTests(unittest.TestCase):
     def test_a_clean_vocal_stem_passes(self):
         pcm = np.concatenate([quiet(2), tone(8), quiet(2), tone(6)])

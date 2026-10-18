@@ -240,13 +240,20 @@ class FillerPhraseTests(unittest.TestCase):
     def test_the_common_caption_signoffs_are_recognised(self):
         for phrase in ["ご視聴ありがとうございました", "Thank you.",
                        "字幕をご視聴頂きましてありがとうございました。",
-                       "thanks for watching", "Bye"]:
+                       "thanks for watching", "Bye",
+                       # Medidos colándose por el rescate en 1b0734de70f7.
+                       "Outro", "Outro Music", "BGM", "お疲れ様でした",
+                       "다음주에 만나요.",
+                       # Como los devuelve Whisper: tokens sueltos y créditos.
+                       "ご 視 聴 ありがとうございました", "다음주에만나요",
+                       "作 詞 ・ 作 曲 ・ 編 曲 初 音 ミ ク"]:
             self.assertTrue(is_filler_line(phrase), phrase)
 
     def test_a_real_lyric_containing_those_words_is_left_alone(self):
         for phrase in ["Thank you for the love you gave me",
                        "おばあちゃんの", "Say goodbye, my love",
-                       "Esta noche seguimos bailando"]:
+                       "Esta noche seguimos bailando",
+                       "Music is the only thing I have"]:
             self.assertFalse(is_filler_line(phrase), phrase)
 
     def test_a_filler_line_never_reaches_the_segments(self):

@@ -20,8 +20,8 @@ from __future__ import annotations
 # Interfaz externa de este módulo; lo que no está aquí es seam interno
 # y solo lo tocan sus propias pruebas (docs/arquitectura.md).
 __all__ = [
-    "ConsensusStats", "ConsensusWord", "consensus_words", "single_pass_words",
-    "summarize", "to_segments",
+    "ConsensusStats", "ConsensusWord", "consensus_words", "is_filler_line",
+    "single_pass_words", "summarize", "to_segments",
 ]
 
 import math
@@ -90,20 +90,37 @@ _FILLER_PHRASES = frozenset({
     "最後までご視聴頂きありがとうございます",
     "チャンネル登録お願いします", "おやすみなさい",
     "エンディング", "本編はコチラ",
+    # Lo que Whisper-ja escribe cuando se le fuerza el japonés sobre música sin
+    # voz: medido sobre el stem de 1b0734de70f7, nunca como letra.
+    "お疲れ様でした", "音楽",
     # en
     "thank you", "thanks for watching", "thank you for watching",
     "please subscribe", "subscribe to my channel",
     "thank you very much", "bye",
+    # Rótulos de sección: lo que sale de la mezcla en un puente instrumental.
+    "outro", "outro music", "music", "bgm",
+    # ko — despedida de vídeo; sale aunque la pista no tenga nada en coreano.
+    "다음 주에 만나요", "다음주에 만나요",
     # es / pt
     "gracias por ver el video", "suscríbete al canal",
     "obrigado por assistir",
 })
 
 
+# Sin espacios: Whisper parte el japonés en tokens ("ご 視 聴 ありがとう…") y
+# el coreano los pone donde quiere, así que la comparación no puede contar con
+# ellos.
+_FILLER_KEYS = frozenset(re.sub(r"\s+", "", phrase) for phrase in _FILLER_PHRASES)
+# Los créditos que Whisper inventa al cierre de un vídeo ("作詞・作曲・編曲
+# 初音ミク"): una letra cantada no empieza nunca así.
+_CREDIT_LINE = re.compile(r"^(作詞|作曲|編曲)")
+
+
 def is_filler_line(text: str) -> bool:
     """Is this whole line one of Whisper's caption reflexes?"""
     stripped = re.sub(r"[\s.,!?…。、！？]+$", "", text.strip())
-    return unicodedata.normalize("NFKC", stripped).casefold() in _FILLER_PHRASES
+    key = re.sub(r"\s+", "", unicodedata.normalize("NFKC", stripped).casefold())
+    return key in _FILLER_KEYS or bool(_CREDIT_LINE.match(key))
 
 
 @dataclass

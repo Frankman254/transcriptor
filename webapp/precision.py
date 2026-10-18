@@ -22,6 +22,8 @@ __all__ = [
     "rescue_from_original", "run",
 ]
 
+import bisect
+import math
 import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -72,6 +74,26 @@ PRIOR_MINORITY_SHARE = 0.15
 # (count-ins borrados por el separador) y texto que ninguna mayoría sostiene.
 RESCUE_MIN_VOTED_WORDS = 3
 
+# Puntuación mínima de una hipótesis del mix (0.8 × prob. media por palabra +
+# 0.2 × avg_logprob).  Cantar sobre la música baja la probabilidad por palabra
+# aunque el texto sea correcto: con 0.58, la corrida 1b0734de70f7 tiraba versos
+# reales entre 0.42 y 0.55.  La basura ya la paran los gates acústicos, el de
+# reflejos y el tope de palabras; esto prefiere letra de más a letra de menos.
+RESCUE_MIN_SCORE = 0.40
+# Un tramo que el VAD del stem marca como voz y en el que la transcripción final
+# deja menos de esto por segundo es voz que el separador se comió, no un verso
+# tranquilo: el canto más lento que se ha medido aquí ronda 1.5 palabras/s.
+# Medido en 1b0734de70f7: 88 regiones así suman 19 de sus 47 min de canto, y
+# la mezcla original devuelve letra real en 9 de esos minutos.
+ERASED_WORDS_PER_SECOND = 0.4
+ERASED_MIN_SECONDS = 3.0
+# El tope de palabras de una sustitución escala con la duración del tramo:
+# un trozo de 29 s de japonés cantado trae 30-80 palabras, y el tope fijo de
+# 12 que protege un remiendo corto las rechazaría todas.  Los bucles no
+# necesitan este tope: ya los para `compression_ratio`.
+ERASED_MAX_WORDS_PER_SECOND = 6.0
+RESCUE_ERASED_LIMIT = 160
+
 
 @dataclass
 class PrecisionConfig:
@@ -107,6 +129,9 @@ class PrecisionResult:
     rescued_windows: int = 0
     rescue_model: str | None = None
     consensus_fallback: bool = False
+    # Dónde oyó voz el VAD del stem.  No va al informe: es lo que necesita el
+    # rescate para distinguir "aquí no se canta" de "aquí se cantó y se perdió".
+    speech_regions: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -526,6 +551,7 @@ def run(audio: Path, config: PrecisionConfig, emit,
     result = PrecisionResult(
         engine=engine, windows=len(base_windows), speech_seconds=speech,
         stem=stem_report.as_dict() if stem_report else None,
+        speech_regions=[(region.start, region.end) for region in regions],
     )
 
     context = multiprocessing.get_context("spawn")
@@ -694,6 +720,38 @@ def _rescue_intervals(segments: list[dict], duration: float,
     return [(start, end) for start, end in merged[:limit] if end - start > 0.2]
 
 
+def _erased_intervals(segments: list[dict],
+                      speech_regions: list[tuple[float, float]],
+                      limit: int = RESCUE_ERASED_LIMIT,
+                      ) -> list[tuple[float, float]]:
+    """Tramos donde el stem tiene voz y la letra final casi no tiene palabras.
+
+    Es la firma de una voz que el separador borró: el VAD la sigue oyendo en lo
+    que queda del stem, pero Whisper ya no saca nada de ahí.  Se devuelven en
+    trozos de hasta 29 s (lo que cabe en una ventana de Whisper) y, si son
+    demasiados, repartidos por toda la mezcla en vez de gastarlos al principio.
+    """
+    starts = sorted(float(word.get("start", segment["start"]))
+                    for segment in segments
+                    for word in (segment.get("words") or ()))
+    chunks: list[tuple[float, float]] = []
+    for start, end in speech_regions:
+        duration = end - start
+        if duration < ERASED_MIN_SECONDS:
+            continue
+        written = bisect.bisect_left(starts, end) - bisect.bisect_left(starts, start)
+        if written / duration >= ERASED_WORDS_PER_SECOND:
+            continue
+        pieces = math.ceil(duration / 29.0)
+        step = duration / pieces
+        chunks.extend((start + i * step, start + (i + 1) * step)
+                      for i in range(pieces))
+    if len(chunks) > limit > 1:
+        chunks = [chunks[round(i * (len(chunks) - 1) / (limit - 1))]
+                  for i in range(limit)]
+    return chunks[:max(limit, 0)]
+
+
 def _consensus_protects(current: list[dict], start: float, end: float,
                         passes: int) -> bool:
     """True si la zona ya está escrita por mayoría y el rescate no debe tocarla.
@@ -718,23 +776,39 @@ def _consensus_protects(current: list[dict], start: float, end: float,
 
 def rescue_from_original(original: Path, result: PrecisionResult,
                          config: PrecisionConfig, emit,
-                         max_windows: int = 24) -> PrecisionResult:
+                         max_windows: int = 24,
+                         max_erased: int = RESCUE_ERASED_LIMIT) -> PrecisionResult:
     """Recheck only dubious stem regions against the untouched mix.
 
     A replacement needs materially stronger acoustic evidence. This lets a
     count-in erased by the separator return without globally feeding music to
     Whisper or paying for another full pass.
+
+    Two kinds of zone, with different rules.  A *repair* is a low-confidence
+    line or a short hole: it keeps the language the stem heard there and may
+    not grow much.  An *erased* zone is voice the VAD heard on the stem with
+    almost no words in the result — the separator ate the singing.  There the
+    stem has already proved it cannot tell what language is sung, so the mix
+    decides, and the word cap follows the zone's length.
     """
     if not result.segments or not original.is_file():
         return result
     duration = max(float(segment["end"]) for segment in result.segments)
-    intervals = _rescue_intervals(result.segments, duration, max_windows)
+    erased = _erased_intervals(result.segments, result.speech_regions, max_erased)
+    repairs = [
+        (start, end)
+        for start, end in _rescue_intervals(result.segments, duration, max_windows)
+        if not any(start < e and end > s for s, e in erased)
+    ]
+    intervals = sorted([(start, end, False) for start, end in repairs]
+                       + [(start, end, True) for start, end in erased])
     if not intervals:
         return result
     rescue_model = "large-v3" if config.model == "turbo" else config.model
     emit("status", stage="rescuing",
-         message=(f"Revisando {len(intervals)} zonas dudosas en el audio original "
-                  f"con {rescue_model}…"))
+         message=(f"Revisando en el audio original con {rescue_model}: "
+                  f"{len(repairs)} zonas dudosas y {len(erased)} tramos con voz "
+                  f"pero sin letra…"))
     pcm = aa.decode_pcm(original)
     engine_name = choose_engine(
         rescue_model, emit, config.engine_preference)
@@ -742,10 +816,10 @@ def rescue_from_original(original: Path, result: PrecisionResult,
     engine = te.build_engine(rescue_model, engine_name, threads)
     segments = list(result.segments)
     accepted = 0
-    for index, (start, end) in enumerate(intervals):
+    for index, (start, end, erased_zone) in enumerate(intervals):
         first = max(0, int(start * aa.SAMPLE_RATE))
         last = min(pcm.size, int(end * aa.SAMPLE_RATE))
-        language = next(
+        language = None if erased_zone else next(
             (segment.get("language") for segment in segments
              if float(segment["start"]) < end and float(segment["end"]) > start),
             result.language,
@@ -758,6 +832,11 @@ def rescue_from_original(original: Path, result: PrecisionResult,
         if (not hypothesis.words or hypothesis.no_speech_prob >= 0.55
                 or hypothesis.compression_ratio >= 2.4
                 or hypothesis.avg_logprob < -1.0):
+            continue
+        # Un "ご視聴ありがとうございました" o un "Outro Music" sacado de la
+        # mezcla suena seguro y pasa la acústica; si se aceptase, borraría lo
+        # que hubiera en la zona para que luego `to_segments` lo tire también.
+        if cs.is_filler_line(hypothesis.text):
             continue
         current = [segment for segment in segments
                    if float(segment["start"]) < end
@@ -774,9 +853,12 @@ def rescue_from_original(original: Path, result: PrecisionResult,
         log_score = max(0.0, min(1.0, hypothesis.avg_logprob + 1.0))
         rescue_score = 0.8 * mean_probability + 0.2 * log_score
         old_words = sum(len(segment.get("words") or ()) for segment in current)
-        if (rescue_score < max(0.58, current_score + 0.10)
-                or len(hypothesis.words) > max(12, old_words * 2 + 8)):
+        word_cap = (max(12, (end - start) * ERASED_MAX_WORDS_PER_SECOND)
+                    if erased_zone else max(12, old_words * 2 + 8))
+        if (rescue_score < max(RESCUE_MIN_SCORE, current_score + 0.10)
+                or len(hypothesis.words) > word_cap):
             continue
+        language = language or hypothesis.language
         raw = [
             {"text": word.text, "start": word.start + start,
              "end": word.end + start, "probability": word.probability}
