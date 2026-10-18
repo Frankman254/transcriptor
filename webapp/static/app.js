@@ -1,4 +1,4 @@
-/* Transcriptor local — lógica de la interfaz.
+/* Scribix (transcriptor local) — lógica de la interfaz.
  *
  * La página es un shell de dos paneles: la biblioteca a la izquierda (lista
  * larga, scroll propio, búsqueda y filtros) y a la derecha una de dos vistas,

@@ -32,5 +32,5 @@ if [[ ! -x ".separator-venv/bin/audio-separator" ]]; then
   echo "Aviso: instala el modo vocal Preciso una vez con ./setup_separator.sh"
 fi
 
-echo "Transcriptor en http://${HOST}:${PORT}"
+echo "Scribix (transcriptor) en http://${HOST}:${PORT}"
 exec python3 -m uvicorn server:app --host "$HOST" --port "$PORT"

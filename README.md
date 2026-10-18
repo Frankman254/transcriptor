@@ -1,4 +1,13 @@
-# 🎙️ Transcriptor local
+<p align="center">
+  <img src="webapp/static/brand/scribix-logo.svg" width="112" alt="Scribix">
+</p>
+
+# Scribix — transcriptor local
+
+> **Scribix** es el nombre de producto del Transcriptor dentro de la suite
+> (Scribix → Lyrixa → Vibrix). El repo, los módulos, las variables
+> `TRANSCRIPTOR_*` y los contratos siguen llamándose "transcriptor"; el nombre
+> solo cambia lo que se ve. Marca e iconos en `webapp/static/brand/`.
 
 App web para transcribir audio/video y sacar letras de canciones **100% en tu
 propia máquina** con [Whisper](https://github.com/openai/whisper), BS-RoFormer y

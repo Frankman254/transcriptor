@@ -1,4 +1,4 @@
-/* Transcriptor local — hoja de estilo única.
+/* Scribix (transcriptor local) — hoja de estilo única.
  *
  * Dos decisiones mandan sobre el resto:
  *
@@ -9,6 +9,11 @@
  * 2. **Tema oscuro y una sola superficie por nivel.**  Es una herramienta de
  *    audio que se mira durante horas; los niveles se distinguen por elevación
  *    y borde, no por cambios de color fuertes.
+ *
+ * La marca sigue la línea de la suite: tipografía Geist + JetBrains Mono como
+ * Lyrixa, monograma con aberración magenta/cian como Vibrix, y un acento
+ * propio — violeta — para no confundirse con el cian de Vibrix ni el ámbar
+ * de Lyrixa.  Los iconos viven en static/brand/.
  */
 
 :root {
@@ -27,9 +32,15 @@
   --muted: #a8b1c2;
   --faint: #7a8596;
 
-  --accent: #5b8cff;
-  --accent-soft: rgba(91, 140, 255, .14);
-  --accent-text: #9db8ff;
+  /* Violeta Scribix. Sobre él el texto va oscuro (--accent-fg): con blanco
+     el contraste se queda en 3:1. */
+  --accent: #a47cff;
+  --accent-soft: rgba(164, 124, 255, .14);
+  --accent-text: #c9b5ff;
+  --accent-fg: #160a33;
+  /* Colores de la suite, solo para la marca y detalles de energía. */
+  --suite-cyan: #21dde8;
+  --suite-magenta: #f0409b;
   --ok: #38d39f;
   --warn: #ffc36b;
   --danger: #ff7a7a;
@@ -43,6 +54,9 @@
 
   --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .22);
   --ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+
+  --font-sans: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 * { box-sizing: border-box; }
@@ -53,7 +67,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font: 15px/1.55 var(--font-sans);
   -webkit-font-smoothing: antialiased;
 }
 
@@ -77,8 +91,19 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
-.brand { display: flex; align-items: baseline; gap: 9px; font-weight: 650; }
-.brand small { color: var(--faint); font-weight: 400; font-size: 12.5px; }
+.brand {
+  display: flex; align-items: center; gap: 10px;
+  color: var(--text); text-decoration: none;
+}
+.brand-mark { width: 26px; height: 26px; flex: none; display: block; }
+/* Mismo tratamiento que la marca de Lyrixa: mayúsculas espaciadas. */
+.brand-text {
+  font-weight: 600; font-size: 13px; letter-spacing: .2em; text-transform: uppercase;
+}
+.brand small {
+  color: var(--faint); font-weight: 400; font-size: 12px;
+  padding-left: 10px; border-left: 1px solid var(--border);
+}
 
 .spacer { flex: 1; }
 
@@ -112,7 +137,10 @@ body {
 .search {
   position: relative; display: flex; align-items: center;
 }
-.search svg { position: absolute; left: 11px; width: 15px; height: 15px; color: var(--faint); }
+.search .search-icon {
+  position: absolute; left: 11px; font-size: 12px; line-height: 1;
+  pointer-events: none; opacity: .6; filter: grayscale(1);
+}
 .search input {
   width: 100%; padding: 9px 30px 9px 33px;
   background: var(--surface-2); border: 1px solid var(--border);
@@ -122,7 +150,7 @@ body {
 .search input:focus { border-color: var(--accent); }
 .search kbd {
   position: absolute; right: 9px;
-  font: 500 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 500 11px/1 var(--font-mono);
   color: var(--faint); background: var(--surface-3);
   border: 1px solid var(--border); border-radius: 4px; padding: 3px 5px;
 }
@@ -315,7 +343,7 @@ select:hover, input[type=text]:hover, textarea:hover { border-color: var(--borde
 select:focus, input[type=text]:focus, textarea:focus { border-color: var(--accent); }
 textarea {
   min-height: 118px; resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+  font-family: var(--font-mono); font-size: 13px;
 }
 input[type=file] { color: var(--muted); font-size: 13px; max-width: 100%; }
 input[type=file]::file-selector-button {
@@ -348,7 +376,7 @@ input[type=file]::file-selector-button {
 
 button.go {
   width: 100%; margin-top: 18px; padding: 12px; border: none; border-radius: 10px;
-  background: var(--accent); color: #fff; font: inherit; font-size: 15px; font-weight: 650;
+  background: var(--accent); color: var(--accent-fg); font: inherit; font-size: 15px; font-weight: 650;
   cursor: pointer; transition: filter .12s;
 }
 button.go:hover:not(:disabled) { filter: brightness(1.08); }
@@ -363,7 +391,7 @@ button.go:disabled { opacity: .45; cursor: not-allowed; }
 .small-button:hover { border-color: var(--accent); }
 .small-button.primary {
   background: var(--accent); border-color: var(--accent);
-  color: #fff; font-weight: 600;
+  color: var(--accent-fg); font-weight: 600;
 }
 .small-button.primary:hover { filter: brightness(1.08); }
 
@@ -410,7 +438,7 @@ button.go:disabled { opacity: .45; cursor: not-allowed; }
 }
 .progress-inner {
   height: 100%; width: 0%; border-radius: 999px;
-  background: linear-gradient(90deg, var(--accent), var(--ok));
+  background: linear-gradient(90deg, var(--suite-magenta), var(--accent) 45%, var(--suite-cyan));
   transition: width .3s ease;
 }
 .progress-label {
@@ -453,7 +481,7 @@ table.rounds td { padding: 5px 8px 5px 0; border-top: 1px solid var(--border); }
 .downloads a:hover, .downloads button:hover { border-color: var(--accent); }
 .downloads button.primary {
   background: var(--accent); border-color: var(--accent);
-  color: #fff; font-weight: 600;
+  color: var(--accent-fg); font-weight: 600;
 }
 .downloads button.primary:hover { filter: brightness(1.08); }
 .downloads a.open-in-lyrixa {
@@ -519,4 +547,5 @@ cite { color: var(--muted); font-style: normal; }
   .topbar .small-button.primary { font-size: 16px; padding: 6px 12px; }
   .seg .t { min-width: 0; max-width: 38vw; overflow: hidden; text-overflow: ellipsis; }
   .brand small { display: none; }
+  .brand-text { letter-spacing: .14em; }
 }
