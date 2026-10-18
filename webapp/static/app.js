@@ -373,13 +373,15 @@ async function previewTracklist() {
 
 const JOB_STATUS = {
   running: "en curso", completed: "terminado",
-  interrupted: "interrumpido", error: "error", saved: "guardado",
+  interrupted: "interrumpido", cancelled: "cancelado",
+  error: "error", saved: "guardado",
 };
 
 const FILTERS = [
   ["all", "Todos"],
   ["completed", "Terminados"],
   ["interrupted", "Retomables"],
+  ["cancelled", "Cancelados"],
   ["error", "Con error"],
   ["saved", "Guardados"],
 ];
@@ -535,6 +537,9 @@ function jobActions(job) {
     return button;
   };
   add("Abrir", () => openSavedJob(job.id));
+  if (job.status === "running") {
+    add("■ Cancelar", () => cancelJob(job.id), "danger");
+  }
   if (job.recoverable) add("↻ Volver a procesar", () => prepareSavedIteration(job.id));
   if (job.files?.json) add("🌐 Traducir / romaji", () => translateSavedJob(job.id));
   if (job.links?.openInLyrixa && job.files?.lyrixa) {
@@ -566,6 +571,42 @@ async function deleteSavedJob(job) {
   await loadSavedJobs();
 }
 
+function setCancelButton(jobId, visible) {
+  const button = document.getElementById("cancel-job");
+  button.dataset.jobId = visible ? (jobId || "") : "";
+  button.disabled = false;
+  button.textContent = "■ Cancelar trabajo";
+  button.classList.toggle("hidden", !visible);
+}
+
+async function cancelJob(jobId) {
+  if (!jobId || !confirm("¿Cancelar este trabajo?\n\n"
+      + "Scribix seguirá abierto y conservará los audios o stems completos.")) return;
+  const button = document.getElementById("cancel-job");
+  if (button.dataset.jobId === jobId) {
+    button.disabled = true;
+    button.textContent = "Cancelando…";
+  }
+  let response, data;
+  try {
+    response = await fetch(`/api/jobs/${jobId}/cancel`, {method: "POST"});
+    data = await response.json();
+  } catch (_) {
+    if (button.dataset.jobId === jobId) button.disabled = false;
+    return alert("No pude contactar con Scribix para cancelar el trabajo.");
+  }
+  if (!response.ok) {
+    if (button.dataset.jobId === jobId) button.disabled = false;
+    return alert(data.error || "No pude cancelar el trabajo.");
+  }
+  if (button.dataset.jobId === jobId) setStage("Cancelando el trabajo…", true);
+  await loadSavedJobs();
+}
+
+function cancelActiveJob() {
+  return cancelJob(document.getElementById("cancel-job").dataset.jobId);
+}
+
 async function openSavedJob(jobId) {
   const response = await fetch(`/api/jobs/${jobId}`, {cache: "no-store"});
   const job = await response.json();
@@ -585,6 +626,11 @@ async function openSavedJob(jobId) {
   setProgress(job.status === "completed" ? 1 : 0);
   showFiles(job.id, job.files || {}, job.links);
   if (job.reference) showReference({...job.reference, section: job.section, stage: "loaded"});
+  setCancelButton(job.id, job.status === "running");
+  if (job.status === "running") {
+    localStorage.setItem("job_id", job.id);
+    listen(job.id);
+  }
 }
 
 async function prepareSavedIteration(jobId) {
@@ -1087,6 +1133,7 @@ function finishJob() {
   syncGoLabel();
   document.getElementById("go").disabled = false;
   document.getElementById("recovery-actions").classList.add("hidden");
+  setCancelButton(null, false);
 }
 
 function showFiles(jobId, files, links) {
@@ -1258,6 +1305,7 @@ function clearSegmentView() {
 }
 
 function listen(jobId) {
+  setCancelButton(jobId, true);
   // EventSource se reconecta solo tras un corte (dormir la Mac, WiFi, etc.) y,
   // gracias a los `id:` del servidor, retoma justo donde se quedó, sin duplicar.
   // Solo puede haber una escucha viva: si arranca otro trabajo (o se reabre la
@@ -1365,6 +1413,16 @@ function listen(jobId) {
     loadSavedJobs();
     es.close();
     finishJob();
+  });
+  on("cancelled", e => {
+    const d = JSON.parse(e.data);
+    setStage("Trabajo cancelado", false);
+    document.getElementById("err").textContent = "ℹ️ "
+      + (d.message || "El trabajo se canceló y Scribix sigue disponible.");
+    document.getElementById("clock").textContent = "";
+    es.close();
+    finishJob();
+    loadSavedJobs();
   });
   on("error", async e => {
     if (e.data) {

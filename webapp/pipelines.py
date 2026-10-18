@@ -34,10 +34,30 @@ def make_emit(job: dict):
     vive allí, no aquí.
     """
     def emit(event: str, **data):
+        job["cancel"].check()
         if event == "status":
             mark_job_stage(job, data.get("stage"))
         hub.publish(job, event, data)
     return emit
+
+
+def finish_failed_or_cancelled(job_id: str, job: dict, error: Exception) -> None:
+    """Persiste una salida voluntaria sin presentarla como fallo del motor."""
+    if job["cancel"].cancelled:
+        jobstore.update_manifest(
+            job_id, status="cancelled", error=None,
+            finishedAt=jobstore.utc_now(), timing=finish_job_timing(job),
+        )
+        hub.publish(job, "cancelled", {
+            "message": "Trabajo cancelado. Los archivos completos se conservaron.",
+            "job_id": job_id,
+        })
+        return
+    jobstore.update_manifest(
+        job_id, status="error", error=str(error),
+        finishedAt=jobstore.utc_now(), timing=finish_job_timing(job),
+    )
+    hub.publish(job, "error", {"message": str(error)})
 
 
 def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
@@ -45,6 +65,7 @@ def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
                        level: str, stem_report, guide: dict | None = None,
                        asr_engine: str = "auto",
                        rescue_audio: Path | None = None,
+                       cancel=None,
                        ) -> tuple[dict, precision.PrecisionResult]:
     """Transcribe por consenso de varias pasadas y escribe las mismas salidas."""
     spec = PRECISION_LEVELS.get(level, PRECISION_LEVELS["balanced"])
@@ -60,11 +81,11 @@ def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
             if guide else None
         ),
     )
-    result = precision.run(audio, config, emit, stem_report)
+    result = precision.run(audio, config, emit, stem_report, cancel=cancel)
     if rescue_audio is not None:
         try:
             result = precision.rescue_from_original(
-                rescue_audio, result, config, emit)
+                rescue_audio, result, config, emit, cancel=cancel)
             if config.segment_refiner:
                 result.segments = config.segment_refiner(result.segments)
         except Exception as error:  # noqa: BLE001
@@ -187,7 +208,8 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         # Modo "solo audio": descargar en el formato pedido y terminar, sin Whisper.
         if mode == "audio_only":
             audio, title, duration = media.download_audio(
-                url, outdir, emit, audio_format, audio_quality)
+                url, outdir, emit, audio_format, audio_quality,
+                cancel=job["cancel"])
             emit("meta", title=title, duration=duration, device=device_name())
             files = {"audio": audio.name}
             jobstore.update_manifest(job_id, status="completed", title=title,
@@ -217,14 +239,14 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         # El modo ultra usa faster-whisper con sus propios pesos; los .pt de
         # ~/.cache/whisper solo hacen falta cuando corre el motor de referencia.
         if mode != "ultra":
-            ensure_model(model, emit)
+            ensure_model(model, emit, cancel=job["cancel"])
 
         source_audio = None
         if source_type == "url":
             # Para letra conviene el audio sin recodificar: mejor separación de voz.
             fmt = "best" if separates else audio_format
             source_audio, title, duration = media.download_audio(
-                url, outdir, emit, fmt, audio_quality)
+                url, outdir, emit, fmt, audio_quality, cancel=job["cancel"])
             audio = source_audio
         else:
             audio = upload_path
@@ -246,7 +268,8 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         stem_report = None
         if separates:
             vocals, instrumental, stem_report = media.separate_vocals(
-                audio, outdir, emit, separation_quality, duration)
+                audio, outdir, emit, separation_quality, duration,
+                cancel=job["cancel"])
             audio = vocals
             job["stem_paths"] = {
                 "vocals": str(vocals.resolve()),
@@ -269,24 +292,42 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
                 },
             }
 
+            # La separación de una mezcla larga da tiempo a que un 429/503
+            # temporal de LRCLIB desaparezca. Antes de arrancar Whisper se
+            # reintentan de verdad solo las referencias fallidas; las ya
+            # encontradas y los "sin coincidencia" siguen saliendo de caché.
+            failed_references = int(
+                ((guide or {}).get("references") or {}).get("failed") or 0)
+            if failed_references and tracklist_text.strip() and fetch_lyrics:
+                emit(
+                    "status", stage="references",
+                    message=(f"Reintentando {failed_references} búsquedas de "
+                             "letras que fallaron mientras se aislaba la voz…"),
+                )
+                guide = jobstore.prepare_track_guide(
+                    outdir, tracklist_text, duration, fetch_lyrics, emit,
+                    retry_errors=True,
+                )
+
         precision_report = None
         detected_language = language
         if mode == "ultra":
             # Nivelar y filtrar el grave antes de transcribir: no cambia lo que
             # se canta, pero sí lo estable que es el umbral de Whisper.
             audio = audio_analysis.condition_for_asr(
-                audio, outdir / "asr-input.wav")
+                audio, outdir / "asr-input.wav", cancel=job["cancel"])
             files, result = run_precision_mode(
                 audio, model, language, outdir, duration, emit,
                 out_stem=title, level=precision_level, stem_report=stem_report,
                 guide=guide, asr_engine=asr_engine,
-                rescue_audio=original_audio if rescue_original else None)
+                rescue_audio=original_audio if rescue_original else None,
+                cancel=job["cancel"])
             precision_report = result.as_report()
             detected_language = result.language or language
             emit("precision", **precision_report)
         else:
             files = run_whisper(audio, model, language, outdir, duration, emit,
-                                out_stem=title)
+                                out_stem=title, cancel=job["cancel"])
 
         # Traducción y romaji: sólo después de que la letra ya está decidida.
         translated_lines = None
@@ -334,9 +375,7 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         emit("done", title=title, files=files, job_id=job_id,
              links=jobstore.job_links(job_id, files))
     except Exception as e:  # noqa: BLE001
-        jobstore.update_manifest(job_id, status="error", error=str(e),
-                        finishedAt=jobstore.utc_now(), timing=finish_job_timing(job))
-        emit("error", message=str(e))
+        finish_failed_or_cancelled(job_id, job, e)
     finally:
         if caffeinate is not None:
             caffeinate.terminate()  # deja que la Mac vuelva a poder dormir
@@ -390,10 +429,11 @@ def resume_precision_pipeline(
         if vocals:
             if checkpoint_kind != "asr":
                 audio = audio_analysis.condition_for_asr(
-                    vocals, outdir / "asr-input.wav")
+                    vocals, outdir / "asr-input.wav", cancel=job["cancel"])
             stem_report = jobstore.stored_stem_report(outdir)
             if stem_report is None:
-                stem_report = media.measure_stems(vocals, instrumental, duration)
+                stem_report = media.measure_stems(
+                    vocals, instrumental, duration, cancel=job["cancel"])
                 jobstore.update_manifest(job_id, stem=stem_report.as_dict())
             emit("stem", stage="recovered", pass_number=0,
                  **stem_report.as_dict())
@@ -413,7 +453,8 @@ def resume_precision_pipeline(
             audio, model, language, outdir, duration, emit,
             out_stem=title, level=precision_level, stem_report=stem_report,
             guide=guide, asr_engine=asr_engine,
-            rescue_audio=original if rescue_original else None)
+            rescue_audio=original if rescue_original else None,
+            cancel=job["cancel"])
         precision_report = result.as_report()
         detected_language = result.language or language
         emit("precision", **precision_report)
@@ -462,9 +503,7 @@ def resume_precision_pipeline(
         emit("done", title=title, files=files, job_id=job_id,
              links=jobstore.job_links(job_id, files))
     except Exception as error:  # noqa: BLE001
-        jobstore.update_manifest(job_id, status="error", error=str(error),
-                        finishedAt=jobstore.utc_now(), timing=finish_job_timing(job))
-        emit("error", message=str(error))
+        finish_failed_or_cancelled(job_id, job, error)
     finally:
         if caffeinate is not None:
             caffeinate.terminate()
@@ -528,8 +567,6 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
              files=files, job_id=job_id,
              links=jobstore.job_links(job_id, files))
     except Exception as error:  # noqa: BLE001
-        jobstore.update_manifest(job_id, status="error", error=str(error),
-                        finishedAt=jobstore.utc_now(), timing=finish_job_timing(job))
-        emit("error", message=str(error))
+        finish_failed_or_cancelled(job_id, job, error)
     finally:
         hub.finish(job)

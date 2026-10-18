@@ -144,6 +144,7 @@ llegó, así que `localhost` y `127.0.0.1` no se convierten en dos orígenes.
 | `GET` | `/api/jobs/{id}/audio` | El audio original. Acepta `Range`. |
 | `GET` | `/api/jobs/{id}/stems/{vocals\|instrumental}` | Las pistas separadas. |
 | `GET` | `/api/jobs/{id}/events` | SSE del progreso, con reconexión por `Last-Event-ID`. |
+| `POST` | `/api/jobs/{id}/cancel` | Cancela ese trabajo sin apagar el motor local. |
 | `POST` | `/api/translate` | Traducción y romaji como servicio. |
 | `POST` | `/api/jobs` · `/api/jobs/{id}/resume` · `/api/jobs/{id}/translate` | Lanzar y retomar trabajos. |
 | `DELETE` | `/api/jobs/{id}` | Borrar un trabajo. |

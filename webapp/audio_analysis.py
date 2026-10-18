@@ -102,25 +102,44 @@ class StemReport:
 # --------------------------------------------------------------------------- #
 # Decodificación
 # --------------------------------------------------------------------------- #
-def decode_pcm(path: Path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+def _communicate(command: list[str], *, cancel=None) -> tuple[int, bytes, bytes]:
+    """Ejecuta ffmpeg en un grupo cancelable sin conocer el servidor."""
+    proc = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    if cancel:
+        cancel.register_process(proc)
+    try:
+        stdout, stderr = proc.communicate()
+    finally:
+        if cancel:
+            cancel.unregister_process(proc)
+    if cancel:
+        cancel.check()
+    return proc.returncode, stdout, stderr
+
+
+def decode_pcm(path: Path, sample_rate: int = SAMPLE_RATE, *,
+               cancel=None) -> np.ndarray:
     """Decode any container to mono float32 in [-1, 1] via ffmpeg."""
-    proc = subprocess.run(
+    returncode, stdout, stderr = _communicate(
         ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path),
          "-f", "f32le", "-ac", "1", "-ar", str(sample_rate), "-"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cancel=cancel,
     )
-    if proc.returncode != 0:
+    if returncode != 0:
         raise RuntimeError(
             f"ffmpeg no pudo decodificar {path.name}: "
-            f"{proc.stderr.decode('utf-8', 'replace')[-300:]}"
+            f"{stderr.decode('utf-8', 'replace')[-300:]}"
         )
-    pcm = np.frombuffer(proc.stdout, dtype="<f4")
+    pcm = np.frombuffer(stdout, dtype="<f4")
     # frombuffer hands back a read-only view over the subprocess buffer.
     return np.nan_to_num(pcm, copy=True, posinf=0.0, neginf=0.0)
 
 
 def condition_for_asr(source: Path, target: Path,
-                      sample_rate: int = SAMPLE_RATE) -> Path:
+                      sample_rate: int = SAMPLE_RATE, *, cancel=None) -> Path:
     """Write the ASR-ready copy of a vocal stem.
 
     Deliberately gentle.  A high-pass removes the kick/bass bleed that survives
@@ -130,13 +149,13 @@ def condition_for_asr(source: Path, target: Path,
     noise gate: those remove consonants, and a lost consonant is a lost word.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(
+    returncode, _stdout, _stderr = _communicate(
         ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", str(source),
          "-af", "highpass=f=70,loudnorm=I=-18:TP=-2.0:LRA=11",
          "-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le", str(target)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cancel=cancel,
     )
-    if proc.returncode != 0 or not target.is_file():
+    if returncode != 0 or not target.is_file():
         # Conditioning is an optimization, never a hard requirement.
         return source
     return target

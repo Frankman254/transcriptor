@@ -35,10 +35,11 @@ MODULES = sorted(p.stem for p in WEBAPP.glob("*.py"))
 # desde una CLI, una prueba o una shell de escritorio sin levantar FastAPI.
 ALLOWED = {
     # Hojas: no saben que existe el resto del backend.
+    "cancellation": set(),
     "paths": set(),
     "catalogs": set(),
     "config": set(),
-    "jobhub": set(),
+    "jobhub": {"cancellation"},
     "textjoin": set(),
     "audio_analysis": set(),
     "consensus": {"textjoin"},

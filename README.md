@@ -84,6 +84,9 @@ un prompt de Whisper. Una línea pública solo reemplaza la ortografía cuando l
 coincidencia ya es alta, porque un remix puede cortar o reordenar la letra.
 La app distingue una canción sin coincidencias de un fallo de red, reintenta
 estos últimos y prefiere referencias que incluyan timestamps sincronizados.
+Los errores temporales `429/503` usan espera progresiva y, si alguno sobrevive,
+se vuelve a consultar al terminar de aislar la voz y antes de iniciar Whisper;
+las referencias ya encontradas no se descargan de nuevo.
 
 El desglose completo — perfil de separación de doble pasada, ventanas
 desfasadas, alineación con Needleman–Wunsch, guardia de bucles de repetición y
@@ -124,6 +127,7 @@ por HTTP sin que nadie tenga que buscar archivos a mano.
 | `GET /api/jobs/{id}` | Metadata del trabajo, con un bloque `links`. |
 | `GET /api/jobs/{id}/lyrixa` | El proyecto `.lyrixa.json`, por id y no por nombre de archivo. |
 | `GET /api/jobs/{id}/audio` | El audio original. Responde a `Range`, así que se puede buscar dentro de una mezcla de tres horas sin descargarla. |
+| `POST /api/jobs/{id}/cancel` | Cancela solo ese trabajo y conserva los archivos completos; el servidor sigue funcionando. |
 | `POST /api/translate` | Traducción y romaji como servicio, con el mismo motor que usa el pipeline. |
 
 Nada de esto lleva un puerto escrito dentro: `TRANSCRIPTOR_HOST`,

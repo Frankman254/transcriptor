@@ -169,7 +169,8 @@ def load_track_guide(outdir: Path) -> dict | None:
 
 
 def prepare_track_guide(outdir: Path, text: str, duration: float,
-                        fetch_lyrics: bool, emit) -> dict | None:
+                        fetch_lyrics: bool, emit, *,
+                        retry_errors: bool = False) -> dict | None:
     """Build once, cache on disk, and reuse on every later iteration."""
     tracklist_path = outdir / "tracklist.txt"
     incoming = (text or "").strip()
@@ -211,6 +212,7 @@ def prepare_track_guide(outdir: Path, text: str, duration: float,
     guide = track_guides.build_guide(
         incoming, duration, fetch_lyrics=fetch_lyrics,
         cache_dir=paths.LYRICS_CACHE_DIR, progress=progress,
+        retry_errors=retry_errors,
     )
     if not guide:
         raise RuntimeError(
@@ -368,14 +370,17 @@ def saved_job(job_id: str, *, running: bool = False) -> dict | None:
     manifest = read_manifest(outdir)
     files = discover_result_files(job_id, outdir, assets)
     completed = any(kind in files for kind in ("json", "txt", "lyrixa"))
+    manifest_status = manifest.get("status")
     if running:
         status = "running"
+    elif manifest_status == "cancelled":
+        status = "cancelled"
     elif completed:
         status = "completed"
     elif assets.get("checkpoint"):
         status = "interrupted"
     else:
-        status = manifest.get("status") or "saved"
+        status = manifest_status or "saved"
     guide = load_track_guide(outdir)
     modified = datetime.fromtimestamp(outdir.stat().st_mtime, timezone.utc).isoformat()
     disk_bytes = 0

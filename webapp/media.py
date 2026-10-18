@@ -125,6 +125,7 @@ def audio_download_args(audio_format: str, quality: str) -> tuple[list[str], dic
 def download_audio(url: str, outdir: Path, emit, audio_format: str = "best",
                    quality: str = "192K",
                    name_template: str = "%(title)s.%(ext)s",
+                   cancel=None,
                    ) -> tuple[Path, str, float]:
     """Descarga el audio de un link y emite el avance en vivo.
 
@@ -153,43 +154,51 @@ def download_audio(url: str, outdir: Path, emit, audio_format: str = "best",
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        start_new_session=True,
     )
+    if cancel:
+        cancel.register_process(proc)
 
     tail: deque[str] = deque(maxlen=30)   # por si hay que explicar un fallo
     done_line: str | None = None
     last_pct = -1
     last_pp = None
 
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        if line.startswith("@DONE@"):
-            done_line = line[len("@DONE@"):]
-            continue
-        if line.startswith("@PP@"):
-            label = _PP_LABELS.get(line[len("@PP@"):].strip())
-            if label and label != last_pp:
-                last_pp = label
-                emit("status", stage="postprocessing", message=label)
-                emit("progress", stage="postprocessing", progress=None)
-            continue
-        m = _PROG_RE.match(line)
-        if m:
-            got, total, frag_i, frag_n = m.groups()
-            fraction = None
-            if _pos_float(total):
-                fraction = (_pos_float(got) or 0.0) / _pos_float(total)
-            elif _pos_float(frag_n):          # HLS: no hay bytes, pero sí fragmentos
-                fraction = (_pos_float(frag_i) or 0.0) / _pos_float(frag_n)
-            if fraction is not None:
-                pct = int(min(fraction, 1.0) * 100)
-                if pct != last_pct:           # 1 evento por punto porcentual
-                    last_pct = pct
-                    emit("progress", stage="downloading",
-                         progress=min(fraction, 1.0))
-            continue
-        tail.append(line)
-
-    proc.wait()
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if line.startswith("@DONE@"):
+                done_line = line[len("@DONE@"):]
+                continue
+            if line.startswith("@PP@"):
+                label = _PP_LABELS.get(line[len("@PP@"):].strip())
+                if label and label != last_pp:
+                    last_pp = label
+                    emit("status", stage="postprocessing", message=label)
+                    emit("progress", stage="postprocessing", progress=None)
+                continue
+            m = _PROG_RE.match(line)
+            if m:
+                got, total, frag_i, frag_n = m.groups()
+                fraction = None
+                if _pos_float(total):
+                    fraction = (_pos_float(got) or 0.0) / _pos_float(total)
+                elif _pos_float(frag_n):
+                    fraction = (_pos_float(frag_i) or 0.0) / _pos_float(frag_n)
+                if fraction is not None:
+                    pct = int(min(fraction, 1.0) * 100)
+                    if pct != last_pct:
+                        last_pct = pct
+                        emit("progress", stage="downloading",
+                             progress=min(fraction, 1.0))
+                continue
+            tail.append(line)
+        proc.wait()
+    finally:
+        if cancel:
+            cancel.unregister_process(proc)
+    if cancel:
+        cancel.check()
     if proc.returncode != 0:
         raise RuntimeError(_yt_dlp_error("\n".join(tail)))
 
@@ -255,7 +264,7 @@ _DEMUCS_BAG_RE = re.compile(r"bag of (\d+) models")
 
 
 def separate_vocals_demucs(
-    audio: Path, outdir: Path, emit, profile_name: str = "quality",
+    audio: Path, outdir: Path, emit, profile_name: str = "quality", cancel=None,
 ) -> tuple[Path, Path]:
     """Aísla voz/música y devuelve ``(vocals.wav, no_vocals.wav)``.
 
@@ -279,7 +288,10 @@ def separate_vocals_demucs(
          "-o", str(sep_dir), str(audio)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        start_new_session=True,
     )
+    if cancel:
+        cancel.register_process(proc)
 
     tail: deque[str] = deque(maxlen=30)
     n_models = 1        # cuántos modelos contiene el bag
@@ -290,32 +302,37 @@ def separate_vocals_demucs(
 
     # text=True traduce los \r de la barra a \n, así que cada refresco de tqdm
     # llega aquí como una línea suelta.
-    for line in proc.stdout:
-        line = line.rstrip("\n").strip()
-        if not line:
-            continue
-        bag = _DEMUCS_BAG_RE.search(line)
-        if bag:
-            n_models = max(1, int(bag.group(1)))
-            n_passes = n_models * int(profile["shifts"])
-            tail.append(line)
-            continue
-        m = _DEMUCS_RE.search(line)
-        if not m:
-            tail.append(line)
-            continue
-        done, total = float(m.group(2)), float(m.group(3))
-        fraction = min(done / total, 1.0) if total else 0.0
-        if fraction < prev_fraction - 0.01:   # la barra reinició = nuevo modelo
-            finished = min(finished + 1, n_passes - 1)
-        prev_fraction = fraction
-        overall = (finished + fraction) / n_passes
-        pct = int(overall * 100)
-        if pct != last_pct:
-            last_pct = pct
-            emit("progress", stage="separating", progress=min(overall, 1.0))
-
-    proc.wait()
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n").strip()
+            if not line:
+                continue
+            bag = _DEMUCS_BAG_RE.search(line)
+            if bag:
+                n_models = max(1, int(bag.group(1)))
+                n_passes = n_models * int(profile["shifts"])
+                tail.append(line)
+                continue
+            m = _DEMUCS_RE.search(line)
+            if not m:
+                tail.append(line)
+                continue
+            done, total = float(m.group(2)), float(m.group(3))
+            fraction = min(done / total, 1.0) if total else 0.0
+            if fraction < prev_fraction - 0.01:
+                finished = min(finished + 1, n_passes - 1)
+            prev_fraction = fraction
+            overall = (finished + fraction) / n_passes
+            pct = int(overall * 100)
+            if pct != last_pct:
+                last_pct = pct
+                emit("progress", stage="separating", progress=min(overall, 1.0))
+        proc.wait()
+    finally:
+        if cancel:
+            cancel.unregister_process(proc)
+    if cancel:
+        cancel.check()
     if proc.returncode != 0:
         raise RuntimeError(f"Demucs falló: {chr(10).join(tail)[-400:]}")
 
@@ -335,7 +352,7 @@ _ROFORMER_CHUNK_RE = re.compile(r"Processing chunk (\d+)/(\d+)")
 
 
 def separate_vocals_roformer(
-    audio: Path, outdir: Path, emit, tag: str = "roformer",
+    audio: Path, outdir: Path, emit, tag: str = "roformer", cancel=None,
 ) -> tuple[Path, Path]:
     """Aísla voz con BS-RoFormer usando un entorno Python independiente.
 
@@ -376,45 +393,53 @@ def separate_vocals_roformer(
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        start_new_session=True,
     )
+    if cancel:
+        cancel.register_process(proc)
 
     tail: deque[str] = deque(maxlen=40)
     current_chunk = 0
     total_chunks = 1
     separating_started = model_cached
     last_pct = -1
-    for line in proc.stdout:
-        line = line.rstrip("\n").strip()
-        if not line:
-            continue
-        tail.append(line)
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n").strip()
+            if not line:
+                continue
+            tail.append(line)
 
-        if not separating_started and "MDXC Separator initialisation complete" in line:
-            separating_started = True
-            emit("status", stage="separating",
-                 message="Separando la voz con BS-RoFormer (puede tardar)…")
-            emit("progress", stage="separating", progress=0.0)
+            if not separating_started and "MDXC Separator initialisation complete" in line:
+                separating_started = True
+                emit("status", stage="separating",
+                     message="Separando la voz con BS-RoFormer (puede tardar)…")
+                emit("progress", stage="separating", progress=0.0)
 
-        chunk = _ROFORMER_CHUNK_RE.search(line)
-        if chunk:
-            current_chunk = max(0, int(chunk.group(1)) - 1)
-            total_chunks = max(1, int(chunk.group(2)))
+            chunk = _ROFORMER_CHUNK_RE.search(line)
+            if chunk:
+                current_chunk = max(0, int(chunk.group(1)) - 1)
+                total_chunks = max(1, int(chunk.group(2)))
 
-        progress = _ROFORMER_PROGRESS_RE.search(line)
-        if not progress:
-            continue
-        fraction = min(int(progress.group(1)) / 100.0, 1.0)
-        if not separating_started:
-            emit("progress", stage="downloading_separator_model",
-                 progress=fraction)
-            continue
-        overall = min((current_chunk + fraction) / total_chunks, 0.99)
-        pct = int(overall * 100)
-        if pct != last_pct:
-            last_pct = pct
-            emit("progress", stage="separating", progress=overall)
-
-    proc.wait()
+            progress = _ROFORMER_PROGRESS_RE.search(line)
+            if not progress:
+                continue
+            fraction = min(int(progress.group(1)) / 100.0, 1.0)
+            if not separating_started:
+                emit("progress", stage="downloading_separator_model",
+                     progress=fraction)
+                continue
+            overall = min((current_chunk + fraction) / total_chunks, 0.99)
+            pct = int(overall * 100)
+            if pct != last_pct:
+                last_pct = pct
+                emit("progress", stage="separating", progress=overall)
+        proc.wait()
+    finally:
+        if cancel:
+            cancel.unregister_process(proc)
+    if cancel:
+        cancel.check()
     if proc.returncode != 0:
         raise RuntimeError(
             f"BS-RoFormer falló: {chr(10).join(tail)[-600:]}"
@@ -429,15 +454,17 @@ def separate_vocals_roformer(
 
 
 def measure_stems(vocals: Path, instrumental: Path | None,
-                  duration: float) -> audio_analysis.StemReport:
+                  duration: float, cancel=None) -> audio_analysis.StemReport:
     """Mide la voz aislada. Nunca tumba el trabajo: si no se puede medir,
     devolvemos un informe vacío y seguimos."""
     try:
-        pcm = audio_analysis.decode_pcm(vocals)
-        other = (audio_analysis.decode_pcm(instrumental)
+        pcm = audio_analysis.decode_pcm(vocals, cancel=cancel)
+        other = (audio_analysis.decode_pcm(instrumental, cancel=cancel)
                  if instrumental and instrumental.is_file() else None)
         return audio_analysis.assess_separation(pcm, other, duration)
     except Exception:  # noqa: BLE001
+        if cancel:
+            cancel.check()
         return audio_analysis.StemReport()
 
 
@@ -459,17 +486,19 @@ def _second_pass_is_better(first: audio_analysis.StemReport,
 
 def separate_vocals(
     audio: Path, outdir: Path, emit, profile_name: str = "precise",
-    duration: float = 0.0,
+    duration: float = 0.0, cancel=None,
 ) -> tuple[Path, Path, audio_analysis.StemReport]:
     """Aísla la voz y devuelve (voz, instrumental, informe de calidad)."""
     profile = SEPARATION_PROFILES.get(profile_name, SEPARATION_PROFILES["precise"])
     if profile["engine"] != "roformer":
         vocals, instrumental = separate_vocals_demucs(
-            audio, outdir, emit, profile_name)
-        return vocals, instrumental, measure_stems(vocals, instrumental, duration)
+            audio, outdir, emit, profile_name, cancel)
+        return vocals, instrumental, measure_stems(
+            vocals, instrumental, duration, cancel)
 
-    vocals, instrumental = separate_vocals_roformer(audio, outdir, emit)
-    report = measure_stems(vocals, instrumental, duration)
+    vocals, instrumental = separate_vocals_roformer(
+        audio, outdir, emit, cancel=cancel)
+    report = measure_stems(vocals, instrumental, duration, cancel)
     emit("stem", stage="separated", pass_number=1, **report.as_dict())
 
     if profile.get("passes", 1) < 2 or report.verdict in {"empty", "silent"}:
@@ -480,13 +509,13 @@ def separate_vocals(
                  "que quedó en la voz…")
     try:
         refined, residue = separate_vocals_roformer(
-            vocals, outdir, emit, tag="roformer-2")
+            vocals, outdir, emit, tag="roformer-2", cancel=cancel)
     except RuntimeError as error:
         emit("status", stage="separating",
              message=f"La segunda pasada falló ({error}); me quedo con la primera.")
         return vocals, instrumental, report
 
-    refined_report = measure_stems(refined, residue, duration)
+    refined_report = measure_stems(refined, residue, duration, cancel)
     emit("stem", stage="separated", pass_number=2, **refined_report.as_dict())
     if _second_pass_is_better(report, refined_report):
         emit("status", stage="separating",

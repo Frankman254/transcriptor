@@ -22,6 +22,7 @@ __all__ = ["hub"]
 
 import json
 import threading
+from cancellation import CancellationToken
 
 # Máximo de eventos por trabajo en el buffer de reconexión. Por encima, los más
 # antiguos se retiren al snapshot (seguían llegando al cliente, pero ya no se
@@ -68,6 +69,7 @@ class JobHub:
             "next_id": 0,       # id del próximo evento
             "cond": threading.Condition(),
             "done": False,
+            "cancel": CancellationToken(),
             "snapshot": {"segments": [], "stems": [], "rounds": [],
                          "latest": {}},
         }
@@ -84,6 +86,17 @@ class JobHub:
         """Hay un pipeline vivo para este trabajo en *este* proceso."""
         job = self._jobs.get(job_id)
         return bool(job and not job["done"])
+
+    def cancel(self, job_id: str) -> bool:
+        """Solicita detener exactamente un trabajo vivo."""
+        job = self._jobs.get(job_id)
+        if not job or job["done"]:
+            return False
+        self.publish(job, "status", {
+            "stage": "cancelling", "message": "Cancelando el trabajo…",
+        })
+        job["cancel"].cancel()
+        return True
 
     # -------------------------------------------------------------- eventos
     def publish(self, job: dict, event: str, data: dict) -> None:

@@ -56,7 +56,7 @@ def model_cache_path(model: str) -> Path:
     return paths.CACHE_DIR / os.path.basename(url)
 def model_is_cached(model: str) -> bool:
     return model_cache_path(model).exists()
-def ensure_model(model: str, emit) -> None:
+def ensure_model(model: str, emit, cancel=None) -> None:
     """Descarga el modelo con curl si no está en caché (evita el SSL de Python)."""
     if model_is_cached(model):
         return
@@ -65,15 +65,25 @@ def ensure_model(model: str, emit) -> None:
     target = model_cache_path(model)
     emit("status", stage="downloading_model",
          message=f"Descargando modelo '{model}' (~una vez)…")
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         ["curl", "-L", "--fail", "-o", str(target), url],
-        capture_output=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
     )
+    if cancel:
+        cancel.register_process(proc)
+    try:
+        _stdout, stderr = proc.communicate()
+    finally:
+        if cancel:
+            cancel.unregister_process(proc)
+    if cancel:
+        cancel.check()
     if proc.returncode != 0:
         if target.exists():
             target.unlink(missing_ok=True)
         raise RuntimeError(
-            f"No se pudo descargar el modelo '{model}': {proc.stderr[-300:]}"
+            f"No se pudo descargar el modelo '{model}': {stderr[-300:]}"
         )
 # Cronómetro de un trabajo: tres funciones sobre el mismo `job["_timing"]`.
 # Se llaman en este orden — arrancar, marcar cada etapa, cerrar — y cerrar dos
