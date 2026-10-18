@@ -8,7 +8,7 @@ vídeo musical**. Todos viven en esta máquina, uno al lado del otro:
 
 ```
 /Users/frankman254/Desktop/Personal-Projects/
-├── transcriptor/              IA: saca la letra del audio      (Python)
+├── transcriptor/              Scribix: saca la letra del audio (Python, IA local)
 ├── Lyrixa/                    Edita y sincroniza la letra      (React)
 ├── LiveWallpaperAnimeGlitch/  Vibrix: la convierte en vídeo    (React)
 └── vibrix-web/                Web que vende la suite           (Next.js, por crear)
@@ -24,27 +24,29 @@ vídeo musical**. Todos viven en esta máquina, uno al lado del otro:
 
 ## Rutas
 
-| Proyecto                | Ruta absoluta                                                            | Stack                                    | Paquetes | Tests / checks                                                                                 |
-| ----------------------- | ------------------------------------------------------------------------ | ---------------------------------------- | -------- | ---------------------------------------------------------------------------------------------- |
-| **Vibrix** (ancla)      | `/Users/frankman254/Desktop/Personal-Projects/LiveWallpaperAnimeGlitch`  | Vite + React 19 + TS + Zustand + R3F     | `pnpm`   | `pnpm format && pnpm lint && pnpm architecture:check && pnpm test:run && pnpm build` (ver AGENTS.md) |
-| **Lyrixa**              | `/Users/frankman254/Desktop/Personal-Projects/Lyrixa`                    | Vite + React 19 + TS                     | `npm`    | `npm test && npm run lint && npm run build`                                                    |
-| **Transcriptor**        | `/Users/frankman254/Desktop/Personal-Projects/transcriptor`              | Python 3 + FastAPI + Whisper             | `pip`    | `python3 -m unittest discover -s tests -v`                                                     |
-| **Web de venta**        | `/Users/frankman254/Desktop/Personal-Projects/vibrix-web`                | Next.js + Tailwind CSS (por crear)       | `pnpm`   | `pnpm lint && pnpm build`                                                                      |
-| Landing personal (ref.) | `/Users/frankman254/Desktop/Personal-Projects/Landing-page-frankmandev` | Next.js 16 + Tailwind 3 (solo referencia) | `npm`    | —                                                                                              |
+| Proyecto                | Ruta absoluta                                                           | Stack                                     | Paquetes | Tests / checks                                                                                       |
+| ----------------------- | ----------------------------------------------------------------------- | ----------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| **Vibrix** (ancla)      | `/Users/frankman254/Desktop/Personal-Projects/LiveWallpaperAnimeGlitch` | Vite + React 19 + TS + Zustand + R3F      | `pnpm`   | `pnpm format && pnpm lint && pnpm architecture:check && pnpm test:run && pnpm build` (ver AGENTS.md) |
+| **Lyrixa**              | `/Users/frankman254/Desktop/Personal-Projects/Lyrixa`                   | Vite + React 19 + TS                      | `npm`    | `npm test && npm run lint && npm run build`                                                          |
+| **Transcriptor**        | `/Users/frankman254/Desktop/Personal-Projects/transcriptor`             | Python 3 + FastAPI + Whisper              | `pip`    | `python3 -m unittest discover -s tests -v`                                                           |
+| **Web de venta**        | `/Users/frankman254/Desktop/Personal-Projects/vibrix-web`               | Next.js + Tailwind CSS (por crear)        | `pnpm`   | `pnpm lint && pnpm build`                                                                            |
+| Landing personal (ref.) | `/Users/frankman254/Desktop/Personal-Projects/Landing-page-frankmandev` | Next.js 16 + Tailwind 3 (solo referencia) | `npm`    | —                                                                                                    |
 
 Repos en GitHub: `Frankman254/Lyrixa`, `Frankman254/transcriptor`; Vibrix y la
 web tienen el suyo propio.
 
 ## Documentos que mandan
 
-| Qué                                        | Dónde                                                                                         |
-| ------------------------------------------ | --------------------------------------------------------------------------------------------- |
-| **Plan maestro de lanzamiento** (la suite) | `LiveWallpaperAnimeGlitch/docs/plans/PLAN_MAESTRO_LANZAMIENTO.md`                             |
-| **Plan de la web de venta**                | `LiveWallpaperAnimeGlitch/docs/plans/PLAN_WEB_VENTA.md`                                       |
-| Contrato Lyrixa → Vibrix                   | `LiveWallpaperAnimeGlitch/docs/features/LYRIXA_CONTRACT.md`                                   |
-| Contrato Transcriptor → Lyrixa             | `transcriptor/docs/contrato-lyrixa.md`                                                        |
-| Lenguaje de efectos (capa 3)               | `transcriptor/docs/contrato-capa-fx.md`                                                       |
-| Arquitectura de cada app                   | Vibrix `docs/architecture/ARCHITECTURE.md` · Lyrixa `docs/01-architecture.md` · Transcriptor `docs/arquitectura.md` |
+| Qué                                                     | Dónde                                                                                                               |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| **Plan de ataque: congelar + arrancar el secuenciador** | `LiveWallpaperAnimeGlitch/docs/plans/PLAN_ATAQUE_CONGELACION_Y_LYRIXA.md`                                           |
+| **Plan maestro de lanzamiento** (la suite)              | `LiveWallpaperAnimeGlitch/docs/plans/PLAN_MAESTRO_LANZAMIENTO.md`                                                   |
+| **Plan de la web de venta**                             | `LiveWallpaperAnimeGlitch/docs/plans/PLAN_WEB_VENTA.md`                                                             |
+| Contrato Lyrixa → Vibrix                                | `LiveWallpaperAnimeGlitch/docs/features/LYRIXA_CONTRACT.md`                                                         |
+| Contrato Transcriptor → Lyrixa                          | `transcriptor/docs/contrato-lyrixa.md`                                                                              |
+| Lenguaje de efectos (capa 3)                            | `transcriptor/docs/contrato-capa-fx.md`                                                                             |
+| Arquitectura de cada app                                | Vibrix `docs/architecture/ARCHITECTURE.md` · Lyrixa `docs/01-architecture.md` · Transcriptor `docs/arquitectura.md` |
+| **Línea visual** (nombres, iconos, colores)             | `.agents/MARCA.md` (copia idéntica en los cuatro repos)                                                             |
 
 Todos los paths de esta tabla son relativos a
 `/Users/frankman254/Desktop/Personal-Projects/`.
@@ -68,14 +70,14 @@ Todos los paths de esta tabla son relativos a
 
 ## Estado del plan (actualizar al cerrar cada fase)
 
-| Fase | Qué                              | Estado                          |
-| ---- | -------------------------------- | ------------------------------- |
-| 0    | Higiene (Vibrix `0.4.1-alpha`)   | Hecha 2026-09-13                |
-| 1    | Export de vídeo offline (Vibrix) | **En curso**                    |
+| Fase | Qué                              | Estado                                         |
+| ---- | -------------------------------- | ---------------------------------------------- |
+| 0    | Higiene (Vibrix `0.4.1-alpha`)   | Hecha 2026-09-13                               |
+| 1    | Export de vídeo offline (Vibrix) | **En curso**                                   |
 | 2    | Plantillas + letras LRC/SRT      | Pendiente (Lyrixa puede adelantar sus exports) |
-| 3    | Rendimiento                      | Pendiente                       |
+| 3    | Rendimiento                      | Pendiente                                      |
 | 4    | Pagos, legal, web de venta       | Pendiente (la web puede empezar su maqueta ya) |
-| 5    | Beta → `1.0.0`                   | Pendiente                       |
+| 5    | Beta → `1.0.0`                   | Pendiente                                      |
 
 ## Skills disponibles
 
