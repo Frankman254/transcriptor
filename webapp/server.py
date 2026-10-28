@@ -17,7 +17,7 @@ import routes_jobs
 import routes_serve
 import routes_system
 
-app = FastAPI(title="Transcriptor local")
+app = FastAPI(title="Scribix · transcriptor local")
 
 # Transcriptor es el motor; Lyrixa y el renderer son clientes que corren en
 # sus propios puertos, así que sin CORS no pueden llamarlo desde el navegador.

@@ -1,0 +1,27 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none"
+     xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Scribix">
+  <title>Scribix</title>
+  <!--
+    Marca para dentro de la interfaz (barra oscura): igual que favicon.svg
+    pero sin la media query, porque en un <img> el tema que manda es el del
+    sistema y no el de la página, y el neutro se volvería oscuro sobre oscuro.
+  -->
+  <mask id="pierce">
+    <rect x="0" y="0" width="64" height="64" fill="white"/>
+    <path d="M44 17 C40 11 21 10 20.5 21.5 C20 32 44 30 43.5 42 C43 53 24 54 19 46"
+          fill="none" stroke="black" stroke-width="10"
+          stroke-linecap="round" stroke-linejoin="round"/>
+  </mask>
+  <g mask="url(#pierce)" fill="none" stroke-linecap="round">
+    <path stroke="#F2F3F5" d="M7 21.5 H57" stroke-width="3.4"/>
+    <path d="M7 32 H57" stroke="#a47cff" stroke-width="3"/>
+    <path d="M7 42.5 H41" stroke="#a47cff" stroke-width="3"/>
+  </g>
+  <g fill="none" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M44 17 C40 11 21 10 20.5 21.5 C20 32 44 30 43.5 42 C43 53 24 54 19 46"
+          stroke="#f0409b" transform="translate(-2.6 0)"/>
+    <path d="M44 17 C40 11 21 10 20.5 21.5 C20 32 44 30 43.5 42 C43 53 24 54 19 46"
+          stroke="#21dde8" transform="translate(2.6 0)"/>
+    <path stroke="#F2F3F5" d="M44 17 C40 11 21 10 20.5 21.5 C20 32 44 30 43.5 42 C43 53 24 54 19 46"/>
+  </g>
+</svg>

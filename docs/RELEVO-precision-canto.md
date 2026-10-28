@@ -272,3 +272,27 @@ previsto: **18:43–18:56, siete líneas de kana sin sentido** del denpa
 `rescuedFromOriginal` y `rescueScore`, así que se pueden filtrar o revisar en
 Lyrixa. "I'm a machine" ×3 (06:30) puede ser coro real o eco: sin verificar.
 Lo siguiente es la corrida `ultra` del usuario, que se compara contra esto.
+
+### H11 — La corrida del usuario (18 oct, 15:38) y el bug de la referencia
+
+Archivo: `~/Downloads/… Parte 1.lyrixa (2).json`. Salió con **turbo** (no
+large-v3) y con referencia LRCLIB (12 canciones encontradas, 37 líneas
+casadas), así que no se compara 1:1 con las 3405 palabras de H10.
+
+| | 16 oct (large-v3) | 18 oct (turbo + ref) |
+| --- | --- | --- |
+| Líneas | 481 | 535 |
+| Palabras latinas / caracteres CJK | 1226 / 2189 | 1846 / 2059 |
+| Segundos en ja | 1061 | 1330 |
+| Huecos descartados / palabras en bucle | 1627 / 308 | 2358 / 693 |
+| Ventanas rescatadas | 2 | 11 |
+
+**Bug grave (corregido):** ~150 líneas en japonés y coreano quedaron
+sustituidas por la primera línea de la letra de su canción ("夢の続き
+追いかけていたはずなのに" ×45 entre 25:36 y 30:25, "教えて 教えてよ" ×23,
+"ララララ" ×27, "어느 날 난…" ×7…). En `refine_segments`, `_fold` vacía las
+líneas no latinas y la regla `exact_short` comparaba `"" == ""`. Ahora exige
+al menos una palabra; prueba
+`test_a_japanese_line_is_never_overwritten_by_the_first_lyric_line`. Hay que
+repetir la corrida para medir de verdad; el arreglo de H9 (casar CJK por
+caracteres) sigue sin aprobar.

@@ -1,4 +1,4 @@
-# 🎙️ Transcriptor local
+# Scribix — transcriptor local
 
 App web para transcribir audio/video **en tu propia máquina** con Whisper.
 Muestra en vivo: el **modelo** que se usa, el **dispositivo** (CPU/GPU), la **barra

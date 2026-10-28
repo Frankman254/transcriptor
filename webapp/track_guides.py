@@ -23,6 +23,7 @@ import ssl
 import statistics
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -39,6 +40,10 @@ USER_AGENT = "TranscriptorLocal/1.0 (local lyrics reference)"
 # aciertos se conservan; los negativos se reintentan al día siguiente.
 NEGATIVE_CACHE_TTL = 24 * 60 * 60
 ERROR_CACHE_TTL = 5 * 60
+# LRCLIB es un servicio comunitario y a veces devuelve 429/503 durante unos
+# segundos. Un fallo transitorio no debe dejar media mezcla sin referencias.
+SEARCH_RETRY_DELAYS = (0.8, 2.0)
+RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
 _TIMED_LINE = re.compile(
     r"^\s*((?:\d{1,2}:){1,2}\d{2}(?:[.,]\d{1,3})?)\s+(.+?)\s*$"
 )
@@ -318,9 +323,24 @@ def _https_context() -> ssl.SSLContext:
 def _search_candidates(query: str, timeout: float) -> list[dict]:
     url = LRCLIB_SEARCH + "?" + urllib.parse.urlencode({"q": query})
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(
-        request, timeout=timeout, context=_https_context()) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    for attempt in range(len(SEARCH_RETRY_DELAYS) + 1):
+        try:
+            with urllib.request.urlopen(
+                request, timeout=timeout, context=_https_context()) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            retryable = error.code in RETRYABLE_HTTP_STATUS
+            if not retryable or attempt >= len(SEARCH_RETRY_DELAYS):
+                raise
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            try:
+                delay = float(retry_after) if retry_after is not None else 0.0
+            except ValueError:
+                delay = 0.0
+            # Nunca martillar el servicio, pero tampoco congelar el pipeline
+            # por una cabecera Retry-After absurda.
+            time.sleep(min(15.0, max(SEARCH_RETRY_DELAYS[attempt], delay)))
     return dedupe_candidates(payload if isinstance(payload, list) else [])
 
 
@@ -331,7 +351,8 @@ def _cache_path(cache_dir: Path, track: Track) -> Path:
     return cache_dir / f"{key}.json"
 
 
-def fetch_reference(track: Track, cache_dir: Path, timeout: float = 12.0) -> dict | None:
+def fetch_reference(track: Track, cache_dir: Path, timeout: float = 12.0,
+                    *, retry_errors: bool = False) -> dict | None:
     """Fetch and cache one public lyric reference; failures stay non-fatal."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     target = _cache_path(cache_dir, track)
@@ -351,7 +372,11 @@ def fetch_reference(track: Track, cache_dir: Path, timeout: float = 12.0) -> dic
                 legacy_ssl_failure = cached.get("error") == "URLError"
                 if reference and not still_plausible(track, reference):
                     reference = None    # elección de una versión sin filtros
-                elif reference or (age < ttl and not legacy_ssl_failure):
+                elif reference or (
+                    age < ttl
+                    and not legacy_ssl_failure
+                    and not (retry_errors and cached.get("error"))
+                ):
                     track.lookup = {
                         "status": "found" if reference else
                                   "error" if cached.get("error") else "no_match",
@@ -408,6 +433,7 @@ def build_guide(
     fetch_lyrics: bool,
     cache_dir: Path,
     progress: Callable[[int, int, Track], None] | None = None,
+    retry_errors: bool = False,
 ) -> dict | None:
     sections = parse_tracklist(text)
     selected = choose_section(sections, duration)
@@ -419,7 +445,8 @@ def build_guide(
         if track.end <= track.start:
             track.end = track.start + 240.0
         if fetch_lyrics:
-            track.reference = fetch_reference(track, cache_dir)
+            track.reference = fetch_reference(
+                track, cache_dir, retry_errors=retry_errors)
             # LRCLIB is a community service; serialize requests instead of
             # hammering it with 50 songs at once. Cache hits skip this delay.
             time.sleep(0.18)
@@ -679,7 +706,10 @@ def refine_segments(segments: list[dict], guide: dict | None) -> list[dict]:
             heard_count = len(_fold(item.get("text", "")).split())
             ref_count = len(_fold(best).split())
             balanced = ref_count <= heard_count * 2 + 2 and heard_count <= ref_count * 2 + 2
-            exact_short = heard_count <= 2 and _fold(item.get("text", "")) == _fold(best)
+            # Una línea que `_fold` deja vacía (japonés, coreano…) no es
+            # "corta y exacta": "" == "" la cambiaba por la primera línea.
+            exact_short = (1 <= heard_count <= 2
+                           and _fold(item.get("text", "")) == _fold(best))
             if (score >= 0.76 and balanced and heard_count >= 3) or exact_short:
                 item["text"] = best
                 item["referenceScore"] = round(score, 4)

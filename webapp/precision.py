@@ -520,12 +520,35 @@ def _prompt_at(spans: list[dict], start: float, end: float) -> str | None:
     return winner.get("prompt") if overlap(winner) > 0 else None
 
 
+@contextmanager
+def _cancel_executor(cancel, executor: ProcessPoolExecutor):
+    """Hace que el botón cancelar corte también los workers de Whisper."""
+    if not cancel:
+        yield
+        return
+
+    def stop_workers() -> None:
+        # ProcessPoolExecutor no ofrecía terminate_workers antes de Python
+        # 3.14. Sus procesos son propiedad exclusiva de este executor/trabajo.
+        for process in list(getattr(executor, "_processes", {}).values()):
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    cancel.register_stopper(stop_workers)
+    try:
+        yield
+    finally:
+        cancel.unregister_stopper(stop_workers)
+
+
 def run(audio: Path, config: PrecisionConfig, emit,
-        stem_report: aa.StemReport | None = None) -> PrecisionResult:
+        stem_report: aa.StemReport | None = None, cancel=None) -> PrecisionResult:
     """Transcribe `audio` by voting several passes until the answer stops moving."""
     emit("status", stage="analyzing",
          message="Analizando el audio y buscando dónde hay voz…")
-    pcm = aa.decode_pcm(audio)
+    pcm = aa.decode_pcm(audio, cancel=cancel)
     regions = aa.detect_speech_regions(pcm)
     speech = sum(region.duration for region in regions)
     if not regions:
@@ -560,7 +583,7 @@ def run(audio: Path, config: PrecisionConfig, emit,
     with shared_audio(pcm) as (name, samples), ProcessPoolExecutor(
         max_workers=workers, mp_context=context,
         initializer=te.init_worker, initargs=(config.model, engine, threads),
-    ) as executor:
+    ) as executor, _cancel_executor(cancel, executor):
         del pcm  # the shared block is now the only copy of the audio
         # Whisper wants an ISO code; the UI may hand us "Spanish".
         forced = normalize_code(config.language)
@@ -777,7 +800,8 @@ def _consensus_protects(current: list[dict], start: float, end: float,
 def rescue_from_original(original: Path, result: PrecisionResult,
                          config: PrecisionConfig, emit,
                          max_windows: int = 24,
-                         max_erased: int = RESCUE_ERASED_LIMIT) -> PrecisionResult:
+                         max_erased: int = RESCUE_ERASED_LIMIT,
+                         cancel=None) -> PrecisionResult:
     """Recheck only dubious stem regions against the untouched mix.
 
     A replacement needs materially stronger acoustic evidence. This lets a
@@ -809,7 +833,7 @@ def rescue_from_original(original: Path, result: PrecisionResult,
          message=(f"Revisando en el audio original con {rescue_model}: "
                   f"{len(repairs)} zonas dudosas y {len(erased)} tramos con voz "
                   f"pero sin letra…"))
-    pcm = aa.decode_pcm(original)
+    pcm = aa.decode_pcm(original, cancel=cancel)
     engine_name = choose_engine(
         rescue_model, emit, config.engine_preference)
     _workers, threads = plan_resources(engine_name, workers=1)
@@ -817,6 +841,8 @@ def rescue_from_original(original: Path, result: PrecisionResult,
     segments = list(result.segments)
     accepted = 0
     for index, (start, end, erased_zone) in enumerate(intervals):
+        if cancel:
+            cancel.check()
         first = max(0, int(start * aa.SAMPLE_RATE))
         last = min(pcm.size, int(end * aa.SAMPLE_RATE))
         language = None if erased_zone else next(

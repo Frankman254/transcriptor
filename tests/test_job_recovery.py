@@ -118,6 +118,40 @@ class JobRecoveryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertTrue(outdir.exists())
 
+    def test_cancel_signals_only_the_requested_running_job(self):
+        first_id, _ = self.make_interrupted_job()
+        second_id, _ = self.make_interrupted_job("b1c2d3e4f5a6")
+        first = routes_jobs.hub.create(first_id)
+        second = routes_jobs.hub.create(second_id)
+        response = routes_jobs.cancel_job(first_id)
+        self.assertEqual(response, {"job_id": first_id, "cancelling": True})
+        self.assertTrue(first["cancel"].cancelled)
+        self.assertFalse(second["cancel"].cancelled)
+        self.assertEqual(first["events"][-1]["event"], "status")
+
+    def test_cancelled_status_wins_over_an_older_result_file(self):
+        job_id, outdir = self.make_interrupted_job()
+        (outdir / "resultado.json").write_text("{}", encoding="utf-8")
+        jobstore.update_manifest(job_id, status="cancelled")
+        with mock.patch.object(media, "ffprobe_duration", return_value=42.0):
+            record = jobstore.saved_job(job_id)
+        self.assertEqual(record["status"], "cancelled")
+
+    def test_stale_running_manifest_is_listed_as_interrupted(self):
+        job_id, outdir = self.make_interrupted_job()
+        (outdir / "asr-input.wav").unlink()
+        (outdir / "roformer" / "vocals.wav").unlink()
+        jobstore.update_manifest(job_id, status="running",
+                                 title="Proceso que ya no existe")
+
+        with mock.patch.object(media, "ffprobe_duration", return_value=42.0):
+            stale = jobstore.saved_job(job_id, running=False)
+            live = jobstore.saved_job(job_id, running=True)
+
+        self.assertEqual(stale["status"], "interrupted")
+        self.assertFalse(stale["recoverable"])
+        self.assertEqual(live["status"], "running")
+
     def test_missing_job_state_is_a_404(self):
         response = routes_jobs.job_state("000000000000")
         self.assertEqual(response.status_code, 404)

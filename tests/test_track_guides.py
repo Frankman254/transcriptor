@@ -3,6 +3,7 @@ import json
 import tempfile
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -74,6 +75,40 @@ class TrackGuideTests(unittest.TestCase):
         self.assertEqual(track.lookup["status"], "error")
         self.assertIn("offline", track.lookup["error"])
 
+    def test_service_unavailable_is_retried_before_marking_failure(self):
+        failure = urllib.error.HTTPError(
+            "https://lrclib.net/api/search", 503, "Service Unavailable",
+            {"Retry-After": "0"}, None,
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"[]"
+        with mock.patch.object(
+            guides.urllib.request, "urlopen", side_effect=[failure, response]
+        ) as request, mock.patch.object(guides.time, "sleep") as sleep:
+            self.assertEqual(guides._search_candidates("Song", 1.0), [])
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(guides.SEARCH_RETRY_DELAYS[0])
+
+    def test_explicit_retry_bypasses_a_fresh_error_cache(self):
+        track = guides.Track(0, "Artist", "Song", "Artist - Song")
+        candidate = {
+            "id": 7, "trackName": "Song", "artistName": "Artist",
+            "plainLyrics": "real lyrics", "syncedLyrics": None,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            guides._cache_path(cache, track).write_text(json.dumps({
+                "reference": None, "fetchedAt": time.time(),
+                "error": "HTTPError: Service Unavailable", "candidateCount": 0,
+            }), encoding="utf-8")
+            with mock.patch.object(
+                guides, "_search_candidates", return_value=[candidate]
+            ) as search:
+                reference = guides.fetch_reference(
+                    track, cache, retry_errors=True)
+        search.assert_called_once()
+        self.assertEqual(reference["id"], 7)
+
     def test_legacy_url_error_cache_is_retried_immediately(self):
         track = guides.Track(0, "Artist", "Song", "Artist - Song")
         candidate = {
@@ -123,6 +158,25 @@ class TrackGuideTests(unittest.TestCase):
         refined = guides.refine_segments(segments, guide)
         self.assertEqual(refined[0]["text"], "Pink elephants and lemonade")
         self.assertEqual(refined[1]["text"], "everybody everybody")
+
+    def test_a_japanese_line_is_never_overwritten_by_the_first_lyric_line(self):
+        # _fold borra el japonés: antes "" == "" pasaba por línea corta exacta
+        # y cada verso se cambiaba por la primera línea de la referencia.
+        guide = {"tracks": [{
+            "start": 0, "end": 60, "artist": "A", "title": "One",
+            "reference": {"plain": "教えて 教えてよ\n世界で君が笑う"},
+        }]}
+        segments = [
+            {"start": 2, "end": 5, "text": "夢の続き追いかけていた",
+             "words": [{"word": "夢の続き", "start": 2, "end": 3.5},
+                       {"word": "追いかけていた", "start": 3.5, "end": 5}]},
+            {"start": 7, "end": 9, "text": "♪"},
+        ]
+        refined = guides.refine_segments(segments, guide)
+        self.assertEqual(refined[0]["text"], "夢の続き追いかけていた")
+        self.assertEqual(refined[0]["words"][0]["word"], "夢の続き")
+        self.assertNotIn("referenceScore", refined[0])
+        self.assertEqual(refined[1]["text"], "♪")
 
 
 class ReferencePlausibilityTests(unittest.TestCase):

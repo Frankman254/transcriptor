@@ -15,7 +15,8 @@ from serveutil import device_name, parse_whisper_line, safe_stem
 
 
 def run_whisper(audio: Path, model: str, language: str, outdir: Path,
-                duration: float, emit, out_stem: str | None = None) -> dict:
+                duration: float, emit, out_stem: str | None = None,
+                cancel=None) -> dict:
     """Corre Whisper por CLI en modo verbose y transmite cada segmento.
 
     `out_stem` es el nombre con el que queremos que salgan los archivos. Whisper
@@ -44,15 +45,24 @@ def run_whisper(audio: Path, model: str, language: str, outdir: Path,
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env=env,
+        start_new_session=True,
     )
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        segment = parse_whisper_line(line)
-        if segment:
-            start, end, text = segment
-            progress = min(end / duration, 1.0) if duration else None
-            emit("segment", start=start, end=end, text=text, progress=progress)
-    proc.wait()
+    if cancel:
+        cancel.register_process(proc)
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            segment = parse_whisper_line(line)
+            if segment:
+                start, end, text = segment
+                progress = min(end / duration, 1.0) if duration else None
+                emit("segment", start=start, end=end, text=text, progress=progress)
+        proc.wait()
+    finally:
+        if cancel:
+            cancel.unregister_process(proc)
+    if cancel:
+        cancel.check()
     if proc.returncode != 0:
         raise RuntimeError("Whisper terminó con error.")
 

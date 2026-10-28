@@ -72,6 +72,26 @@ def delete_saved_job(job_id: str):
     shutil.rmtree(outdir)
     hub.pop(job_id)
     return {"deleted": True, "job_id": job_id}
+
+
+@router.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    """Detiene un trabajo, no el servidor ni los demás trabajos."""
+    if not _JOB_ID_RE.fullmatch(job_id):
+        return JSONResponse({"error": "ID de trabajo inválido."}, status_code=400)
+    job = hub.get(job_id)
+    if job is None:
+        record = jobstore.saved_job(job_id, running=False)
+        return JSONResponse(
+            {"error": "El trabajo no existe." if record is None
+                      else "El trabajo ya no está corriendo."},
+            status_code=404 if record is None else 409,
+        )
+    if job["done"]:
+        return JSONResponse(
+            {"error": "El trabajo ya terminó."}, status_code=409)
+    accepted = hub.cancel(job_id)
+    return {"job_id": job_id, "cancelling": accepted}
 @router.post("/api/tracklists/preview")
 async def preview_tracklist(
     tracklist_text: str = Form(...),
