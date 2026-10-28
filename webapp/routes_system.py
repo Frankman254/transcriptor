@@ -47,7 +47,16 @@ class TranslateRequest(BaseModel):
         return [self.text] if self.text is not None else []
 @router.get("/", response_class=HTMLResponse)
 def index():
-    return (paths.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = (paths.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    # El servidor puede reiniciarse mientras la pestaña sigue abierta. El HTML
+    # no se cachea y las URLs de CSS/JS cambian con sus mtimes, así una recarga
+    # normal nunca conserva una interfaz anterior contra un backend nuevo.
+    assets = (paths.STATIC_DIR / "app.css", paths.STATIC_DIR / "app.js")
+    version = f"{max(asset.stat().st_mtime_ns for asset in assets):x}"
+    return HTMLResponse(
+        html.replace("__SCRIBIX_ASSET_VERSION__", version),
+        headers={"Cache-Control": "no-store"},
+    )
 @router.get("/api/info")
 def info():
     engines = precision.engine_availability(MODELS)

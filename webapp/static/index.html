@@ -16,7 +16,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/app.css?v=__SCRIBIX_ASSET_VERSION__">
 </head>
 <body>
 
@@ -256,6 +256,30 @@
   </main>
 </div>
 
-<script src="/static/app.js"></script>
+<!-- Un solo diálogo para todas las decisiones y avisos de la aplicación.
+     El contenido y la variante visual los configura app.js; mantenerlo aquí
+     evita que cada acción construya su propio modal. -->
+<dialog class="app-dialog" id="app-dialog"
+        aria-labelledby="app-dialog-title" aria-describedby="app-dialog-message">
+  <div class="app-dialog-card">
+    <div class="app-dialog-heading">
+      <span class="app-dialog-icon" id="app-dialog-icon" aria-hidden="true"></span>
+      <div>
+        <span class="app-dialog-kicker">Scribix</span>
+        <h2 id="app-dialog-title"></h2>
+      </div>
+    </div>
+    <p class="app-dialog-message" id="app-dialog-message"></p>
+    <p class="app-dialog-detail hidden" id="app-dialog-detail"></p>
+    <div class="app-dialog-actions">
+      <button class="app-dialog-button secondary hidden" id="app-dialog-cancel"
+              type="button"></button>
+      <button class="app-dialog-button primary" id="app-dialog-confirm"
+              type="button"></button>
+    </div>
+  </div>
+</dialog>
+
+<script src="/static/app.js?v=__SCRIBIX_ASSET_VERSION__"></script>
 </body>
 </html>

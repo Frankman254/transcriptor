@@ -74,6 +74,17 @@ class HealthTests(ApiTestCase):
         self.assertTrue(body["publicUrl"].startswith("http://"))
 
 
+class UiShellTests(ApiTestCase):
+    def test_index_always_points_at_the_current_frontend_assets(self):
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertNotIn("__SCRIBIX_ASSET_VERSION__", response.text)
+        self.assertRegex(response.text, r"app\.js\?v=[0-9a-f]+")
+        self.assertRegex(response.text, r"app\.css\?v=[0-9a-f]+")
+
+
 class CorsTests(ApiTestCase):
     def test_lyrixa_on_its_own_port_is_allowed_to_call_the_api(self):
         response = self.client.get(

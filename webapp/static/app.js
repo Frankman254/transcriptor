@@ -22,6 +22,89 @@ let EXPANDED_JOB = null;    // id con el cajón de acciones abierto
 let VIEW = "new";
 
 // ----------------------------------------------------------------------- //
+// Diálogo reutilizable                                                      //
+// ----------------------------------------------------------------------- //
+
+const DIALOG_QUEUE = [];
+let DIALOG_ACTIVE = null;
+
+function presentNextDialog() {
+  if (DIALOG_ACTIVE || !DIALOG_QUEUE.length) return;
+  DIALOG_ACTIVE = DIALOG_QUEUE.shift();
+  const options = DIALOG_ACTIVE.options;
+  const dialog = document.getElementById("app-dialog");
+  const kind = ["warning", "danger"].includes(options.kind)
+    ? options.kind : "info";
+  dialog.className = `app-dialog is-${kind}`;
+  document.getElementById("app-dialog-icon").textContent = {
+    info: "i", warning: "!", danger: "×",
+  }[kind];
+  document.getElementById("app-dialog-title").textContent =
+    options.title || (kind === "danger" ? "Confirma esta acción" : "Aviso");
+  document.getElementById("app-dialog-message").textContent = options.message || "";
+
+  const detail = document.getElementById("app-dialog-detail");
+  detail.textContent = options.detail || "";
+  detail.classList.toggle("hidden", !options.detail);
+
+  const cancel = document.getElementById("app-dialog-cancel");
+  cancel.textContent = options.cancelLabel || "";
+  cancel.classList.toggle("hidden", !options.cancelLabel);
+  const confirm = document.getElementById("app-dialog-confirm");
+  confirm.textContent = options.confirmLabel || "Entendido";
+  dialog.showModal();
+  confirm.focus();
+}
+
+function finishDialog(accepted) {
+  const dialog = document.getElementById("app-dialog");
+  if (!dialog.open || !DIALOG_ACTIVE) return;
+  const active = DIALOG_ACTIVE;
+  DIALOG_ACTIVE = null;
+  dialog.close();
+  active.resolve(accepted);
+  presentNextDialog();
+}
+
+function showAppDialog(options) {
+  return new Promise(resolve => {
+    DIALOG_QUEUE.push({options, resolve});
+    presentNextDialog();
+  });
+}
+
+function showAlert(message, options = {}) {
+  return showAppDialog({
+    title: options.title || "No se pudo completar",
+    message,
+    detail: options.detail,
+    kind: options.kind || "warning",
+    confirmLabel: options.confirmLabel || "Entendido",
+  });
+}
+
+function showConfirm(options) {
+  return showAppDialog({
+    ...options,
+    kind: options.kind || "danger",
+    cancelLabel: options.cancelLabel || "Volver",
+    confirmLabel: options.confirmLabel || "Confirmar",
+  });
+}
+
+document.getElementById("app-dialog-confirm").addEventListener("click", () => {
+  finishDialog(true);
+});
+document.getElementById("app-dialog-cancel").addEventListener("click", () => {
+  finishDialog(false);
+});
+document.getElementById("app-dialog").addEventListener("cancel", event => {
+  event.preventDefault();
+  // Escape equivale a volver en una confirmación y a cerrar en un aviso.
+  finishDialog(!DIALOG_ACTIVE?.options.cancelLabel);
+});
+
+// ----------------------------------------------------------------------- //
 // Estructura: vistas y barra lateral                                        //
 // ----------------------------------------------------------------------- //
 
@@ -380,7 +463,7 @@ const JOB_STATUS = {
 const FILTERS = [
   ["all", "Todos"],
   ["completed", "Terminados"],
-  ["interrupted", "Retomables"],
+  ["interrupted", "Interrumpidos"],
   ["cancelled", "Cancelados"],
   ["error", "Con error"],
   ["saved", "Guardados"],
@@ -552,13 +635,20 @@ function jobActions(job) {
 
 async function deleteSavedJob(job) {
   const size = job.diskBytes ? ` (${fmtBytes(job.diskBytes)})` : "";
-  if (!confirm(`¿Eliminar permanentemente “${job.title || job.id}”${size}?\n\n`
-      + "Se borrarán el audio, stems, resultados e iteraciones. Esta acción no se puede deshacer.")) {
-    return;
-  }
+  const confirmed = await showConfirm({
+    title: "Eliminar trabajo",
+    message: `¿Quieres eliminar permanentemente “${job.title || job.id}”${size}?`,
+    detail: "Se borrarán el audio, los stems, los resultados y todas sus iteraciones. Esta acción no se puede deshacer.",
+    confirmLabel: "Eliminar definitivamente",
+  });
+  if (!confirmed) return;
   const response = await fetch(`/api/jobs/${job.id}`, {method: "DELETE"});
   const data = await response.json();
-  if (!response.ok) return alert(data.error || "No pude eliminar el trabajo.");
+  if (!response.ok) {
+    return showAlert(data.error || "No pude eliminar el trabajo.", {
+      title: "No se eliminó el trabajo",
+    });
+  }
   if (ITERATE_JOB_ID === job.id) {
     ITERATE_JOB_ID = null;
     syncGoLabel();
@@ -580,8 +670,16 @@ function setCancelButton(jobId, visible) {
 }
 
 async function cancelJob(jobId) {
-  if (!jobId || !confirm("¿Cancelar este trabajo?\n\n"
-      + "Scribix seguirá abierto y conservará los audios o stems completos.")) return;
+  if (!jobId) return;
+  const confirmed = await showConfirm({
+    title: "Cancelar trabajo",
+    message: "¿Quieres detener el trabajo que está en curso?",
+    detail: "Scribix seguirá abierto y conservará los audios o stems que ya estén completos.",
+    kind: "warning",
+    confirmLabel: "Detener trabajo",
+    cancelLabel: "Seguir procesando",
+  });
+  if (!confirmed) return;
   const button = document.getElementById("cancel-job");
   if (button.dataset.jobId === jobId) {
     button.disabled = true;
@@ -592,12 +690,16 @@ async function cancelJob(jobId) {
     response = await fetch(`/api/jobs/${jobId}/cancel`, {method: "POST"});
     data = await response.json();
   } catch (_) {
-    if (button.dataset.jobId === jobId) button.disabled = false;
-    return alert("No pude contactar con Scribix para cancelar el trabajo.");
+    if (button.dataset.jobId === jobId) setCancelButton(jobId, true);
+    return showAlert("No pude contactar con Scribix para cancelar el trabajo.", {
+      title: "Scribix no responde",
+    });
   }
   if (!response.ok) {
-    if (button.dataset.jobId === jobId) button.disabled = false;
-    return alert(data.error || "No pude cancelar el trabajo.");
+    if (button.dataset.jobId === jobId) setCancelButton(jobId, true);
+    return showAlert(data.error || "No pude cancelar el trabajo.", {
+      title: "No se canceló el trabajo",
+    });
   }
   if (button.dataset.jobId === jobId) setStage("Cancelando el trabajo…", true);
   await loadSavedJobs();
@@ -610,7 +712,11 @@ function cancelActiveJob() {
 async function openSavedJob(jobId) {
   const response = await fetch(`/api/jobs/${jobId}`, {cache: "no-store"});
   const job = await response.json();
-  if (!response.ok) return alert(job.error || "No pude abrir el trabajo.");
+  if (!response.ok) {
+    return showAlert(job.error || "No pude abrir el trabajo.", {
+      title: "No se pudo abrir",
+    });
+  }
   SELECTED_JOB = jobId;
   renderJobs();
   enableJobView(true);
@@ -636,7 +742,11 @@ async function openSavedJob(jobId) {
 async function prepareSavedIteration(jobId) {
   const response = await fetch(`/api/jobs/${jobId}`, {cache: "no-store"});
   const job = await response.json();
-  if (!response.ok) return alert(job.error || "No pude cargar el trabajo.");
+  if (!response.ok) {
+    return showAlert(job.error || "No pude cargar el trabajo.", {
+      title: "No se pudo cargar",
+    });
+  }
   setMode("ultra");
   ITERATE_JOB_ID = jobId;
   SELECTED_JOB = jobId;
@@ -682,7 +792,10 @@ async function translateSavedJob(jobId) {
     setMode("ultra");
     setView("new");
     document.getElementById("translate_to").focus();
-    return alert("Elige en el formulario un idioma de traducción o activa romaji.");
+    return showAlert("Elige en el formulario un idioma de traducción o activa romaji.", {
+      title: "Falta una opción de idioma",
+      kind: "info",
+    });
   }
   const fd = new FormData();
   fd.append("translate_to", target);
@@ -694,9 +807,15 @@ async function translateSavedJob(jobId) {
     });
     data = await response.json();
   } catch (_) {
-    return alert("No se pudo contactar con el servidor.");
+    return showAlert("No se pudo contactar con el servidor.", {
+      title: "Scribix no responde",
+    });
   }
-  if (!response.ok) return alert(data.error || "No pude iniciar la traducción.");
+  if (!response.ok) {
+    return showAlert(data.error || "No pude iniciar la traducción.", {
+      title: "No se inició la traducción",
+    });
+  }
   const job = await (await fetch(`/api/jobs/${jobId}`)).json();
   SELECTED_JOB = jobId;
   EXPANDED_JOB = null;
@@ -1024,15 +1143,30 @@ async function start() {
   if (MODE === "audio_only") {
     // Solo audio funciona con un link de YouTube.
     const url = document.getElementById("url").value.trim();
-    if (!url) return alert("Pega un link de YouTube para descargar el audio");
+    if (!url) {
+      return showAlert("Pega un link de YouTube para descargar el audio.", {
+        title: "Falta el enlace",
+        kind: "info",
+      });
+    }
     fd.append("url", url);
   } else if (SOURCE === "url") {
     const url = document.getElementById("url").value.trim();
-    if (!url) return alert("Pega un link de YouTube");
+    if (!url) {
+      return showAlert("Pega un link de YouTube para comenzar.", {
+        title: "Falta el enlace",
+        kind: "info",
+      });
+    }
     fd.append("url", url);
   } else {
     const f = document.getElementById("file").files[0];
-    if (!f) return alert("Elige un archivo");
+    if (!f) {
+      return showAlert("Elige un archivo de audio o video para comenzar.", {
+        title: "Falta el archivo",
+        kind: "info",
+      });
+    }
     fd.append("file", f);
   }
 
@@ -1195,6 +1329,9 @@ function showFiles(jobId, files, links) {
 
 function showRecovery(jobId, state) {
   enableJobView(true);
+  // No hay proceso vivo que cancelar. Esta vista puede aparecer mientras el
+  // botón aún dice “Cancelando…” tras perderse la conexión.
+  setCancelButton(jobId, false);
   clearSegmentView();
   document.getElementById("downloads").classList.add("hidden");
   resetPanels();

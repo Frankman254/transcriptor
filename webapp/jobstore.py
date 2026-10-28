@@ -377,6 +377,12 @@ def saved_job(job_id: str, *, running: bool = False) -> dict | None:
         status = "cancelled"
     elif completed:
         status = "completed"
+    elif manifest_status == "running":
+        # `running` solo describe memoria del proceso actual. Si quedó escrito
+        # en disco y el hub ya no conoce el trabajo, macOS o el servidor se
+        # cerraron: enseñarlo como activo crea un botón que no puede cancelar
+        # nada y además bloquea Eliminar en la interfaz.
+        status = "interrupted"
     elif assets.get("checkpoint"):
         status = "interrupted"
     else:

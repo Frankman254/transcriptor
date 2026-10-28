@@ -531,6 +531,82 @@ cite { color: var(--muted); font-style: normal; }
 .hidden { display: none !important; }
 
 /* --------------------------------------------------------------------- */
+/* Diálogo de la aplicación                                               */
+/* --------------------------------------------------------------------- */
+
+.app-dialog {
+  width: min(92vw, 460px); max-width: none; margin: auto; padding: 0;
+  color: var(--text); background: transparent; border: 0; overflow: visible;
+}
+.app-dialog::backdrop {
+  background: rgba(3, 5, 10, .72);
+  backdrop-filter: blur(5px);
+}
+.app-dialog[open] { animation: dialog-in .16s ease-out; }
+.app-dialog[open]::backdrop { animation: backdrop-in .16s ease-out; }
+@keyframes dialog-in {
+  from { opacity: 0; transform: translateY(8px) scale(.985); }
+}
+@keyframes backdrop-in { from { opacity: 0; } }
+
+.app-dialog-card {
+  padding: 22px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--surface) 96%, var(--accent) 4%);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .55), var(--shadow);
+}
+.app-dialog-heading { display: flex; align-items: flex-start; gap: 13px; }
+.app-dialog-icon {
+  display: grid; place-items: center; flex: none;
+  width: 36px; height: 36px; border-radius: 10px;
+  color: var(--accent-text); background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  font-size: 17px;
+}
+.app-dialog-kicker {
+  display: block; margin-bottom: 2px; color: var(--faint);
+  font-size: 10.5px; font-weight: 600; letter-spacing: .16em;
+  text-transform: uppercase;
+}
+.app-dialog h2 { margin: 0; font-size: 17px; line-height: 1.35; }
+.app-dialog-message {
+  margin: 16px 0 0; color: var(--muted); font-size: 13.5px;
+  line-height: 1.6; white-space: pre-line;
+}
+.app-dialog-detail {
+  margin: 12px 0 0; padding: 11px 12px; border-radius: var(--radius-sm);
+  color: var(--faint); background: var(--surface-2); border: 1px solid var(--border);
+  font-size: 12.5px; line-height: 1.55; white-space: pre-line;
+}
+.app-dialog-actions {
+  display: flex; justify-content: flex-end; gap: 9px; margin-top: 22px;
+}
+.app-dialog-button {
+  min-width: 96px; padding: 8px 14px; border-radius: 9px;
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.app-dialog-button.secondary {
+  color: var(--muted); background: transparent; border: 1px solid var(--border);
+}
+.app-dialog-button.secondary:hover { color: var(--text); border-color: var(--border-strong); }
+.app-dialog-button.primary {
+  color: var(--accent-fg); background: var(--accent); border: 1px solid var(--accent);
+}
+.app-dialog-button.primary:hover { filter: brightness(1.08); }
+
+.app-dialog.is-warning .app-dialog-icon {
+  color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent);
+  border-color: color-mix(in srgb, var(--warn) 28%, transparent);
+}
+.app-dialog.is-danger .app-dialog-icon {
+  color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 30%, transparent);
+}
+.app-dialog.is-danger .app-dialog-button.primary {
+  color: #230508; background: var(--danger); border-color: var(--danger);
+}
+
+/* --------------------------------------------------------------------- */
 /* Adaptación a pantallas estrechas                                       */
 /* --------------------------------------------------------------------- */
 
@@ -560,4 +636,7 @@ cite { color: var(--muted); font-style: normal; }
   .seg .t { min-width: 0; max-width: 38vw; overflow: hidden; text-overflow: ellipsis; }
   .brand small { display: none; }
   .brand-text { letter-spacing: .14em; }
+  .app-dialog-card { padding: 19px; }
+  .app-dialog-actions { flex-direction: column-reverse; }
+  .app-dialog-button { width: 100%; }
 }

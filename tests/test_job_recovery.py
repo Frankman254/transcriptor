@@ -137,6 +137,21 @@ class JobRecoveryTests(unittest.TestCase):
             record = jobstore.saved_job(job_id)
         self.assertEqual(record["status"], "cancelled")
 
+    def test_stale_running_manifest_is_listed_as_interrupted(self):
+        job_id, outdir = self.make_interrupted_job()
+        (outdir / "asr-input.wav").unlink()
+        (outdir / "roformer" / "vocals.wav").unlink()
+        jobstore.update_manifest(job_id, status="running",
+                                 title="Proceso que ya no existe")
+
+        with mock.patch.object(media, "ffprobe_duration", return_value=42.0):
+            stale = jobstore.saved_job(job_id, running=False)
+            live = jobstore.saved_job(job_id, running=True)
+
+        self.assertEqual(stale["status"], "interrupted")
+        self.assertFalse(stale["recoverable"])
+        self.assertEqual(live["status"], "running")
+
     def test_missing_job_state_is_a_404(self):
         response = routes_jobs.job_state("000000000000")
         self.assertEqual(response.status_code, 404)
