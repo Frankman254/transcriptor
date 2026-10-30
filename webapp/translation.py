@@ -297,52 +297,61 @@ def _run_lines(model: str, system: str, lines: list[str],
 
 
 def _translation_cache_path(cache_dir: Path, *, model: str, source: str,
-                            target: str, text: str) -> Path:
+                            target: str, text: str, system: str = "",
+                            context: str = "") -> Path:
     key = hashlib.sha256(
-        f"v1\0{model}\0{source}\0{target}\0{text}".encode("utf-8")
+        f"v2\0{model}\0{source}\0{target}\0{system}\0{context}\0{text}"
+        .encode("utf-8")
     ).hexdigest()
     return cache_dir / f"{key}.json"
 
 
 def _run_cached_lines(model: str, system: str, lines: list[str], *,
                       source: str, target: str, cache_dir: Path | None,
-                      progress=None) -> list[str]:
-    """Translate each distinct lyric once and reuse persistent chorus hits."""
+                      progress=None,
+                      contexts: list[str] | None = None) -> list[str]:
+    """Translate each distinct lyric+context once and reuse safe chorus hits."""
     if not cache_dir:
         return _run_lines(model, system, lines, progress)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    unique = list(dict.fromkeys(lines))
-    values: dict[str, str] = {}
-    missing: list[str] = []
-    for line in unique:
+    contexts = contexts or [""] * len(lines)
+    pairs = [(line, contexts[index] if index < len(contexts) else "")
+             for index, line in enumerate(lines)]
+    unique = list(dict.fromkeys(pairs))
+    values: dict[tuple[str, str], str] = {}
+    missing: list[tuple[str, str]] = []
+    for line, context in unique:
         path = _translation_cache_path(
-            cache_dir, model=model, source=source, target=target, text=line)
+            cache_dir, model=model, source=source, target=target, text=line,
+            system=system, context=context)
         try:
             value = json.loads(path.read_text(encoding="utf-8")).get("text")
         except Exception:  # noqa: BLE001
             value = None
         if isinstance(value, str) and value:
-            values[line] = value
+            values[(line, context)] = value
         else:
-            missing.append(line)
+            missing.append((line, context))
 
     def missing_progress(done: int, total: int) -> None:
         if progress:
             progress(len(unique) - len(missing) + done, len(unique))
 
-    produced = (_run_lines(model, system, missing, missing_progress)
+    produced = (_run_lines(model, system, [line for line, _ in missing],
+                           missing_progress)
                 if missing else [])
-    for original, translated in zip(missing, produced):
-        values[original] = translated
+    for (original, context), translated in zip(missing, produced):
+        values[(original, context)] = translated
         path = _translation_cache_path(
-            cache_dir, model=model, source=source, target=target, text=original)
+            cache_dir, model=model, source=source, target=target, text=original,
+            system=system, context=context)
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps({"text": translated}, ensure_ascii=False),
                              encoding="utf-8")
         temporary.replace(path)
     if progress and not missing:
         progress(len(unique), len(unique))
-    return [values.get(line, line) for line in lines]
+    return [values.get(pair, pair[0]) for pair in pairs]
 
 
 # --------------------------------------------------------------------------- #
@@ -400,6 +409,26 @@ def route_label(route: list[tuple[str, str]]) -> str:
     return " → ".join(names)
 
 
+_JAPANESE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")
+_LATIN_READING = re.compile(r"[A-Za-z]")
+
+
+def _valid_romaji(source: str, output: str) -> bool:
+    """Conservative coverage check for one romanized line.
+
+    It cannot prove a polyphonic reading is correct, but it catches the
+    destructive cases we can establish mechanically: blank output, Japanese
+    spans left untouched, or a response without any Latin reading.  Ambiguous
+    readings remain the local model's job and are documented as reviewable.
+    """
+    if not source.strip():
+        return not output.strip()
+    if not _JAPANESE.search(source):
+        return output.strip() == source.strip()
+    return bool(output.strip() and not _JAPANESE.search(output)
+                and _LATIN_READING.search(output))
+
+
 # --------------------------------------------------------------------------- #
 # API pública
 # --------------------------------------------------------------------------- #
@@ -418,8 +447,19 @@ def romanize(lines: list[str], *, model: str | None = None,
     if model:
         try:
             produced = _run_lines(model, _ROMAJI_SYSTEM, lines, progress)
-            if sum(1 for a, b in zip(lines, produced) if a != b) >= len(lines) // 2:
+            invalid = [index for index, (source, value) in
+                       enumerate(zip(lines, produced))
+                       if not _valid_romaji(source, value)]
+            if not invalid:
                 return produced, f"ollama:{model}"
+            fallback = romanize_offline(lines)
+            if fallback is not None:
+                for index in invalid:
+                    if _valid_romaji(lines[index], fallback[index]):
+                        produced[index] = fallback[index]
+                    else:
+                        produced[index] = lines[index]
+                return produced, f"ollama:{model}+pykakasi"
         except Exception:  # noqa: BLE001
             pass
     fallback = romanize_offline(lines)
@@ -444,7 +484,8 @@ def romanize_offline(lines: list[str]) -> list[str] | None:
 
 def translate(lines: list[str], *, source: str | None, target: str,
               model: str | None = None, progress=None,
-              cache_dir: Path | None = None) -> dict:
+              cache_dir: Path | None = None,
+              contexts: list[str] | None = None) -> dict:
     """Translate lyric lines, pivoting through English when the script demands.
 
     Returns the translated lines plus the metadata the UI and the Lyrixa
@@ -474,7 +515,7 @@ def translate(lines: list[str], *, source: str | None, target: str,
 
         current = _run_cached_lines(
             model, system, current, source=hop_source, target=hop_target,
-            cache_dir=cache_dir, progress=hop_progress)
+            cache_dir=cache_dir, progress=hop_progress, contexts=contexts)
 
     return {
         "lines": current,
@@ -510,9 +551,40 @@ def group_by_language(languages: list[str | None],
     return groups
 
 
+def _contiguous_groups(languages: list[str | None], fallback: str | None,
+                       track_ids: list[str | None] | None = None
+                       ) -> list[tuple[str | None, str | None, list[int]]]:
+    """Group adjacent lines without leaking context across songs.
+
+    A DJ mix can return to the same language many tracks later.  A global
+    language bucket makes those unrelated songs share one LLM batch; track id
+    plus adjacency is the correct context boundary.
+    """
+    ids = track_ids or [None] * len(languages)
+    groups: list[tuple[str | None, str | None, list[int]]] = []
+    for index, raw_code in enumerate(languages):
+        code = normalize_code(raw_code) or normalize_code(fallback)
+        track_id = ids[index] if index < len(ids) else None
+        if groups and groups[-1][0] == code and groups[-1][1] == track_id:
+            groups[-1][2].append(index)
+        else:
+            groups.append((code, track_id, [index]))
+    return groups
+
+
+def _neighbor_contexts(lines: list[str]) -> list[str]:
+    """Small read-only context fingerprint, bounded to one adjacent line."""
+    return [
+        "\u241e".join((lines[index - 1] if index else "",
+                        lines[index + 1] if index + 1 < len(lines) else ""))
+        for index in range(len(lines))
+    ]
+
+
 def translate_clip_lines(lines: list[str], languages: list[str | None], *,
                          source: str | None, target: str,
-                         romaji: bool, emit) -> dict:
+                         romaji: bool, emit,
+                         track_ids: list[str | None] | None = None) -> dict:
     """Romaniza y traduce las líneas ya confirmadas por el consenso.
 
     Se hace al final a propósito: traducir un texto que todavía puede cambiar
@@ -529,7 +601,7 @@ def translate_clip_lines(lines: list[str], languages: list[str | None], *,
     if not lines:
         return out
 
-    groups = group_by_language(languages, source)
+    groups = _contiguous_groups(languages, source, track_ids)
     errors: list[str] = []
     routes: list[str] = []
 
@@ -540,7 +612,7 @@ def translate_clip_lines(lines: list[str], languages: list[str | None], *,
     # `except` y dejando el romaji vacío sin que nadie se entere.
     romaji_lines: list[str] | None = None
     if romaji:
-        for code, indices in groups.items():
+        for code, _track_id, indices in groups:
             if code not in ROMANIZABLE:
                 continue
             emit("status", stage="romanizing",
@@ -570,7 +642,7 @@ def translate_clip_lines(lines: list[str], languages: list[str | None], *,
     # --- Traducción: una ruta por idioma de origen ---
     translated = list(lines)
     did_translate = False
-    for code, indices in groups.items():
+    for code, _track_id, indices in groups:
         route = plan_route(code, target)
         if not route:
             continue                    # ya está en el idioma de destino
@@ -579,9 +651,11 @@ def translate_clip_lines(lines: list[str], languages: list[str | None], *,
              message=(f"Traduciendo {len(indices)} líneas ya confirmadas · "
                       f"{label}…"))
         try:
+            group_lines = [lines[i] for i in indices]
             result = translate(
-                [lines[i] for i in indices], source=code, target=target,
+                group_lines, source=code, target=target,
                 cache_dir=DEFAULT_CACHE_DIR,
+                contexts=_neighbor_contexts(group_lines),
                 progress=lambda p: emit("progress", stage="translating",
                                         progress=p),
             )

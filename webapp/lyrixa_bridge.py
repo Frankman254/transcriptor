@@ -16,7 +16,7 @@ from __future__ import annotations
 # y solo lo tocan sus propias pruebas (docs/arquitectura.md).
 __all__ = [
     "BRIDGE_SCHEMA_VERSION", "LAYER_ROLES", "build_lyrixa_envelope",
-    "clip_languages", "clip_lines",
+    "clip_languages", "clip_lines", "clip_track_ids",
 ]
 
 import math
@@ -173,6 +173,9 @@ def _fallback_clip(segment: dict[str, Any], segment_index: int) -> dict[str, Any
     }
     if segment.get("language"):
         clip["language"] = segment["language"]
+    track = segment.get("track") or {}
+    if track.get("id"):
+        clip["trackId"] = str(track["id"])
     return clip
 
 
@@ -363,6 +366,7 @@ def segment_whisper_segment(
         return [fallback]
 
     spoken = segment.get("language")
+    track_id = (segment.get("track") or {}).get("id")
     clips: list[dict[str, Any]] = []
     for chunk in split_words(words):
         clip = {
@@ -385,6 +389,8 @@ def segment_whisper_segment(
             clip["agreement"] = round(sum(agreements) / len(agreements), 4)
         if spoken:
             clip["language"] = spoken
+        if track_id:
+            clip["trackId"] = str(track_id)
         clips.append(clip)
     return clips
 
@@ -403,6 +409,10 @@ def _merge_clips(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     if left.get("segmentIndex") != right.get("segmentIndex"):
         # A line stitched from two Whisper segments belongs to neither.
         merged.pop("segmentIndex", None)
+    if left.get("trackId") != right.get("trackId"):
+        # A safety merge across a track boundary has no single translation
+        # context, so it must not inherit either song's identity.
+        merged.pop("trackId", None)
     words = [*(left.get("words") or []), *(right.get("words") or [])]
     if words:
         merged["words"] = words
@@ -498,6 +508,12 @@ def clip_languages(whisper_data: dict[str, Any]) -> list[str | None]:
     line by the language it was sung in rather than by one value for the file.
     """
     return [clip.get("language") for clip
+            in normalize_whisper_segments(whisper_data.get("segments"))]
+
+
+def clip_track_ids(whisper_data: dict[str, Any]) -> list[str | None]:
+    """Track context parallel to :func:`clip_lines` for long mixes."""
+    return [clip.get("trackId") for clip
             in normalize_whisper_segments(whisper_data.get("segments"))]
 
 

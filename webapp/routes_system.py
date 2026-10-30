@@ -27,6 +27,8 @@ from catalogs import (
     PRECISION_LEVELS,
     SEPARATION_PROFILES,
     TARGET_LANGUAGES,
+    VIDEO_FORMATS,
+    VIDEO_QUALITIES,
 )
 
 # Un tope para que una llamada equivocada no ocupe Ollama media hora. Una capa
@@ -80,6 +82,8 @@ def info():
         "languages": [{"value": v, "label": l} for v, l in LANGUAGES],
         "audio_formats": AUDIO_FORMATS,
         "audio_qualities": AUDIO_QUALITIES,
+        "video_formats": VIDEO_FORMATS,
+        "video_qualities": VIDEO_QUALITIES,
         "separation_profiles": [
             {"value": value, "label": spec["label"], "hint": spec["hint"],
              "available": media.separation_profile_available(value)}

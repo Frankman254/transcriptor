@@ -16,7 +16,8 @@ from __future__ import annotations
 # Interfaz externa de este módulo; lo que no está aquí es seam interno
 # y solo lo tocan sus propias pruebas (docs/arquitectura.md).
 __all__ = [
-    "demucs_available", "download_audio", "ffprobe_duration", "measure_stems",
+    "demucs_available", "download_audio", "download_video", "ffprobe_duration",
+    "measure_stems", "video_download_args",
     "roformer_available", "separate_vocals", "separation_profile_available",
     "separator_acceleration",
 ]
@@ -32,7 +33,9 @@ from pathlib import Path
 
 import audio_analysis
 import paths
-from catalogs import SEPARATION_PROFILES, FORMATS_BY_VALUE
+from catalogs import (
+    FORMATS_BY_VALUE, SEPARATION_PROFILES, VIDEO_FORMATS_BY_VALUE,
+)
 
 
 def ffprobe_duration(path: Path) -> float:
@@ -64,6 +67,8 @@ _PP_LABELS = {
     "EmbedThumbnail": "Incrustando la carátula…",
     "FFmpegMetadata": "Escribiendo los metadatos…",
     "Metadata": "Escribiendo los metadatos…",
+    "Merger": "Uniendo video y audio…",
+    "VideoRemuxer": "Preparando el contenedor de video…",
 }
 
 
@@ -120,6 +125,38 @@ def audio_download_args(audio_format: str, quality: str) -> tuple[list[str], dic
     if spec["cover"]:
         args += ["--embed-thumbnail", "--convert-thumbnails", "jpg"]
     return args, spec
+
+
+def video_download_args(video_format: str, quality: str) -> tuple[list[str], dict]:
+    """Build a bounded yt-dlp selector for one video container/resolution."""
+    spec = VIDEO_FORMATS_BY_VALUE.get(video_format)
+    if spec is None:
+        spec = VIDEO_FORMATS_BY_VALUE["mp4"]
+    height = int(quality) if str(quality).isdigit() else None
+    height_filter = f"[height<={height}]" if height else ""
+    container = spec["value"]
+    if container == "mp4":
+        selector = (
+            f"bv*[ext=mp4]{height_filter}+ba[ext=m4a]/"
+            f"b[ext=mp4]{height_filter}/"
+            f"bv*{height_filter}+ba/b{height_filter}"
+        )
+    elif container == "webm":
+        selector = (
+            f"bv*[ext=webm]{height_filter}+ba[ext=webm]/"
+            f"b[ext=webm]{height_filter}/"
+            f"bv*{height_filter}+ba/b{height_filter}"
+        )
+    else:
+        selector = f"bv*{height_filter}+ba/b{height_filter}"
+    return [
+        "-f", selector,
+        "--merge-output-format", container,
+        "--remux-video", container,
+        "--embed-metadata",
+        "--parse-metadata", ":(?P<meta_description>)",
+        "--parse-metadata", ":(?P<meta_synopsis>)",
+    ], spec
 
 
 def download_audio(url: str, outdir: Path, emit, audio_format: str = "best",
@@ -206,6 +243,83 @@ def download_audio(url: str, outdir: Path, emit, audio_format: str = "best",
         raise RuntimeError("yt-dlp terminó pero no reportó el archivo descargado.")
     _id, title, dur, filepath = done_line.split("\t")
     duration = float(dur) if dur and dur != "NA" else 0.0
+    emit("progress", stage="downloading", progress=1.0)
+    return Path(filepath), title, duration
+
+
+def download_video(url: str, outdir: Path, emit, video_format: str = "mp4",
+                   quality: str = "1080",
+                   name_template: str = "%(title)s.%(ext)s", cancel=None,
+                   ) -> tuple[Path, str, float]:
+    """Download one video for personal local use, preserving live progress."""
+    extra, spec = video_download_args(video_format, quality)
+    quality_label = "máxima" if quality == "best" else f"hasta {quality}p"
+    emit("status", stage="downloading",
+         message=f"Descargando video {spec['label']} · {quality_label}…")
+    emit("progress", stage="downloading", progress=0.0)
+    cmd = [
+        "yt-dlp", "--no-simulate", "--no-playlist", "--newline", "--progress",
+        "--retries", "10", "--fragment-retries", "10",
+        "--concurrent-fragments", "4",
+        "--progress-template", _YT_PROGRESS_TMPL,
+        "--progress-template", "postprocess:@PP@%(progress.postprocessor)s",
+        "--print", "after_move:@DONE@%(id)s\t%(title)s\t%(duration)s\t%(filepath)s",
+        "-o", str(outdir / name_template),
+    ] + extra + [url]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        start_new_session=True,
+    )
+    if cancel:
+        cancel.register_process(proc)
+    tail: deque[str] = deque(maxlen=30)
+    done_line: str | None = None
+    last_pct = -1
+    last_pp = None
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if line.startswith("@DONE@"):
+                done_line = line[len("@DONE@"):]
+                continue
+            if line.startswith("@PP@"):
+                label = _PP_LABELS.get(line[len("@PP@"):].strip())
+                if label and label != last_pp:
+                    last_pp = label
+                    emit("status", stage="postprocessing", message=label)
+                    emit("progress", stage="postprocessing", progress=None)
+                continue
+            match = _PROG_RE.match(line)
+            if match:
+                got, total, fragment, fragment_total = match.groups()
+                fraction = None
+                if _pos_float(total):
+                    fraction = (_pos_float(got) or 0.0) / _pos_float(total)
+                elif _pos_float(fragment_total):
+                    fraction = ((_pos_float(fragment) or 0.0)
+                                / _pos_float(fragment_total))
+                if fraction is not None:
+                    pct = int(min(fraction, 1.0) * 100)
+                    if pct != last_pct:
+                        last_pct = pct
+                        emit("progress", stage="downloading",
+                             progress=min(fraction, 1.0))
+                continue
+            tail.append(line)
+        proc.wait()
+    finally:
+        if cancel:
+            cancel.unregister_process(proc)
+    if cancel:
+        cancel.check()
+    if proc.returncode != 0:
+        raise RuntimeError(_yt_dlp_error("\n".join(tail)))
+    if not done_line:
+        raise RuntimeError("yt-dlp terminó pero no reportó el video descargado.")
+    _video_id, title, duration_text, filepath = done_line.split("\t", 3)
+    duration = (float(duration_text)
+                if duration_text and duration_text != "NA" else 0.0)
     emit("progress", stage="downloading", progress=1.0)
     return Path(filepath), title, duration
 

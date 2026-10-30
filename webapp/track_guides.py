@@ -31,7 +31,7 @@ from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable
-from textjoin import space_prefixes
+from textjoin import is_no_space_char, space_prefixes
 
 
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
@@ -169,6 +169,52 @@ def _fold(value: str) -> str:
     value = unicodedata.normalize("NFKD", value or "")
     value = "".join(char for char in value if not unicodedata.combining(char))
     return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _lyric_char(char: str) -> str:
+    """Normalize one lyric character without erasing its writing system."""
+    # Katakana and hiragana are alternate spellings of the same Japanese
+    # reading.  Folding the common katakana block makes a sung loanword
+    # comparable without transliterating it or confusing it with Hangul.
+    code = ord(char)
+    if 0x30A1 <= code <= 0x30F6:
+        return chr(code - 0x60)
+    return char.casefold()
+
+
+def _lyric_units(value: str) -> list[str]:
+    """Comparable lyric units that retain kana, Han and Hangul.
+
+    Metadata matching deliberately remains Latin-only in :func:`_fold`.
+    Lyrics need a different representation: CJK characters are useful units,
+    while adjacent Latin letters/digits remain words so the established
+    English/Spanish scoring does not become character-based overnight.
+    """
+    normalized = unicodedata.normalize("NFKC", value or "")
+    units: list[str] = []
+    latin_run: list[str] = []
+
+    def flush() -> None:
+        if latin_run:
+            units.append("".join(latin_run))
+            latin_run.clear()
+
+    for char in normalized:
+        category = unicodedata.category(char)
+        if char.isascii() and char.isalnum():
+            latin_run.append(char.casefold())
+        elif category.startswith(("L", "N")):
+            flush()
+            units.append(_lyric_char(char))
+        else:
+            flush()
+    flush()
+    return units
+
+
+def _lyric_key(value: str) -> str:
+    """Stable Unicode key for lyric text; punctuation alone has no key."""
+    return "\u2063".join(_lyric_units(value))
 
 
 def _search_title(value: str) -> str:
@@ -541,7 +587,7 @@ def prompt_spans(guide: dict | None, max_chars: int = 1400) -> list[dict]:
         seen: set[str] = set()
         lines = []
         for line in reference_lines(track.get("reference")):
-            key = _fold(line)
+            key = _lyric_key(line)
             if key and key not in seen:
                 seen.add(key)
                 lines.append(line)
@@ -567,16 +613,57 @@ def prompt_at(spans: list[dict], start: float, end: float) -> str | None:
 
 
 def _line_score(heard: str, reference: str) -> float:
-    heard_tokens = _fold(heard).split()
-    ref_tokens = _fold(reference).split()
+    heard_tokens = _lyric_units(heard)
+    ref_tokens = _lyric_units(reference)
     if not heard_tokens or not ref_tokens:
         return 0.0
     common = sum((Counter(heard_tokens) & Counter(ref_tokens)).values())
     coverage = common / len(heard_tokens)
     precision = common / len(ref_tokens)
-    sequence = SequenceMatcher(None, " ".join(heard_tokens),
-                               " ".join(ref_tokens)).ratio()
-    return 0.45 * sequence + 0.35 * coverage + 0.20 * precision
+    sequence = SequenceMatcher(None, heard_tokens, ref_tokens).ratio()
+    score = 0.45 * sequence + 0.35 * coverage + 0.20 * precision
+    # A short substitution inside an otherwise identical CJK line often
+    # represents Whisper spelling a reading phonetically.  Reward matching
+    # context at both edges very slightly; unrelated lines still score far
+    # below the acceptance gate.
+    if (heard_tokens[0] == ref_tokens[0]
+            and heard_tokens[-1] == ref_tokens[-1]
+            and min(coverage, precision) >= 0.70):
+        score += 0.02
+    return min(score, 1.0)
+
+
+def _reference_tokens(reference: str, words: list[dict]) -> list[str]:
+    """Split a reference without turning a whole Japanese line into one word.
+
+    Whisper already measured useful acoustic intervals.  For no-space scripts
+    we partition the corrected surface across those intervals, weighted by
+    how much source text each interval carried.  This preserves the exact
+    reference string and the measured first/last boundaries.
+    """
+    spaced = [token for token in reference.split() if token.strip()]
+    if (len(spaced) > 1 or not words
+            or not any(is_no_space_char(char) for char in reference)):
+        return spaced
+    chars = list(reference.strip())
+    if not chars:
+        return []
+    count = min(len(words), len(chars))
+    if count == 1:
+        return ["".join(chars)]
+    weights = [max(len(_lyric_units(word.get("word", ""))), 1)
+               for word in words[:count]]
+    total_weight = sum(weights)
+    cuts = [0]
+    consumed = 0
+    for index, weight in enumerate(weights[:-1], start=1):
+        consumed += weight
+        target = round(len(chars) * consumed / total_weight)
+        minimum = cuts[-1] + 1
+        maximum = len(chars) - (count - index)
+        cuts.append(min(max(target, minimum), maximum))
+    cuts.append(len(chars))
+    return ["".join(chars[left:right]) for left, right in zip(cuts, cuts[1:])]
 
 
 def _resync_words(item: dict, reference: str) -> None:
@@ -593,7 +680,7 @@ def _resync_words(item: dict, reference: str) -> None:
     folds to nothing, and gets its times redistributed proportionally instead.
     """
     words = item.get("words") or []
-    tokens = [token for token in reference.split() if token.strip()]
+    tokens = _reference_tokens(reference, words)
     if not words or not tokens:
         return
 
@@ -607,26 +694,38 @@ def _resync_words(item: dict, reference: str) -> None:
     m = len(tokens)
     token_start = [0.0] * m
     token_end = [0.0] * m
+    if not anchor_of:
+        if m == len(words):
+            token_start[:] = heard_start
+            token_end[:] = heard_end
+        else:
+            full_start, full_end = heard_start[0], heard_end[-1]
+            step = max(full_end - full_start, 0.02 * m) / m
+            for index in range(m):
+                token_start[index] = full_start + step * index
+                token_end[index] = (full_end if index == m - 1
+                                    else full_start + step * (index + 1))
     for ref_index, heard_index in anchor_of.items():
         token_start[ref_index] = heard_start[heard_index]
         token_end[ref_index] = heard_end[heard_index]
 
     # Unmatched reference words split the gap between their nearest anchors.
-    last = -1
-    for ref_index in range(m):
-        if ref_index in anchor_of:
-            last = ref_index
-            continue
-        nxt = next((k for k in range(ref_index + 1, m) if k in anchor_of), None)
-        left_end = (heard_end[anchor_of[last]] if last >= 0
-                    else heard_start[0])
-        right_start = (heard_start[anchor_of[nxt]] if nxt is not None
-                       else heard_end[-1])
-        run = (nxt if nxt is not None else m) - last
-        offset = ref_index - last
-        span = max(right_start - left_end, 0.02 * run)
-        token_start[ref_index] = left_end + span * (offset - 1) / run
-        token_end[ref_index] = left_end + span * offset / run
+    if anchor_of:
+        last = -1
+        for ref_index in range(m):
+            if ref_index in anchor_of:
+                last = ref_index
+                continue
+            nxt = next((k for k in range(ref_index + 1, m) if k in anchor_of), None)
+            left_end = (heard_end[anchor_of[last]] if last >= 0
+                        else heard_start[0])
+            right_start = (heard_start[anchor_of[nxt]] if nxt is not None
+                           else heard_end[-1])
+            run = (nxt if nxt is not None else m) - last
+            offset = ref_index - last
+            span = max(right_start - left_end, 0.02 * run)
+            token_start[ref_index] = left_end + span * (offset - 1) / run
+            token_end[ref_index] = left_end + span * offset / run
 
     # Keep the timeline strictly increasing: interpolation can make neighbours
     # touch, and downstream consumers expect a monotone word stream.
@@ -688,12 +787,13 @@ def refine_segments(segments: list[dict], guide: dict | None) -> list[dict]:
     for segment in segments:
         item = dict(segment)
         midpoint = (float(item.get("start", 0)) + float(item.get("end", 0))) / 2
-        track = next((track for track in tracks
-                      if float(track.get("start", 0)) <= midpoint <
-                      float(track.get("end", float("inf")))), None)
-        if not track:
+        track_index = next((index for index, candidate in enumerate(tracks)
+                            if float(candidate.get("start", 0)) <= midpoint <
+                            float(candidate.get("end", float("inf")))), None)
+        if track_index is None:
             out.append(item)
             continue
+        track = tracks[track_index]
         lines = reference_lines(track.get("reference"))
         candidates = list(lines)
         candidates.extend(
@@ -703,13 +803,13 @@ def refine_segments(segments: list[dict], guide: dict | None) -> list[dict]:
         if candidates:
             best = max(candidates, key=lambda line: _line_score(item.get("text", ""), line))
             score = _line_score(item.get("text", ""), best)
-            heard_count = len(_fold(item.get("text", "")).split())
-            ref_count = len(_fold(best).split())
+            heard_count = len(_lyric_units(item.get("text", "")))
+            ref_count = len(_lyric_units(best))
             balanced = ref_count <= heard_count * 2 + 2 and heard_count <= ref_count * 2 + 2
             # Una línea que `_fold` deja vacía (japonés, coreano…) no es
             # "corta y exacta": "" == "" la cambiaba por la primera línea.
             exact_short = (1 <= heard_count <= 2
-                           and _fold(item.get("text", "")) == _fold(best))
+                           and _lyric_key(item.get("text", "")) == _lyric_key(best))
             if (score >= 0.76 and balanced and heard_count >= 3) or exact_short:
                 item["text"] = best
                 item["referenceScore"] = round(score, 4)
@@ -719,6 +819,8 @@ def refine_segments(segments: list[dict], guide: dict | None) -> list[dict]:
                 # line's boundaries, silently.
                 _resync_words(item, best)
         item["track"] = {
+            "id": (track.get("id") or
+                   f"track-{track_index:04d}-{round(float(track.get('start', 0)) * 1000)}"),
             "artist": track.get("artist", ""), "title": track.get("title", ""),
         }
         out.append(item)

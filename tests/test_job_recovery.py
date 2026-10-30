@@ -168,6 +168,24 @@ class JobRecoveryTests(unittest.TestCase):
         self.assertEqual(record["files"]["vocals"]["url"],
                          f"/api/jobs/{job_id}/stems/vocals")
 
+    def test_completed_video_job_reopens_as_video_not_audio(self):
+        job_id = "c1d2e3f4a5b6"
+        outdir = self.output / job_id
+        outdir.mkdir()
+        video = outdir / "Mix visual.mp4"
+        video.write_bytes(b"video")
+        jobstore.update_manifest(
+            job_id, status="completed", mode="video_only",
+            title="Mix visual", duration=120.0,
+            files={"video": video.name},
+        )
+        with mock.patch.object(media, "ffprobe_duration", return_value=120.0):
+            record = jobstore.saved_job(job_id)
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["files"]["video"], video.name)
+        self.assertNotIn("audio", record["files"])
+        self.assertIn("/download/", record["links"]["video"])
+
     def test_iterating_archives_small_outputs_but_keeps_large_audio(self):
         job_id, outdir = self.make_interrupted_job()
         jobstore.update_manifest(job_id, status="completed",

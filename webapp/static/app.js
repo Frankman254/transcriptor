@@ -149,6 +149,7 @@ function syncGoLabel() {
   document.getElementById("go").textContent = ITERATE_JOB_ID
     ? "Reanalizar usando la voz guardada"
     : MODE === "audio_only" ? "Descargar audio"
+    : MODE === "video_only" ? "Descargar video"
     : MODE === "ultra" ? "Sacar letra ultra precisa"
     : MODE === "lyrics" ? "Sacar letra" : "Transcribir";
 }
@@ -175,7 +176,9 @@ const SEPARATES = m => m === "lyrics" || m === "ultra";
 // letra el backend usa siempre el original (separa mejor la voz).
 function syncAudioOpts() {
   document.getElementById("audio-opts").classList.toggle(
-    "hidden", SOURCE !== "url" || SEPARATES(MODE));
+    "hidden", SOURCE !== "url" || SEPARATES(MODE) || MODE === "video_only");
+  document.getElementById("video-opts").classList.toggle(
+    "hidden", SOURCE !== "url" || MODE !== "video_only");
   document.getElementById("separator-opts").classList.toggle(
     "hidden", !SEPARATES(MODE));
   document.getElementById("ultra-opts").classList.toggle(
@@ -273,6 +276,12 @@ function onFormatChange() {
   document.getElementById("fmt-hint").textContent = spec ? spec.hint : "";
 }
 
+function onVideoFormatChange() {
+  const value = document.getElementById("video_format").value;
+  const spec = (INFO?.video_formats || []).find(item => item.value === value);
+  document.getElementById("video-fmt-hint").textContent = spec ? spec.hint : "";
+}
+
 function onSeparationChange() {
   const value = document.getElementById("separation_quality").value;
   const spec = (INFO?.separation_profiles || []).find(p => p.value === value);
@@ -287,6 +296,7 @@ function onSeparationChange() {
 
 function setMode(m) {
   MODE = m;
+  if (m === "video_only" && SOURCE !== "url") setSource("url");
   document.querySelectorAll(".tab[data-mode]").forEach(t => {
     const on = t.dataset.mode === m;
     t.classList.toggle("active", on);
@@ -296,8 +306,9 @@ function setMode(m) {
   // El panel agrupado se presenta como el panel del tab activo.
   document.getElementById("mode-panel")
     .setAttribute("aria-labelledby", "mode-tab-" + m);
-  // En "solo audio" no hacen falta modelo ni idioma; en letra sí (usa Whisper).
-  document.getElementById("opts").classList.toggle("hidden", m === "audio_only");
+  // Las descargas directas no necesitan Whisper ni selector de idioma.
+  document.getElementById("opts").classList.toggle(
+    "hidden", m === "audio_only" || m === "video_only");
   if (m !== "ultra") ITERATE_JOB_ID = null;
   syncGoLabel();
   const hints = {
@@ -308,6 +319,8 @@ function setMode(m) {
            "revisar solo las zonas dudosas en el audio original. Detecta el " +
            "idioma tramo por tramo, así que un mix con canciones en japonés y " +
            "en inglés se transcribe y se traduce bien en las dos partes.",
+    video_only: "Descarga el video y su audio en el mejor flujo disponible " +
+                "hasta la resolución elegida. Función local para uso personal.",
   };
   const hint = document.getElementById("mode-hint");
   hint.textContent = hints[m] || "";
@@ -363,6 +376,7 @@ const STAGE_LABELS = {
 
 // Cómo presentar cada archivo del resultado. El orden manda en la fila.
 const FILE_KINDS = [
+  ["video", "🎞️", "Video"],
   ["audio", "⬇️", "Audio"],
   ["vocals", "🎤", "Voz aislada"],
   ["instrumental", "🎹", "Instrumental sin voz"],
@@ -871,6 +885,22 @@ async function loadInfo() {
     if (q === "192K") o.selected = true;
     qs.appendChild(o);
   });
+  const vfs = document.getElementById("video_format");
+  (INFO.video_formats || []).forEach(format => {
+    const option = document.createElement("option");
+    option.value = format.value;
+    option.textContent = format.label;
+    if (format.value === "mp4") option.selected = true;
+    vfs.appendChild(option);
+  });
+  const vqs = document.getElementById("video_quality");
+  (INFO.video_qualities || []).forEach(quality => {
+    const option = document.createElement("option");
+    option.value = quality.value;
+    option.textContent = quality.label;
+    if (quality.value === "1080") option.selected = true;
+    vqs.appendChild(option);
+  });
   const ss = document.getElementById("separation_quality");
   INFO.separation_profiles.forEach(p => {
     const o = document.createElement("option");
@@ -916,6 +946,7 @@ async function loadInfo() {
   onTranslateChange();
   onSeparationChange();
   onFormatChange();
+  onVideoFormatChange();
   syncAudioOpts();
 }
 
@@ -1129,6 +1160,8 @@ async function start() {
   fd.append("mode", MODE);
   fd.append("audio_format", document.getElementById("audio_format").value);
   fd.append("audio_quality", document.getElementById("audio_quality").value);
+  fd.append("video_format", document.getElementById("video_format").value);
+  fd.append("video_quality", document.getElementById("video_quality").value);
   fd.append("separation_quality", document.getElementById("separation_quality").value);
   fd.append("precision_level", document.getElementById("precision_level").value);
   fd.append("asr_engine", document.getElementById("asr_engine").value);
@@ -1140,11 +1173,12 @@ async function start() {
     ? document.getElementById("tracklist_text").value : "");
   fd.append("fetch_lyrics", document.getElementById("fetch_lyrics").checked ? "1" : "0");
 
-  if (MODE === "audio_only") {
-    // Solo audio funciona con un link de YouTube.
+  if (MODE === "audio_only" || MODE === "video_only") {
+    // Las descargas directas funcionan con un link de YouTube.
     const url = document.getElementById("url").value.trim();
     if (!url) {
-      return showAlert("Pega un link de YouTube para descargar el audio.", {
+      const kind = MODE === "video_only" ? "video" : "audio";
+      return showAlert(`Pega un link de YouTube para descargar el ${kind}.`, {
         title: "Falta el enlace",
         kind: "info",
       });
@@ -1179,7 +1213,8 @@ async function start() {
   document.getElementById("downloads").innerHTML = "";
   document.getElementById("err").textContent = "";
   resetPanels();
-  setBadges({ model: MODE === "audio_only" ? null : model, device: INFO.device });
+  setBadges({ model: ["audio_only", "video_only"].includes(MODE) ? null : model,
+              device: INFO.device });
   setStage("Iniciando…", true);
   setProgress(0);
 

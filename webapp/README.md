@@ -14,6 +14,13 @@ Tiene cuatro modos:
   añadirse después desde Trabajos guardados. Ver [Modo ultra](#modo-ultra).
 - **⬇️ Solo audio** — descarga un YouTube en MP3, M4A, Opus, OGG,
   FLAC, ALAC, WAV o en su formato original, sin transcribir.
+- **🎞️ Solo video** — descarga local para uso personal en MP4, MKV o WebM,
+  con límite de 360p, 480p, 720p, 1080p, 1440p, 2160p o máxima disponible.
+  Une video y audio con ffmpeg sin ejecutar Whisper.
+
+Los modos de descarga de YouTube son exclusivamente para el uso personal de
+esta instalación local. No se incluyen en builds, imágenes ni servicios que
+se distribuyan o cobren.
 
 ## Requisitos (ya instalados en esta máquina)
 - `python3`
@@ -187,7 +194,9 @@ La referencia participa de dos maneras conservadoras:
 - **Japonés → romaji**: lo hace el modelo local, que sabe la lectura *en
   contexto* (君の名は → `kimi no na wa`). `pykakasi` queda de respaldo sin
   conexión, pero es un diccionario sin análisis morfológico y produce
-  `kun no mei ha`.
+  `kun no mei ha`. Cada salida se valida: si queda japonés sin convertir, está
+  vacía o no contiene lectura latina, solo esa línea vuelve a `pykakasi`; el
+  resto de la respuesta válida se conserva.
 - **Traducción con pivote**: los idiomas de escritura no latina pasan por
   inglés (ruso → inglés → español). Es la ruta con más masa de entrenamiento
   en cualquier modelo que quepa en esta máquina.
@@ -195,9 +204,34 @@ La referencia participa de dos maneras conservadoras:
   vuelve mal, se reintenta y luego se traduce línea por línea. Si aun así falla
   una, se conserva el original. Una línea sin traducir se ve; una capa
   desplazada, no.
+- **Contexto aislado por canción**: la representación intermedia de cada clip
+  conserva `trackId`, idioma, orden, texto, tiempos por palabra, procedencia y
+  acuerdo. Romaji y traducción agrupan únicamente líneas contiguas del mismo
+  track e idioma; cada lote conserva hasta 32 líneas contiguas. Dos canciones
+  japonesas nunca comparten lote solo por tener el mismo idioma.
 - **Optativa y diferida**: el valor inicial es *Sin traducción*. Desde Trabajos
   guardados se puede añadir/cambiar la capa sin repetir Whisper. Coros y líneas
-  ya traducidas se reutilizan desde `output/.translation-cache`.
+  ya traducidas se reutilizan desde `output/.translation-cache`. La caché v2
+  incluye modelo, versión de prompt/ruta, texto y una huella limitada a la
+  línea anterior y posterior:
+  un estribillo se reutiliza cuando su contexto equivale, pero no hereda el
+  sentido de otra canción.
+
+### Referencias CJK y límites conocidos
+
+La coincidencia de metadatos sigue siendo latina, mientras que la letra usa
+una clave Unicode separada que conserva kana, kanji y hangul. Una clave vacía
+nunca coincide. La referencia solo sustituye una hipótesis cuando supera el
+umbral de similitud dentro del track y conserva los intervalos ya medidos; no
+crea una alineación acústica nueva ni demuestra que LRCLIB tenga la versión del
+remix.
+
+El cortador penaliza límites dentro de escritura sin espacios y favorece
+puntuación, pausas y cambios de escritura. No hay un analizador morfológico
+japonés obligatorio: los límites ambiguos y las lecturas polifónicas siguen
+necesitando escucha humana. La ruta japonés → inglés → español tampoco se
+cambia globalmente hasta compararla con japonés → español sobre un conjunto
+real etiquetado.
 
 ### Salidas
 

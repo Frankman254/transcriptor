@@ -1,0 +1,56 @@
+{
+  "description": "Casos sintéticos mínimos para referencias CJK, romaji y límites de subtítulo; no contienen una letra completa.",
+  "referenceMatches": [
+    {
+      "heard": "はしゃいちゃうのも",
+      "reference": "はしゃいじゃうのも",
+      "shouldMatch": true
+    },
+    {
+      "heard": "落ち込むのもと",
+      "reference": "落ち込むのも",
+      "shouldMatch": true
+    },
+    {
+      "heard": "まだ見えないけど",
+      "reference": "まだ慣れないけど",
+      "shouldMatch": true
+    },
+    {
+      "heard": "夢の続きを探す",
+      "reference": "朝の光を浴びる",
+      "shouldMatch": false
+    }
+  ],
+  "safeBoundaries": [
+    {
+      "tokens": ["少", "し", "ずつ", "変わって", "く", "よ"],
+      "forbiddenCut": 1
+    },
+    {
+      "tokens": ["終わらない", "Future", "へ"],
+      "preferredCut": 1
+    }
+  ],
+  "trackGroups": [
+    {"text": "君を探す", "language": "ja", "trackId": "track-a"},
+    {"text": "夜を越える", "language": "ja", "trackId": "track-a"},
+    {"text": "空に歌う", "language": "ja", "trackId": "track-b"}
+  ],
+  "layerDemo": [
+    {
+      "original": "まだ慣れないけど",
+      "romaji": "mada narenai kedo",
+      "spanish": "Quizá aún no me acostumbro",
+      "start": 0.0,
+      "end": 2.4
+    },
+    {
+      "original": "少しずつ変わってくよ",
+      "romaji": "sukoshi zutsu kawatteku yo",
+      "spanish": "Iré cambiando poco a poco",
+      "start": 2.5,
+      "end": 5.0
+    }
+  ]
+}

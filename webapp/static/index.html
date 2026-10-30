@@ -109,6 +109,7 @@
             <div class="tab" role="tab" id="mode-tab-lyrics" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="lyrics" onclick="setMode('lyrics')">🎤 Letra</div>
             <div class="tab" role="tab" id="mode-tab-ultra" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="ultra" onclick="setMode('ultra')">🎯 Letra ultra precisa</div>
             <div class="tab" role="tab" id="mode-tab-audio_only" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="audio_only" onclick="setMode('audio_only')">⬇️ Solo audio</div>
+            <div class="tab" role="tab" id="mode-tab-video_only" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="video_only" onclick="setMode('video_only')">🎞️ Solo video</div>
           </div>
           <p class="hint hidden" id="mode-hint"></p>
 
@@ -139,6 +140,21 @@
                 </div>
               </div>
               <p class="hint" id="fmt-hint"></p>
+            </div>
+
+            <div id="video-opts" class="hidden">
+              <div class="row">
+                <div>
+                  <label for="video_format">Formato de video</label>
+                  <select id="video_format" onchange="onVideoFormatChange()"></select>
+                </div>
+                <div>
+                  <label for="video_quality">Calidad máxima</label>
+                  <select id="video_quality"></select>
+                </div>
+              </div>
+              <p class="hint" id="video-fmt-hint"></p>
+              <p class="hint">Uso personal local. La disponibilidad real depende de las calidades publicadas por el video.</p>
             </div>
 
             <div id="separator-opts" class="hidden">

@@ -19,6 +19,7 @@ __all__ = [
     "ASR_ENGINES", "AUDIO_FORMATS", "AUDIO_QUALITIES", "FORMATS_BY_VALUE",
     "LANGUAGES", "MODELS", "MODEL_ARTIFACTS", "MODEL_DETAILS",
     "PRECISION_LEVELS", "SEPARATION_PROFILES", "TARGET_LANGUAGES",
+    "VIDEO_FORMATS", "VIDEO_FORMATS_BY_VALUE", "VIDEO_QUALITIES",
 ]
 
 # Modelos que ofrecemos en la interfaz (nombre -> etiqueta amigable).
@@ -100,6 +101,28 @@ AUDIO_FORMATS = [
 
 # Bitrates para los formatos con pérdida (mp3/m4a/opus/vorbis).
 AUDIO_QUALITIES = ["320K", "256K", "192K", "128K", "96K"]
+
+# Contenedores y límites de resolución del modo local "Solo video". yt-dlp
+# elige el mejor códec disponible dentro de cada contenedor y ffmpeg une las
+# pistas sin recodificarlas siempre que el origen lo permita.
+VIDEO_FORMATS = [
+    {"value": "mp4", "label": "MP4 · recomendado",
+     "hint": "La opción más compatible con móviles, televisores y editores."},
+    {"value": "mkv", "label": "MKV · máxima compatibilidad de códecs",
+     "hint": "Acepta casi cualquier pista original sin perder calidad."},
+    {"value": "webm", "label": "WebM · abierto y eficiente",
+     "hint": "Ideal para navegadores modernos y video VP9/AV1."},
+]
+VIDEO_FORMATS_BY_VALUE = {item["value"]: item for item in VIDEO_FORMATS}
+VIDEO_QUALITIES = [
+    {"value": "best", "label": "Máxima disponible"},
+    {"value": "2160", "label": "Hasta 2160p · 4K"},
+    {"value": "1440", "label": "Hasta 1440p · 2K"},
+    {"value": "1080", "label": "Hasta 1080p · Full HD"},
+    {"value": "720", "label": "Hasta 720p · HD"},
+    {"value": "480", "label": "Hasta 480p"},
+    {"value": "360", "label": "Hasta 360p · ligero"},
+]
 
 # Perfiles de aislamiento. BS-RoFormer es la opción de mayor precisión; Demucs
 # queda disponible como alternativa equilibrada o rápida.

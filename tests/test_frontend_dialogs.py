@@ -8,6 +8,16 @@ STATIC = ROOT / "webapp" / "static"
 
 
 class FrontendDialogTests(unittest.TestCase):
+    def test_video_download_mode_has_format_and_quality_controls(self):
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        javascript = (STATIC / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('data-mode="video_only"', html)
+        self.assertIn('id="video_format"', html)
+        self.assertIn('id="video_quality"', html)
+        self.assertIn('fd.append("video_format"', javascript)
+        self.assertIn('["video", "🎞️", "Video"]', javascript)
+
     def test_native_browser_dialogs_are_not_used(self):
         javascript = (STATIC / "app.js").read_text(encoding="utf-8")
 

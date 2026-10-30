@@ -25,6 +25,11 @@ Nightcore Tracklist:
 00:06:00 Artist C - Third Song
 """
 
+JA_CASES = json.loads(
+    (ROOT / "tests" / "fixtures" / "japanese_precision_cases.json")
+    .read_text(encoding="utf-8")
+)
+
 
 class TrackGuideTests(unittest.TestCase):
     def test_named_sections_and_artist_title_are_parsed(self):
@@ -177,6 +182,59 @@ class TrackGuideTests(unittest.TestCase):
         self.assertEqual(refined[0]["words"][0]["word"], "夢の続き")
         self.assertNotIn("referenceScore", refined[0])
         self.assertEqual(refined[1]["text"], "♪")
+
+
+class CjkReferenceTests(unittest.TestCase):
+    def test_unicode_lyric_keys_keep_scripts_but_reject_empty_noise(self):
+        self.assertTrue(guides._lyric_key("はしゃいじゃう"))
+        self.assertTrue(guides._lyric_key("少しずつ"))
+        self.assertTrue(guides._lyric_key("어느 날"))
+        self.assertFalse(guides._lyric_key("♪ … !!!"))
+        self.assertFalse(guides._lyric_key(""))
+        self.assertNotEqual(guides._lyric_key("かな"),
+                            guides._lyric_key("가나"))
+
+    def test_synthetic_reference_pairs_have_the_expected_gate(self):
+        for case in JA_CASES["referenceMatches"]:
+            with self.subTest(case=case):
+                matched = guides._line_score(
+                    case["heard"], case["reference"]) >= 0.76
+                self.assertEqual(matched, case["shouldMatch"])
+
+    def test_japanese_reference_lines_are_available_to_the_right_track(self):
+        guide = {"tracks": [{
+            "start": 0, "end": 30,
+            "reference": {"plain": "少しずつ変わってくよ\n少しずつ変わってくよ"},
+        }]}
+        spans = guides.prompt_spans(guide)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["prompt"], "少しずつ変わってくよ")
+
+    def test_cjk_reference_reuses_multiple_measured_word_intervals(self):
+        reference = "少しずつ変わってくよ"
+        guide = {"tracks": [{
+            "start": 0, "end": 30, "artist": "A", "title": "B",
+            "reference": {"plain": reference},
+        }]}
+        segment = {
+            "start": 2, "end": 5, "text": "しずつ変わってくよ",
+            "words": [
+                {"word": "しずつ", "start": 2.0, "end": 3.0},
+                {"word": "変わって", "start": 3.0, "end": 4.1},
+                {"word": "くよ", "start": 4.1, "end": 5.0},
+            ],
+        }
+        refined = guides.refine_segments([segment], guide)[0]
+        self.assertEqual(refined["text"], reference)
+        self.assertGreater(len(refined["words"]), 1)
+        self.assertEqual("".join(w["word"].strip() for w in refined["words"]),
+                         reference)
+        self.assertEqual(refined["words"][0]["start"], 2.0)
+        self.assertEqual(refined["words"][-1]["end"], 5.0)
+        self.assertTrue(all(
+            left["end"] <= right["start"]
+            for left, right in zip(refined["words"], refined["words"][1:])
+        ))
 
 
 class ReferencePlausibilityTests(unittest.TestCase):

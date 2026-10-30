@@ -5,6 +5,7 @@ translation layer from the lyrics, so they are covered here; the actual
 language quality is the local model's job.
 """
 
+import json
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "webapp"))
 
 import translation as T  # noqa: E402
+
+JA_CASES = json.loads(
+    (ROOT / "tests" / "fixtures" / "japanese_precision_cases.json")
+    .read_text(encoding="utf-8")
+)
 
 
 class LanguageCodeTests(unittest.TestCase):
@@ -110,6 +116,22 @@ class OfflineRomanizationTests(unittest.TestCase):
             self.skipTest("pykakasi no está instalado")
         self.assertEqual(len(result), len(lines))
 
+    def test_romaji_validator_rejects_unconverted_or_empty_japanese(self):
+        self.assertFalse(T._valid_romaji("少しずつ", "少しずつ"))
+        self.assertFalse(T._valid_romaji("少しずつ", ""))
+        self.assertTrue(T._valid_romaji("少しずつ", "sukoshi zutsu"))
+        self.assertTrue(T._valid_romaji("Hello", "Hello"))
+
+    def test_invalid_llm_lines_fall_back_individually(self):
+        with mock.patch.object(T, "pick_model", return_value="qwen3:8b"), \
+             mock.patch.object(T, "_run_lines",
+                               return_value=["mada narenai kedo", "少しずつ"]), \
+             mock.patch.object(T, "romanize_offline",
+                               return_value=["mada nare nai kedo", "sukoshi zutsu"]):
+            result, backend = T.romanize(["まだ慣れないけど", "少しずつ"])
+        self.assertEqual(result, ["mada narenai kedo", "sukoshi zutsu"])
+        self.assertEqual(backend, "ollama:qwen3:8b+pykakasi")
+
 
 class NoBackendTests(unittest.TestCase):
     def test_translating_nothing_is_not_an_error_even_without_a_model(self):
@@ -171,6 +193,40 @@ class TranslationCacheTests(unittest.TestCase):
         self.assertEqual(first, ["ES:hello", "ES:hello", "ES:goodbye"])
         self.assertEqual(second, ["ES:hello", "ES:goodbye"])
 
+    def test_same_text_with_different_context_does_not_collide(self):
+        calls = []
+
+        def fake_run(model, system, lines, progress=None):
+            calls.append(list(lines))
+            return [f"ES:{line}:{index}" for index, line in enumerate(lines)]
+
+        with tempfile.TemporaryDirectory() as folder, \
+             mock.patch.object(T, "_run_lines", side_effect=fake_run):
+            result = T._run_cached_lines(
+                "qwen3:8b", "prompt", ["same", "same"],
+                source="en", target="es", cache_dir=Path(folder),
+                contexts=["left-a|right-a", "left-b|right-b"],
+            )
+        self.assertEqual(calls, [["same", "same"]])
+        self.assertEqual(result, ["ES:same:0", "ES:same:1"])
+
+    def test_equivalent_context_reuses_a_repeated_chorus(self):
+        calls = []
+
+        def fake_run(model, system, lines, progress=None):
+            calls.append(list(lines))
+            return [f"ES:{line}" for line in lines]
+
+        with tempfile.TemporaryDirectory() as folder, \
+             mock.patch.object(T, "_run_lines", side_effect=fake_run):
+            result = T._run_cached_lines(
+                "qwen3:8b", "prompt", ["chorus", "chorus"],
+                source="en", target="es", cache_dir=Path(folder),
+                contexts=["verse|end", "verse|end"],
+            )
+        self.assertEqual(calls, [["chorus"]])
+        self.assertEqual(result, ["ES:chorus", "ES:chorus"])
+
 
 
 class MultilingualGroupingTests(unittest.TestCase):
@@ -202,6 +258,17 @@ class MultilingualGroupingTests(unittest.TestCase):
         routes = {code: T.plan_route(code, "es") for code in groups}
         self.assertEqual(routes["ja"], [("ja", "en"), ("en", "es")])
         self.assertEqual(routes["en"], [("en", "es")])
+
+    def test_contiguous_groups_never_cross_a_track_boundary(self):
+        rows = JA_CASES["trackGroups"]
+        groups = T._contiguous_groups(
+            [row["language"] for row in rows], None,
+            [row["trackId"] for row in rows],
+        )
+        self.assertEqual(
+            [(group[0], group[1], group[2]) for group in groups],
+            [("ja", "track-a", [0, 1]), ("ja", "track-b", [2])],
+        )
 
 
 class ClipRomanizationTests(unittest.TestCase):

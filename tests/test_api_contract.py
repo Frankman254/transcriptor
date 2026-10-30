@@ -317,6 +317,29 @@ class ServiceDescriptionTests(ApiTestCase):
         self.assertIn("ja", service["romanizable"])
         self.assertGreaterEqual(service["bridgeSchemaVersion"], 3)
 
+    def test_info_lists_video_containers_and_resolution_limits(self):
+        with mock.patch.object(translation, "available_models", lambda: []):
+            body = self.client.get("/api/info").json()
+        self.assertEqual([item["value"] for item in body["video_formats"]],
+                         ["mp4", "mkv", "webm"])
+        self.assertIn("1080", [item["value"] for item in body["video_qualities"]])
+
+    def test_video_download_rejects_an_unknown_container(self):
+        response = self.client.post("/api/jobs", data={
+            "source_type": "url",
+            "url": "https://example.invalid/watch?v=x",
+            "mode": "video_only",
+            "video_format": "avi",
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("video", response.json()["error"].lower())
+
+    def test_video_download_requires_a_url_source(self):
+        response = self.client.post("/api/jobs", data={
+            "source_type": "url", "url": "", "mode": "video_only",
+        })
+        self.assertEqual(response.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

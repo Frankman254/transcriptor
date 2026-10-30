@@ -7,7 +7,9 @@ es su única conexión con las rutas.
 # y solo lo tocan sus propias pruebas (docs/arquitectura.md).
 __all__ = ["pipeline", "resume_precision_pipeline", "translate_saved_pipeline"]
 
-from lyrixa_bridge import build_lyrixa_envelope, clip_languages, clip_lines
+from lyrixa_bridge import (
+    build_lyrixa_envelope, clip_languages, clip_lines, clip_track_ids,
+)
 
 import json
 from pathlib import Path
@@ -119,13 +121,15 @@ def run_precision_mode(audio: Path, model: str, language: str, outdir: Path,
     target = safe_stem(out_stem, fallback=audio.stem)
     files = write_whisper_outputs(payload, outdir, target)
     return files, result
-def read_clip_lines(json_path: Path) -> tuple[list[str], list[str | None]]:
+def read_clip_lines(json_path: Path) -> tuple[
+    list[str], list[str | None], list[str | None],
+]:
     """Las líneas exactas que serán clips, con el idioma en que se cantó cada una."""
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
-        return [], []
-    return clip_lines(data), clip_languages(data)
+        return [], [], []
+    return clip_lines(data), clip_languages(data), clip_track_ids(data)
 def write_lyrics_sheet(outdir: Path, title: str, original: list[str],
                        romaji: list[str] | None,
                        translated: list[str] | None) -> str | None:
@@ -187,6 +191,7 @@ def build_lyrixa_bundle(
 def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
              model: str, language: str, mode: str = "transcribe",
              audio_format: str = "best", audio_quality: str = "192K",
+             video_format: str = "mp4", video_quality: str = "1080",
              separation_quality: str = "precise",
              precision_level: str = "balanced", translate_to: str = "",
              romaji: bool = False, tracklist_text: str = "",
@@ -205,6 +210,23 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
     jobstore.update_manifest(job_id, status="running", error=None,
                     startedAt=jobstore.utc_now(), finishedAt=None)
     try:
+        # Descarga local para uso personal. No forma parte de ninguna imagen o
+        # servicio distribuible: la regla de YouTube del repositorio se mantiene.
+        if mode == "video_only":
+            video, title, duration = media.download_video(
+                url, outdir, emit, video_format, video_quality,
+                cancel=job["cancel"])
+            emit("meta", title=title, duration=duration, device=device_name())
+            files = {"video": video.name}
+            jobstore.update_manifest(
+                job_id, status="completed", title=title, duration=duration,
+                files=files, finishedAt=jobstore.utc_now(),
+                timing=finish_job_timing(job),
+            )
+            emit("done", title=title, files=files, job_id=job_id,
+                 links=jobstore.job_links(job_id, files))
+            return
+
         # Modo "solo audio": descargar en el formato pedido y terminar, sin Whisper.
         if mode == "audio_only":
             audio, title, duration = media.download_audio(
@@ -334,10 +356,11 @@ def pipeline(job_id: str, source_type: str, url: str, upload_path: Path | None,
         romaji_lines = None
         translation_language = None
         if mode == "ultra" and files.get("json"):
-            lines, line_languages = read_clip_lines(outdir / files["json"])
+            lines, line_languages, track_ids = read_clip_lines(outdir / files["json"])
             language_report = translation.translate_clip_lines(
                 lines, line_languages, source=detected_language,
-                target=translate_to, romaji=romaji, emit=emit)
+                target=translate_to, romaji=romaji, emit=emit,
+                track_ids=track_ids)
             translated_lines = language_report["lines"]
             romaji_lines = language_report["romaji"]
             translation_language = language_report["targetLanguage"]
@@ -463,10 +486,11 @@ def resume_precision_pipeline(
         romaji_lines = None
         translation_language = None
         if files.get("json"):
-            lines, line_languages = read_clip_lines(outdir / files["json"])
+            lines, line_languages, track_ids = read_clip_lines(outdir / files["json"])
             language_report = translation.translate_clip_lines(
                 lines, line_languages, source=detected_language,
-                target=translate_to, romaji=romaji, emit=emit)
+                target=translate_to, romaji=romaji, emit=emit,
+                track_ids=track_ids)
             translated_lines = language_report["lines"]
             romaji_lines = language_report["romaji"]
             translation_language = language_report["targetLanguage"]
@@ -527,7 +551,7 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
         json_name = files.get("json")
         if not isinstance(json_name, str):
             raise RuntimeError("Este trabajo no conserva el JSON cronometrado.")
-        lines, languages = read_clip_lines(outdir / json_name)
+        lines, languages, track_ids = read_clip_lines(outdir / json_name)
         precision_report = manifest.get("precision") or {}
         settings = dict(manifest.get("settings") or {})
         source_language = (
@@ -537,7 +561,7 @@ def translate_saved_pipeline(job_id: str, target: str, romanize: bool) -> None:
              message="Añadiendo capas al resultado guardado; no repetiré Whisper…")
         report = translation.translate_clip_lines(
             lines, languages, source=source_language, target=target,
-            romaji=romanize, emit=emit)
+            romaji=romanize, emit=emit, track_ids=track_ids)
         emit("translation", routeLabel=report["routeLabel"],
              backend=report["backend"],
              romajiBackend=report.get("romajiBackend"),

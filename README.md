@@ -25,6 +25,7 @@ con su tiempo `inicio → fin` conforme se genera (vía SSE).
 | 🎤 **Letra de canción** | Aísla la voz con BS-RoFormer o Demucs y luego la transcribe. |
 | 🎯 **Letra ultra precisa** | 1 o 3 lecturas, voto y rescate selectivo; traducción opcional. |
 | ⬇️ **Solo audio** | Descarga audio de YouTube en MP3, M4A, Opus, OGG, FLAC, ALAC, WAV u original. |
+| 🎞️ **Solo video** | Descarga video para uso personal en MP4, MKV o WebM, desde 360p hasta 4K o máxima disponible. |
 
 ## Trabajos guardados e iteraciones
 

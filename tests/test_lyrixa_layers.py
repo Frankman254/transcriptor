@@ -15,9 +15,16 @@ from lyrixa_bridge import (  # noqa: E402
     TRANSLATION_LAYER_ID,
     build_lyrixa_envelope,
     clip_lines,
+    clip_track_ids,
     normalize_whisper_segments,
 )
+import lyrixa_bridge as bridge  # noqa: E402
 from textjoin import display_width, join_raw, join_tokens  # noqa: E402
+
+JA_CASES = json.loads(
+    (ROOT / "tests" / "fixtures" / "japanese_precision_cases.json")
+    .read_text(encoding="utf-8")
+)
 
 
 def segment(tokens, starts, ends, *, spaced=True):
@@ -111,6 +118,12 @@ class BalancedSplitTests(unittest.TestCase):
                 if c["layerId"] == MAIN_LAYER_ID]
         self.assertEqual(clip_lines({"segments": [LONG]}), main)
 
+    def test_track_identity_survives_visual_segmentation(self):
+        source = {**LONG, "track": {"id": "track-0042"}}
+        data = {"segments": [source]}
+        self.assertEqual(clip_track_ids(data),
+                         ["track-0042"] * len(clip_lines(data)))
+
     def test_a_no_space_script_prefers_cutting_where_the_script_changes(self):
         tokens = ["誰", "の", "メモ", "気", "に", "しない", "で",
                   "You'll", "be", "getting", "high", "so", "let", "me", "go"]
@@ -120,6 +133,16 @@ class BalancedSplitTests(unittest.TestCase):
                                                     spaced=False)])
         self.assertGreater(len(clips), 1)
         self.assertEqual(clips[0]["text"], "誰のメモ気にしないで")
+
+    def test_a_kanji_hiragana_word_boundary_is_not_a_preferred_cut(self):
+        words = [
+            {"text": "少", "startTime": 0.0, "endTime": 0.5},
+            {"text": "し", "startTime": 0.5, "endTime": 1.0},
+            {"text": "Future", "startTime": 1.0, "endTime": 1.5},
+        ]
+        inside_word = bridge._boundary_bonus(words, 0)
+        script_change = bridge._boundary_bonus(words, 1)
+        self.assertGreater(inside_word, script_change)
 
 
 class TwoLayerEnvelopeTests(unittest.TestCase):
@@ -266,6 +289,42 @@ class TwoLayerEnvelopeTests(unittest.TestCase):
         self.assertEqual(meta["precision"]["passes"], 5)
         self.assertEqual(restored["project"]["clips"],
                          envelope["project"]["clips"])
+
+    def test_japanese_fixture_keeps_three_representations_on_the_same_timing(self):
+        rows = JA_CASES["layerDemo"]
+        segments = [{
+            "start": row["start"], "end": row["end"],
+            "text": row["original"], "language": "ja",
+            "track": {"id": "track-demo"},
+            "words": [{"word": row["original"],
+                       "start": row["start"], "end": row["end"]}],
+        } for row in rows]
+        envelope = build_lyrixa_envelope(
+            {"segments": segments, "language": "ja"},
+            title="Fixture japonesa", duration=5.0,
+            translations=[row["spanish"] for row in rows],
+            translation_language="es",
+            romaji=[row["romaji"] for row in rows],
+        )
+        clips = envelope["project"]["clips"]
+        main = [clip for clip in clips if clip["layerId"] == MAIN_LAYER_ID]
+        translated = [clip for clip in clips
+                      if clip["layerId"] == TRANSLATION_LAYER_ID]
+        romanized = [clip for clip in clips if clip["layerId"] == ROMAJI_LAYER_ID]
+        self.assertEqual([clip["text"] for clip in main],
+                         [row["original"] for row in rows])
+        self.assertEqual([clip["text"] for clip in translated],
+                         [row["spanish"] for row in rows])
+        self.assertEqual([clip["text"] for clip in romanized],
+                         [row["romaji"] for row in rows])
+        for source, translation, reading in zip(main, translated, romanized):
+            identity = (source["sourceId"], source["startTime"], source["endTime"])
+            self.assertEqual(identity, (translation["sourceId"],
+                                        translation["startTime"],
+                                        translation["endTime"]))
+            self.assertEqual(identity, (reading["sourceId"],
+                                        reading["startTime"],
+                                        reading["endTime"]))
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ _SOURCE_SUFFIXES = {
     ".mp3", ".m4a", ".opus", ".ogg", ".flac", ".wav",
     ".mp4", ".webm", ".mov", ".mkv",
 }
+_VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv"}
 
 
 def utc_now() -> str:
@@ -291,6 +292,7 @@ def discover_result_files(job_id: str, outdir: Path, assets: dict | None) -> dic
         return max(matches, key=lambda path: path.stat().st_mtime).name if matches else None
 
     guesses = {
+        "video": newest(lambda p: p.suffix.lower() in _VIDEO_SUFFIXES),
         "lyrixa": newest(lambda p: p.name.endswith(".lyrixa.json")),
         "lyrics": newest(lambda p: p.name.endswith(".letra.txt")),
         "srt": newest(lambda p: p.suffix.lower() == ".srt"),
@@ -309,7 +311,9 @@ def discover_result_files(job_id: str, outdir: Path, assets: dict | None) -> dic
     if (outdir / "track-guide.json").is_file():
         files["guide"] = "track-guide.json"
     if assets and assets.get("original"):
-        files.setdefault("audio", assets["original"].name)
+        original = assets["original"]
+        kind = "video" if original.suffix.lower() in _VIDEO_SUFFIXES else "audio"
+        files.setdefault(kind, original.name)
     if assets and assets.get("vocals"):
         files["vocals"] = {
             "name": "voz aislada.wav",
@@ -356,6 +360,10 @@ def job_links(job_id: str, files: dict) -> dict:
         links["lyrixa"] = f"/api/jobs/{job_id}/lyrixa"
     if files.get("audio"):
         links["audio"] = f"/api/jobs/{job_id}/audio"
+    if files.get("video"):
+        links["video"] = (
+            f"/download/{job_id}/{Path(str(files['video'])).name}"
+        )
     for stem in ("vocals", "instrumental"):
         if files.get(stem):
             links[stem] = f"/api/jobs/{job_id}/stems/{stem}"
@@ -369,6 +377,9 @@ def saved_job(job_id: str, *, running: bool = False) -> dict | None:
     outdir = assets["outdir"]
     manifest = read_manifest(outdir)
     files = discover_result_files(job_id, outdir, assets)
+    # A source media file alone is not proof that a running pipeline finished:
+    # it may have been interrupted immediately after the download. Direct
+    # audio/video jobs persist manifest status="completed" explicitly.
     completed = any(kind in files for kind in ("json", "txt", "lyrixa"))
     manifest_status = manifest.get("status")
     if running:

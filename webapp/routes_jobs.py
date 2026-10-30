@@ -29,6 +29,8 @@ from catalogs import (
     SEPARATION_PROFILES,
     TARGET_LANGUAGES,
     FORMATS_BY_VALUE,
+    VIDEO_FORMATS_BY_VALUE,
+    VIDEO_QUALITIES,
 )
 
 def job_is_running(job_id: str) -> bool:
@@ -130,6 +132,8 @@ async def create_job(
     mode: str = Form("transcribe"),
     audio_format: str = Form("best"),
     audio_quality: str = Form("192K"),
+    video_format: str = Form("mp4"),
+    video_quality: str = Form("1080"),
     separation_quality: str = Form("precise"),
     precision_level: str = Form("balanced"),
     asr_engine: str = Form("auto"),
@@ -145,6 +149,12 @@ async def create_job(
                             status_code=400)
     if audio_quality not in AUDIO_QUALITIES:
         audio_quality = "192K"
+    if video_format not in VIDEO_FORMATS_BY_VALUE:
+        return JSONResponse({"error": f"Formato de video desconocido: {video_format}"},
+                            status_code=400)
+    video_quality_values = {item["value"] for item in VIDEO_QUALITIES}
+    if video_quality not in video_quality_values:
+        video_quality = "1080"
     if separation_quality not in SEPARATION_PROFILES:
         separation_quality = "precise"
     if precision_level not in PRECISION_LEVELS:
@@ -159,6 +169,12 @@ async def create_job(
 
     if source_type not in {"url", "file"}:
         return JSONResponse({"error": "Fuente desconocida"}, status_code=400)
+    if mode in {"audio_only", "video_only"} and (
+            source_type != "url" or not url.strip()):
+        return JSONResponse(
+            {"error": "Las descargas directas necesitan un enlace de YouTube."},
+            status_code=400,
+        )
     if source_type == "file" and file is None:
         return JSONResponse({"error": "Falta el archivo"}, status_code=400)
     if len(tracklist_text.encode("utf-8")) > 2_000_000:
@@ -181,6 +197,7 @@ async def create_job(
         job_id, status="queued", mode=mode, iteration=0,
         settings={
             "model": model, "language": language,
+            "videoFormat": video_format, "videoQuality": video_quality,
             "separationQuality": separation_quality,
             "precisionLevel": precision_level, "asrEngine": asr_engine,
             "rescueOriginal": rescue_original not in {"", "0", "false"},
@@ -195,7 +212,8 @@ async def create_job(
     threading.Thread(
         target=pipeline,
         args=(job_id, source_type, url, upload_path, model, language, mode,
-              audio_format, audio_quality, separation_quality, precision_level,
+              audio_format, audio_quality, video_format, video_quality,
+              separation_quality, precision_level,
               translate_to, romaji not in {"", "0", "false"},
               tracklist_text, fetch_lyrics not in {"", "0", "false"},
               asr_engine, rescue_original not in {"", "0", "false"}),
